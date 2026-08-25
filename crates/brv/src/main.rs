@@ -60,6 +60,8 @@ enum Cmd {
     Listen,
     /// 로컬 MCP 서버 (stdio) — Claude Code 등 MCP 호스트용
     Mcp,
+    /// 상주 데몬 — 메시지 도착 시 세션을 깨워 처리 (config의 [wake] 필요)
+    Daemon,
 }
 
 #[tokio::main]
@@ -89,19 +91,20 @@ async fn main() -> anyhow::Result<()> {
         } => send(to, payload, expects_ack).await,
         Cmd::Listen => listen().await,
         Cmd::Mcp => mcp().await,
+        Cmd::Daemon => {
+            let cfg = config::load()?;
+            let token = config::load_token(&cfg)?;
+            brv::daemon::run(cfg, token).await
+        }
     }
 }
 
 fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
     let cfg = config::load()?;
     let token = config::load_token(&cfg)?;
-    let client = Client::connect(ClientOptions {
-        server: cfg.server.clone(),
-        channel: cfg.channel.clone(),
-        agent: cfg.agent.clone(),
-        token,
-        description: cfg.description.clone(),
-    });
+    let mut opts = ClientOptions::new(&cfg.server, &cfg.channel, &cfg.agent, token);
+    opts.description = cfg.description.clone();
+    let client = Client::connect(opts);
     Ok((cfg, client))
 }
 
@@ -173,6 +176,7 @@ async fn init(
         channel,
         agent,
         description,
+        wake: None, // 깨우기는 daemon 도입 시 config.toml에 [wake]로 추가
     };
     config::store_token(&cfg, &token)?;
     let path = config::store(&cfg)?;

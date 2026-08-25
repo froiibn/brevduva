@@ -420,13 +420,12 @@ mod tests {
     #[tokio::test]
     async fn initialize_and_tools_list_shapes() {
         // 클라이언트 연결 없이 프로토콜 계층만 검증 (dead client — 도구 호출은 안 함)
-        let client = Client::connect(crate::client::ClientOptions {
-            server: "http://127.0.0.1:1".into(),
-            channel: "x".into(),
-            agent: "x".into(),
-            token: "t".into(),
-            description: String::new(),
-        });
+        let client = Client::connect(crate::client::ClientOptions::new(
+            "http://127.0.0.1:1",
+            "x",
+            "x",
+            "t",
+        ));
         let mut mcp = McpServer::new(client);
         let init = mcp
             .dispatch(

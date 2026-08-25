@@ -19,6 +19,42 @@ pub struct BrvConfig {
     /// 능력 선언의 소개문 (PROTOCOL.md 4장) — 동료가 라우팅 판단에 쓴다.
     #[serde(default)]
     pub description: String,
+    /// `brv daemon`의 세션 깨우기 설정 (5.3 CLI 어댑터 규약). 없으면 daemon 기동 거부.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeConfig>,
+}
+
+/// 깨우기 설정 — 메시지 도착 시 실행할 명령 (예: `claude -p "{prompt}"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeConfig {
+    /// `always` | `never` (5.3: 항상/무시. 업무시간 정책은 잔여)
+    #[serde(default = "default_policy")]
+    pub policy: String,
+    /// 실행 파일 (전체 경로 권장 — PATH에 없을 수 있음)
+    pub command: String,
+    /// 인자 목록 — `{prompt}` 자리에 메시지 프롬프트가 치환된다
+    #[serde(default = "default_wake_args")]
+    pub args: Vec<String>,
+    /// 실행 작업 디렉터리 (해당 프로젝트 루트 — .mcp.json이 있는 곳)
+    pub dir: String,
+    /// 깨운 세션의 최대 실행 시간(초) — 초과 시 강제 종료
+    #[serde(default = "default_wake_timeout")]
+    pub timeout_s: u64,
+}
+
+fn default_policy() -> String {
+    "always".to_owned()
+}
+fn default_wake_args() -> Vec<String> {
+    vec![
+        "-p".to_owned(),
+        "{prompt}".to_owned(),
+        "--allowedTools".to_owned(),
+        "mcp__brevduva__*".to_owned(),
+    ]
+}
+fn default_wake_timeout() -> u64 {
+    600
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {

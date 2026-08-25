@@ -33,6 +33,30 @@ pub struct ClientOptions {
     pub agent: String,
     pub token: String,
     pub description: String,
+    /// 테이크오버(`agent/session-conflict`)를 받으면 재접속 대신 standby로 —
+    /// 데몬용 (2.2). 대화형 어댑터는 false(즉시 재접속 = 기존 세션 탈환).
+    pub takeover_standby: bool,
+    /// standby 중 자리 확인 주기 — long-poll PRESENCE 프로브 (세션·큐를 건드리지 않음).
+    pub standby_probe: Duration,
+}
+
+impl ClientOptions {
+    pub fn new(
+        server: impl Into<String>,
+        channel: impl Into<String>,
+        agent: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self {
+            server: server.into(),
+            channel: channel.into(),
+            agent: agent.into(),
+            token: token.into(),
+            description: String::new(),
+            takeover_standby: false,
+            standby_probe: Duration::from_secs(30),
+        }
+    }
 }
 
 /// 발행 명세 — 엔벨로프의 클라이언트 채움분 (id·ts는 서버 소관, 3장).
@@ -515,6 +539,16 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
                 attempt = 0;
                 match run_connection(&mut state, ws, backlog, &mut cmds).await {
                     ConnEnd::Reconnect => state.on_disconnect(),
+                    ConnEnd::TakenOver => {
+                        state.on_disconnect();
+                        if state.opts.takeover_standby {
+                            // 새 세션과 자리 다툼 금지 (2.2) — 자리가 빌 때까지 대기
+                            tracing::info!("session taken over — entering standby");
+                            standby_until_free(&state.opts).await;
+                            tracing::info!("agent slot free — resuming");
+                        }
+                        // 대화형(기본): 즉시 재접속 = 최신 연결이 자리를 가진다
+                    }
                     ConnEnd::Closed => return,
                 }
             }
@@ -546,7 +580,50 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
 // 치명(JOIN 비재시도 거부)은 connect_and_join의 "FATAL: " 오류 경로가 담당한다
 enum ConnEnd {
     Reconnect,
+    /// 다른 세션이 자리를 가져감 (`agent/session-conflict` 수신, 2.2).
+    TakenOver,
     Closed,
+}
+
+/// standby: long-poll PRESENCE 프로브(세션·큐 무접촉)로 자리가 빌 때까지 대기.
+/// 오류(서버 불가 등)는 "자리 비어 있음"으로 간주 — 재접속 경로의 백오프가 뒷일을 맡는다.
+async fn standby_until_free(opts: &ClientOptions) {
+    let http = reqwest::Client::new();
+    loop {
+        tokio::time::sleep(opts.standby_probe).await;
+        let occupied = async {
+            let resp: ServerFrame = http
+                .post(format!(
+                    "{}/v1/frames?channel={}",
+                    opts.server.trim_end_matches('/'),
+                    opts.channel
+                ))
+                .bearer_auth(&opts.token)
+                .json(&ClientFrame {
+                    seq: Some(1),
+                    re: None,
+                    op: ClientOp::Presence,
+                })
+                .send()
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            let ServerOp::Ok(body) = resp.op else {
+                return None;
+            };
+            let mine = body
+                .presence?
+                .into_iter()
+                .find(|e| e.agent.as_str() == opts.agent)?;
+            Some(mine.state == brevduva_protocol::PresenceState::Online)
+        }
+        .await;
+        if !occupied.unwrap_or(false) {
+            return;
+        }
+    }
 }
 
 /// 접속 + JOIN(멱등, 13.2). JOIN OK 이전에 도착한 DELIVER는 backlog로 넘긴다.
@@ -670,6 +747,9 @@ async fn run_connection(
                     ServerOp::Err(body) => {
                         if let Some(re) = frame.re {
                             state.resolve_err(re, body);
+                        } else if body.code == ErrorCode::AgentSessionConflict {
+                            // 테이크오버 통지 (2.2) — 네트워크 장애와 구별되는 명시적 신호
+                            return ConnEnd::TakenOver;
                         } else if body.code == ErrorCode::FrameInvalid {
                             tracing::warn!(message = %body.message, "server rejected a frame");
                         }
