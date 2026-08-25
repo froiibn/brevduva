@@ -1,13 +1,258 @@
-//! brv — Brevduva 리시버 데몬 + CLI.
+//! brv — Brevduva 리시버 CLI.
 //!
-//! 페이즈 5(IMPLEMENTATION.md)에서 구현: WS 클라이언트 코어(재연결 백오프·client_key
-//! 멱등성), `brv init`/`brv status`, OS 서비스 데몬, 로컬 MCP 서버.
-//! 지금은 워크스페이스 배선 검증용 최소 진입점.
+//! `init`(셋업 일괄) · `status` · `send` · `listen`(수신 출력) · `mcp`(로컬 MCP 서버).
+//! 데몬화(OS 서비스 등록·idle 세션 깨우기)는 후속 — IMPLEMENTATION.md 잔여 참조.
 
-fn main() {
+use std::time::Duration;
+
+use anyhow::Context as _;
+use brv::client::{Client, ClientOptions, PublishSpec, RecvFilter};
+use brv::config::{self, BrvConfig};
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "brv",
+    version,
+    about = "Brevduva receiver & CLI — real-time messaging for AI agents"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// 에이전트 등록 + 채널 생성 + grant + 로컬 설정까지 한 번에 (관리 API 사용)
+    Init {
+        /// 서버 베이스 URL (예: http://3.34.220.217:8080)
+        #[arg(long)]
+        server: String,
+        /// 관리 API 키 (BREVDUVA_ADMIN_KEY)
+        #[arg(long, env = "BREVDUVA_ADMIN_KEY")]
+        admin_key: String,
+        /// 이 머신의 에이전트 이름 (예: backend)
+        #[arg(long)]
+        agent: String,
+        /// 채널(프로젝트) 이름
+        #[arg(long)]
+        channel: String,
+        /// 능력 선언 소개문 — 동료 에이전트의 라우팅 판단 근거
+        #[arg(long, default_value = "")]
+        description: String,
+        /// 에이전트가 이미 있으면 토큰을 회전해 재사용
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// 설정·서버·채널 상태 점검
+    Status,
+    /// 메시지 한 건 발행 (수동 테스트용)
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        payload: String,
+        /// broadcast에 ack 수집을 요구 (11장)
+        #[arg(long)]
+        expects_ack: bool,
+    },
+    /// 수신 메시지를 줄 단위 JSON으로 출력 (수동 테스트용, Ctrl+C로 종료)
+    Listen,
+    /// 로컬 MCP 서버 (stdio) — Claude Code 등 MCP 호스트용
+    Mcp,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // stdout은 MCP 프로토콜 전용일 수 있다 — 로그는 항상 stderr로
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    match Cli::parse().cmd {
+        Cmd::Init {
+            server,
+            admin_key,
+            agent,
+            channel,
+            description,
+            rotate,
+        } => init(server, admin_key, agent, channel, description, rotate).await,
+        Cmd::Status => status().await,
+        Cmd::Send {
+            to,
+            payload,
+            expects_ack,
+        } => send(to, payload, expects_ack).await,
+        Cmd::Listen => listen().await,
+        Cmd::Mcp => mcp().await,
+    }
+}
+
+fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
+    let cfg = config::load()?;
+    let token = config::load_token(&cfg)?;
+    let client = Client::connect(ClientOptions {
+        server: cfg.server.clone(),
+        channel: cfg.channel.clone(),
+        agent: cfg.agent.clone(),
+        token,
+        description: cfg.description.clone(),
+    });
+    Ok((cfg, client))
+}
+
+async fn init(
+    server: String,
+    admin_key: String,
+    agent: String,
+    channel: String,
+    description: String,
+    rotate: bool,
+) -> anyhow::Result<()> {
+    let http = reqwest::Client::new();
+    let base = server.trim_end_matches('/').to_owned();
+
+    // 1) 에이전트 등록 (409 + --rotate → 토큰 회전)
+    let created = http
+        .post(format!("{base}/v1/agents"))
+        .bearer_auth(&admin_key)
+        .json(&serde_json::json!({ "name": agent, "description": description }))
+        .send()
+        .await
+        .context("server unreachable")?;
+    let token = match created.status().as_u16() {
+        201 => created.json::<serde_json::Value>().await?["token"]
+            .as_str()
+            .context("no token in response")?
+            .to_owned(),
+        409 if rotate => {
+            let rotated = http
+                .delete(format!("{base}/v1/agents/{agent}/token"))
+                .bearer_auth(&admin_key)
+                .send()
+                .await?
+                .error_for_status()
+                .context("token rotate failed")?;
+            rotated.json::<serde_json::Value>().await?["token"]
+                .as_str()
+                .context("no token in response")?
+                .to_owned()
+        }
+        409 => anyhow::bail!(
+            "agent {agent:?} already exists — rerun with --rotate to rotate its token \
+             (this disconnects any session using the old token)"
+        ),
+        _ => anyhow::bail!("agent registration failed: {}", created.text().await?),
+    };
+
+    // 2) 채널 생성 (이미 있으면 통과) + grant
+    let ch = http
+        .post(format!("{base}/v1/channels"))
+        .bearer_auth(&admin_key)
+        .json(&serde_json::json!({ "name": channel }))
+        .send()
+        .await?;
+    if !ch.status().is_success() && ch.status().as_u16() != 409 {
+        anyhow::bail!("channel creation failed: {}", ch.text().await?);
+    }
+    http.post(format!("{base}/v1/channels/{channel}/grants"))
+        .bearer_auth(&admin_key)
+        .json(&serde_json::json!({ "agent": agent }))
+        .send()
+        .await?
+        .error_for_status()
+        .context("grant failed")?;
+
+    // 3) 로컬 저장 — 토큰은 키체인, 설정은 파일 (클라이언트에 비밀 없음 원칙)
+    let cfg = BrvConfig {
+        server: base,
+        channel,
+        agent,
+        description,
+    };
+    config::store_token(&cfg, &token)?;
+    let path = config::store(&cfg)?;
+
+    println!("초기화 완료 — 설정: {path:?} (토큰은 OS 키체인)");
+    println!();
+    println!("Claude Code에 연결하려면:");
+    println!("  claude mcp add brevduva -- brv mcp");
+    println!();
+    println!("수동 확인: brv status / brv listen / brv send --to <agent> --payload \"...\"");
+    Ok(())
+}
+
+async fn status() -> anyhow::Result<()> {
+    let cfg = config::load()?;
     println!(
-        "brv {} (protocol v{})",
-        env!("CARGO_PKG_VERSION"),
-        brevduva_protocol::PROTOCOL_VERSION
+        "설정: 서버 {} / 채널 {} / 에이전트 {}",
+        cfg.server, cfg.channel, cfg.agent
     );
+    let health = reqwest::Client::new()
+        .get(format!("{}/healthz", cfg.server.trim_end_matches('/')))
+        .send()
+        .await;
+    match health {
+        Ok(resp) if resp.status().is_success() => println!("서버: OK"),
+        Ok(resp) => println!("서버: 응답 이상 ({})", resp.status()),
+        Err(e) => {
+            println!("서버: 연결 불가 — {e}");
+            return Ok(());
+        }
+    }
+    let (_, client) = connect_from_config()?;
+    match client.presence(Duration::from_secs(10)).await {
+        Ok(entries) => {
+            println!("채널 프레즌스:");
+            for e in entries {
+                println!("  {:10} {:?}", e.agent.as_str(), e.state);
+            }
+        }
+        Err(e) => println!("프레즌스 조회 실패: {e}"),
+    }
+    Ok(())
+}
+
+async fn send(to: String, payload: String, expects_ack: bool) -> anyhow::Result<()> {
+    let (_, client) = connect_from_config()?;
+    let mut spec = PublishSpec::message(
+        if to == "broadcast" || to.contains(':') {
+            to
+        } else {
+            format!("agent:{to}")
+        },
+        payload,
+    );
+    if expects_ack {
+        spec.expects = Some(brevduva_protocol::Expects::Ack);
+    }
+    match tokio::time::timeout(Duration::from_secs(10), client.publish(spec)).await {
+        Ok(Ok(id)) => println!("sent {id}"),
+        Ok(Err(e)) => anyhow::bail!("rejected: {} — {}", e.code, e.message),
+        Err(_) => anyhow::bail!("unconfirmed after 10s — will republish on reconnect (13.3)"),
+    }
+    Ok(())
+}
+
+async fn listen() -> anyhow::Result<()> {
+    let (cfg, client) = connect_from_config()?;
+    eprintln!(
+        "listening as {}@{} — Ctrl+C to stop",
+        cfg.agent, cfg.channel
+    );
+    loop {
+        if let Some(env) = client.recv(RecvFilter::Any, Duration::from_secs(60)).await {
+            println!("{}", serde_json::to_string(&env)?);
+        }
+    }
+}
+
+async fn mcp() -> anyhow::Result<()> {
+    let (cfg, client) = connect_from_config()?;
+    tracing::info!(agent = %cfg.agent, channel = %cfg.channel, "brv mcp server on stdio");
+    brv::mcp::run_stdio(client).await
 }
