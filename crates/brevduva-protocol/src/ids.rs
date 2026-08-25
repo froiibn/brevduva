@@ -74,6 +74,16 @@ ulid_newtype!(
     MessageId,
     "server-issued ULID: time-sortable unique message id (PROTOCOL.md 3)"
 );
+
+impl MessageId {
+    /// ULID의 시간 성분(밀리초, Unix epoch) — FETCH `after_id` 커서의 시작점 해석용.
+    /// ULID는 사전순 = 시간순이므로 이 값으로 조회 시작점을 잡고 id 비교로 정밀 필터링한다.
+    pub fn timestamp_ms(&self) -> u64 {
+        ulid::Ulid::from_string(&self.0)
+            .map(|u| u.timestamp_ms())
+            .unwrap_or(0)
+    }
+}
 ulid_newtype!(
     ClientKey,
     "client-issued ULID: publish retry idempotency key, deduplicated by the server within a 10-minute window (PROTOCOL.md 13.3)"
