@@ -352,7 +352,7 @@ claude.ai·ChatGPT 등 웹 제품은 SaaS가 호스팅하는 원격 MCP 서버�
 
 ## 15. 미해결 (다음 라운드)
 
-- [ ] 컨트롤 프레임·엔벨로프의 JSON Schema 정식화 — 마일스톤 1에서 공유 crate 타입 정의와 동시 확정 (문서 선행 대신 코드와 함께)
+- [x] 컨트롤 프레임·엔벨로프의 JSON Schema 정식화 (2026-08-26) — `brevduva-protocol` crate 타입에서 생성된 [schemas/](schemas/)가 필드 수준의 정식(normative) 정의다. 이 문서의 산문·예시와 스키마가 어긋나면 스키마 쪽 처리가 우선하되, 어긋남 자체를 결함으로 보고 문서를 정정한다. 산문에 없던 세부(FETCH 커서: topics/after_id/after_ts/limit, OK body: id/presence/messages, ERR body: retry_after_ms 포함, 클라이언트 ACK op)는 스키마가 확정한 것
 - [ ] 원격 MCP OAuth 스코프 세분화 (읽기 전용 관제 등) — B2B 단계
 - ~~rate limit·기본값 표~~ → 12장
 - ~~장애 시 클라이언트 규약~~ → 13장

@@ -8,5 +8,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# JSON Schema 생성 (schemas/ 스냅샷) — 스펙 정식화의 산출물
+schemars = "1"
+# id·client_key 검증/생성 (PROTOCOL.md 3장)
+ulid = "1"
+# ts(RFC 3339) 검증 (PROTOCOL.md 3장) — 시각 연산은 소비자(서버) 소관, 여기선 파싱 검증만
+time = { version = "0.3", features = ["parsing"] }
+
 [lints]
 workspace = true

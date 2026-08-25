@@ -1,0 +1,452 @@
+{
+  "$defs": {
+    "Address": {
+      "description": "message destination: `agent:{name}` (1:1 inbox), `topic:{path}` (subscribers), or `broadcast` (whole channel except sender) (PROTOCOL.md 2.3)",
+      "pattern": "^(agent:_?[a-z0-9-]{1,64}|topic:[a-z0-9-]+(\\.[a-z0-9-]+)*|broadcast)$",
+      "type": "string"
+    },
+    "ClientKey": {
+      "description": "client-issued ULID: publish retry idempotency key, deduplicated by the server within a 10-minute window (PROTOCOL.md 13.3)",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "Envelope": {
+      "description": "메시지 엔벨로프 (PROTOCOL.md 3장).",
+      "properties": {
+        "client_key": {
+          "$ref": "#/$defs/ClientKey",
+          "description": "클라이언트 발급 멱등 키 — 발행 재시도용 (PROTOCOL.md 13.3). PUB에 필수."
+        },
+        "content_type": {
+          "description": "페이로드 MIME 타입.",
+          "type": "string"
+        },
+        "correlation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "reply/ack/report가 원본을 가리킬 때 — 해당 kind에서 필수 (3.1)."
+        },
+        "expects": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Expects"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "발신자가 기대하는 반응."
+        },
+        "from": {
+          "$ref": "#/$defs/Ident",
+          "description": "발신 에이전트."
+        },
+        "hops": {
+          "default": 0,
+          "description": "에이전트 간 연쇄 전파 깊이 — 폭주 방지 (3.3). 원본에 반응한 메시지는 +1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "서버 발급 ULID. 클라이언트 PUB 시점에는 없다 (서버가 채움)."
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind",
+          "description": "메시지 종류 (3.1)."
+        },
+        "meta": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "확장 슬롯: 서명, 트레이스, parent_id 등. 알 수 없는 키는 무시하고 보존한다.",
+          "type": "object"
+        },
+        "payload": {
+          "description": "인라인 페이로드 (임계값 이하). JSON 페이로드도 직렬화된 문자열로 싣는다.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "claim-check 참조 (임계값 초과 시, 3.2). payload와 동시 설정 불가."
+        },
+        "to": {
+          "$ref": "#/$defs/Address",
+          "description": "주소 (2.3)."
+        },
+        "ts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "서버 수신 시각. 클라이언트 PUB 시점에는 없다 (진실의 원천은 서버 시계)."
+        },
+        "ttl_ms": {
+          "description": "만료(ms). 생략 시 채널 `default_ttl_ms` 적용 (12.1) — 만료 후 미전달분은 폐기.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "v": {
+          "description": "프로토콜 버전 — 현재 1.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v",
+        "client_key",
+        "from",
+        "to",
+        "kind",
+        "content_type"
+      ],
+      "type": "object"
+    },
+    "ErrBody": {
+      "description": "ERR body. 원칙(8장): message는 에이전트(LLM)가 읽고 스스로 정정할 수 있게 서술적으로.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "description": "rate/limited일 때 재시도 대기 시간 (12.3).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "error code as `{category}/{code}` (PROTOCOL.md 8); clients must preserve unknown codes",
+      "pattern": "^[a-z]+/[a-z-]+$",
+      "type": "string"
+    },
+    "Expects": {
+      "description": "발신자가 기대하는 반응 (PROTOCOL.md 3장 `expects`).",
+      "enum": [
+        "ack",
+        "reply"
+      ],
+      "type": "string"
+    },
+    "Ident": {
+      "description": "org/channel/agent identifier: lowercase kebab-case, max 64 chars; leading `_` reserved for system identities (PROTOCOL.md 2.1)",
+      "pattern": "^_?[a-z0-9-]{1,64}$",
+      "type": "string"
+    },
+    "Kind": {
+      "description": "메시지 종류 (PROTOCOL.md 3.1).",
+      "oneOf": [
+        {
+          "const": "message",
+          "description": "단방향 알림/정보.",
+          "type": "string"
+        },
+        {
+          "const": "request",
+          "description": "응답을 기대하는 요청 (지시 포함).",
+          "type": "string"
+        },
+        {
+          "const": "reply",
+          "description": "request에 대한 응답 — correlation_id 필수.",
+          "type": "string"
+        },
+        {
+          "const": "ack",
+          "description": "수신 확인 (\"받았고 처리하겠다/무관하다\") — correlation_id 필수.",
+          "type": "string"
+        },
+        {
+          "const": "report",
+          "description": "작업 완료/실패 보고 — correlation_id 필수 (원본 request/message).",
+          "type": "string"
+        },
+        {
+          "const": "event",
+          "description": "시스템 이벤트 (입장/퇴장/능력 변경 등, `_system` 발신).",
+          "type": "string"
+        }
+      ]
+    },
+    "MessageId": {
+      "description": "server-issued ULID: time-sortable unique message id (PROTOCOL.md 3)",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "OkBody": {
+      "additionalProperties": true,
+      "description": "OK body — 조작별 결과 필드의 합집합 (없는 필드는 생략).",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "PUB 성공 시 발급된 메시지 ID. client_key 중복이면 기존 ID (멱등 성공, 13.3)."
+        },
+        "messages": {
+          "description": "FETCH 결과 페이지.",
+          "items": {
+            "$ref": "#/$defs/Envelope"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "presence": {
+          "description": "PRESENCE 조회 결과.",
+          "items": {
+            "$ref": "#/$defs/PresenceEntry"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PayloadRef": {
+      "description": "claim-check 참조 — 인라인 임계값(256KB) 초과 페이로드 (PROTOCOL.md 3.2).",
+      "properties": {
+        "content_type": {
+          "description": "페이로드 MIME 타입.",
+          "type": "string"
+        },
+        "id": {
+          "description": "서버 발급 blob ID.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "무결성 해시 (hex).",
+          "type": "string"
+        },
+        "size": {
+          "description": "바이트 크기.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "size",
+        "sha256",
+        "content_type"
+      ],
+      "type": "object"
+    },
+    "PresenceEntry": {
+      "description": "프레즌스 항목 (5.3).",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/Ident"
+        },
+        "last_seen": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "마지막 수신 확인 시각 (idle/offline 판단 참고용)."
+        },
+        "state": {
+          "$ref": "#/$defs/PresenceState"
+        }
+      },
+      "required": [
+        "agent",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PresenceState": {
+      "description": "수신 상태 (5.3 표).",
+      "oneOf": [
+        {
+          "const": "online",
+          "description": "상시 수신 (데몬, push).",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "일시 수신 (GUI long-poll 홀드 중).",
+          "type": "string"
+        },
+        {
+          "const": "idle",
+          "description": "접속 이력은 있으나 현재 안 들음 — 메시지는 큐잉(TTL까지).",
+          "type": "string"
+        },
+        {
+          "const": "offline",
+          "description": "채널 이탈.",
+          "type": "string"
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "RFC 3339 timestamp; source of truth is the server clock (PROTOCOL.md 3)",
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "서버 → 클라이언트 프레임.",
+  "oneOf": [
+    {
+      "description": "성공 응답. body 형태는 원 조작이 결정한다 (PUB → id, PRESENCE → presence).",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/OkBody"
+        },
+        "op": {
+          "const": "OK",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "실패 응답.",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/ErrBody"
+        },
+        "op": {
+          "const": "ERR",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "메시지 전달 — 클라이언트는 `{op:\"ACK\", re:seq}`로 확인 (at-least-once).\nBox: 엔벨로프가 다른 변형 대비 커서 enum 크기 비대를 막는다 (와이어 표현 동일).",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/Envelope"
+        },
+        "op": {
+          "const": "DELIVER",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "op": {
+          "const": "PING",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "op": {
+          "const": "PONG",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "re": {
+      "description": "클라이언트 프레임에 대한 응답일 때 그 seq.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "seq": {
+      "description": "서버 발신 프레임(DELIVER 등)의 단조 증가 번호.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "title": "ServerFrame",
+  "type": "object"
+}

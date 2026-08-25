@@ -1,0 +1,79 @@
+{
+  "$defs": {
+    "Ident": {
+      "description": "org/channel/agent identifier: lowercase kebab-case, max 64 chars; leading `_` reserved for system identities (PROTOCOL.md 2.1)",
+      "pattern": "^_?[a-z0-9-]{1,64}$",
+      "type": "string"
+    },
+    "ReceiveMode": {
+      "description": "수신 방식 (PROTOCOL.md 4장 `modes`).",
+      "oneOf": [
+        {
+          "const": "push",
+          "description": "상시 수신 (데몬).",
+          "type": "string"
+        },
+        {
+          "const": "poll",
+          "description": "blocking 도구 재호출 루프 (GUI 어댑터).",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "에이전트 능력 선언.",
+  "properties": {
+    "agent": {
+      "$ref": "#/$defs/Ident",
+      "description": "선언 주체 에이전트."
+    },
+    "content_types": {
+      "description": "수신 가능 콘텐츠 타입 (예: `text/*`, `application/json`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "description": {
+      "description": "동료 에이전트가 읽는 소개 — 브로드캐스트 관련성 판단·지명 대상 선택의 근거.",
+      "type": "string"
+    },
+    "encodings": {
+      "description": "직렬화 협상 자리 — v1은 `json`, 로봇 단계에 `cbor` 추가 예정.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "max_inline_bytes": {
+      "description": "이 크기까지 한 메시지로 수신 가능 (컨텍스트 예산 반영).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "meta": {
+      "additionalProperties": true,
+      "default": {},
+      "description": "확장 슬롯.",
+      "type": "object"
+    },
+    "modes": {
+      "description": "수신 방식.",
+      "items": {
+        "$ref": "#/$defs/ReceiveMode"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "agent",
+    "description",
+    "max_inline_bytes",
+    "content_types",
+    "encodings",
+    "modes"
+  ],
+  "title": "Capabilities",
+  "type": "object"
+}
