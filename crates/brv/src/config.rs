@@ -22,6 +22,10 @@ pub struct BrvConfig {
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
+    // 한 머신에서 여러 에이전트 프로필을 돌릴 때(테스트·다중 프로젝트)를 위한 오버라이드
+    if let Ok(path) = std::env::var("BREVDUVA_CONFIG") {
+        return Ok(PathBuf::from(path));
+    }
     let dir = dirs::config_dir().context("cannot resolve OS config directory")?;
     Ok(dir.join("brevduva").join("config.toml"))
 }
