@@ -1,0 +1,12 @@
+# 공유 crate — 프로토콜 타입·직렬화·검증·토픽 매칭 (PROTOCOL.md의 코드화)
+# 리시버(brv)와 서버(클로즈드 리포)가 함께 의존한다 — 이중 구현 금지의 실체
+[package]
+name = "brevduva-protocol"
+description = "Brevduva agent messaging protocol: types, serialization, validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

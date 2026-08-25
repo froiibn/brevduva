@@ -1,0 +1,14 @@
+# brv — Brevduva 리시버 데몬 + CLI (오픈소스 클라이언트, IMPLEMENTATION.md 페이즈 5에서 본격 구현)
+[package]
+name = "brv"
+description = "Brevduva receiver daemon and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+brevduva-protocol = { path = "../brevduva-protocol" }
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+# 버전 고정 정책 (검증한 버전만 사용) — 올릴 때는 CI 녹색 확인 후 의도적 커밋으로
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
