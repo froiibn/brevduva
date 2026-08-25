@@ -228,6 +228,7 @@ WebSocket 위의 모든 통신 단위는 컨트롤 프레임. 메시지 엔벨�
 | `msg/hops-exceeded` | max_hops 초과 — 연쇄 차단 | ✕ |
 | `msg/unknown-recipient` | `agent:{name}`이 채널에 없음 | ✕ |
 | `msg/capability-mismatch` | 수신자 능력 선언 위반 (크기/타입) | ✕ |
+| `frame/invalid` | 컨트롤 프레임 파싱 불가 또는 프레임 규약 위반 (JOIN 전 다른 op, capabilities와 토큰 정체성 불일치 등) | ✕ |
 | `rate/limited` | 발행 속도 제한 | ○ (backoff 후) |
 | `server/internal` | 서버 오류 | ○ |
 

@@ -29,6 +29,9 @@ pub enum ErrorCode {
     MsgUnknownRecipient,
     /// 수신자 능력 선언 위반 (크기/타입).
     MsgCapabilityMismatch,
+    /// 프레임 파싱 불가 또는 프레임 규약 위반 (JOIN 전 다른 op, capabilities 불일치 등).
+    /// 페이즈 2 구현 중 발견된 스펙 공백을 8장에 역반영하며 추가 (2026-08-26).
+    FrameInvalid,
     /// 발행 속도 제한 — ERR body의 retry_after_ms 후 재시도.
     RateLimited,
     /// 서버 오류.
@@ -48,6 +51,7 @@ impl ErrorCode {
             Self::MsgHopsExceeded => "msg/hops-exceeded",
             Self::MsgUnknownRecipient => "msg/unknown-recipient",
             Self::MsgCapabilityMismatch => "msg/capability-mismatch",
+            Self::FrameInvalid => "frame/invalid",
             Self::RateLimited => "rate/limited",
             Self::ServerInternal => "server/internal",
             Self::Unknown(s) => s,
@@ -72,6 +76,7 @@ impl From<String> for ErrorCode {
             "msg/hops-exceeded" => Self::MsgHopsExceeded,
             "msg/unknown-recipient" => Self::MsgUnknownRecipient,
             "msg/capability-mismatch" => Self::MsgCapabilityMismatch,
+            "frame/invalid" => Self::FrameInvalid,
             "rate/limited" => Self::RateLimited,
             "server/internal" => Self::ServerInternal,
             _ => Self::Unknown(value),
