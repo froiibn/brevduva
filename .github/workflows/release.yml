@@ -1,0 +1,92 @@
+# 릴리스 파이프라인 (2026-08-27) — 태그 `v*` 푸시 → 5종 타깃 빌드 → GitHub Release 게시.
+#
+# 자산 이름에 버전을 넣지 않는다(`brv-<target>.tar.gz`) — install.sh가
+# /releases/latest/download/ 고정 URL로 항상 최신을 받기 위함. 버전은 태그가 담는다.
+# 리눅스는 musl 정적 링크 — 배포 대상의 glibc 버전에 의존하지 않는다.
+# aarch64 리눅스는 공개 리포 무료 arm64 러너로 네이티브 빌드 (크로스 컴파일 배제).
+# macOS x86_64만 arm 러너에서 크로스 (Intel 러너 은퇴 대비 — SDK가 양쪽 아치를 지원).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      # aws-lc-sys(TLS 암호 구현) 빌드 요구: musl은 musl-gcc, 윈도우 MSVC는 NASM
+      - name: musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: NASM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
+
+      - name: target 추가
+        run: rustup target add ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked -p brv --target ${{ matrix.target }}
+
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir stage
+          cp "target/${{ matrix.target }}/release/brv" LICENSE stage/
+          tar -czf "brv-${{ matrix.target }}.tar.gz" -C stage .
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/brv.exe","LICENSE" stage/
+          Compress-Archive -Path stage\* -DestinationPath "brv-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brv-${{ matrix.target }}
+          path: brv-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: checksums
+        run: cd dist && sha256sum brv-* > SHA256SUMS
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # 재실행 시 릴리스가 이미 있으면 자산만 갱신 (--clobber)
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "brv $GITHUB_REF_NAME" \
+            --notes "설치: macOS/Linux \`curl -fsSL https://brevduva.dev/install.sh | sh\` · Windows \`irm https://brevduva.dev/install.ps1 | iex\` — 또는 아래 자산을 직접 받아 SHA256SUMS로 검증." \
+          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber

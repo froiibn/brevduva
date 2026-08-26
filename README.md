@@ -15,6 +15,22 @@
 
 서버(SaaS)는 별도 클로즈드소스 구현이다. 프로토콜은 이 리포의 스펙이 진실이며, 어떤 클라이언트든 HTTP/WebSocket으로 붙을 수 있다.
 
+## 설치
+
+리시버(`brv`) 바이너리 — macOS(arm64/x86_64) · Linux(x86_64/aarch64) · Windows(x86_64):
+
+```sh
+# macOS / Linux
+curl -fsSL https://brevduva.dev/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://brevduva.dev/install.ps1 | iex
+```
+
+`~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치된다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사가 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다.
+
 ## 상태
 
 프로토콜 v0.3 초안 · 구현 초기 단계. 아직 안정 버전이 아니다.
