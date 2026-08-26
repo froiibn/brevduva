@@ -174,13 +174,15 @@ async fn init(
         .error_for_status()
         .context("grant failed")?;
 
-    // 3) 로컬 저장 — 토큰은 키체인, 설정은 파일 (클라이언트에 비밀 없음 원칙)
+    // 3) 로컬 저장 — 토큰은 키체인, 설정은 파일 (클라이언트에 비밀 없음 원칙).
+    // 기존 설정이 있으면 [wake] 등 운영 설정을 보존한다 — 재init·토큰 회전이 깨우기를 지우면 안 됨
+    let wake = config::load().ok().and_then(|existing| existing.wake);
     let cfg = BrvConfig {
         server: base,
         channel,
         agent,
         description,
-        wake: None, // 깨우기는 daemon 도입 시 config.toml에 [wake]로 추가
+        wake,
     };
     config::store_token(&cfg, &token)?;
     let path = config::store(&cfg)?;

@@ -81,12 +81,11 @@ pub fn store(cfg: &BrvConfig) -> anyhow::Result<PathBuf> {
 }
 
 fn keyring_entry(cfg: &BrvConfig) -> anyhow::Result<keyring::Entry> {
-    // 계정 키에 서버·채널·에이전트를 모두 넣어 다중 프로필 충돌을 막는다
-    keyring::Entry::new(
-        "brevduva",
-        &format!("{}:{}@{}", cfg.channel, cfg.agent, cfg.server),
-    )
-    .context("keyring unavailable")
+    // 계정 키 = 에이전트@서버 — 채널은 넣지 않는다 (2026-08-27 수정).
+    // 토큰은 org 스코프(PROTOCOL.md 2.1·5.1)라 한 에이전트가 여러 채널에 참가한다 —
+    // 채널을 키에 넣으면 채널 추가마다 토큰을 못 찾는 스펙 위반이 된다 (실전 채널 분리에서 발견)
+    keyring::Entry::new("brevduva", &format!("{}@{}", cfg.agent, cfg.server))
+        .context("keyring unavailable")
 }
 
 /// 토큰 저장 — 키체인 우선. 실패 시 오류 (파일에 평문 저장은 하지 않는다).
