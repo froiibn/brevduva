@@ -95,12 +95,25 @@ pub fn store_token(cfg: &BrvConfig, token: &str) -> anyhow::Result<()> {
         .context("keyring write failed — set BREVDUVA_TOKEN env var as a fallback")
 }
 
-/// 토큰 로드 — `BREVDUVA_TOKEN` 환경 변수가 키체인보다 우선 (CI·headless용).
+/// 토큰 로드 우선순위: `BREVDUVA_TOKEN` env → OS 키체인 → 토큰 파일.
+/// 토큰 파일(설정 디렉터리의 `token`, 600 권한)은 키체인이 없는 headless 리눅스 서버용 —
+/// 데몬이 깨운 세션의 MCP도 같은 경로로 토큰을 찾는다 (2026-08-27, lucadm 배치에서 필요 확인).
 pub fn load_token(cfg: &BrvConfig) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("BREVDUVA_TOKEN") {
         return Ok(token);
     }
-    keyring_entry(cfg)?
-        .get_password()
-        .context("token not found — run `brv init` or set BREVDUVA_TOKEN")
+    if let Ok(entry) = keyring_entry(cfg)
+        && let Ok(token) = entry.get_password()
+    {
+        return Ok(token);
+    }
+    let token_file = config_path()?
+        .parent()
+        .expect("config has parent")
+        .join("token");
+    std::fs::read_to_string(&token_file)
+        .map(|t| t.trim().to_owned())
+        .with_context(|| {
+            format!("token not found — run `brv init`, set BREVDUVA_TOKEN, or place it at {token_file:?}")
+        })
 }
