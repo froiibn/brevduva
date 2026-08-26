@@ -1,4 +1,4 @@
-﻿//! 로컬 MCP 서버 — stdio 위 JSON-RPC (newline-delimited).
+//! 로컬 MCP 서버 — stdio 위 JSON-RPC (newline-delimited).
 //!
 //! 도구 설명이 곧 제품이다 (PLAN.md "자율 협업 유도"): 언제 동료에게 알리고 물어야
 //! 하는지의 규약을 설명에 심는다. stdout은 프로토콜 전용 — 로그는 stderr로.
@@ -13,7 +13,7 @@ use brevduva_protocol::{Envelope, Expects, Kind};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-use crate::client::{Client, PublishSpec, RecvFilter};
+use crate::client::{Client, ClientOptions, PublishSpec, RecvFilter};
 
 /// 도구가 기다릴 수 있는 상한 — MCP 호스트 타임아웃(9장 "60초 홀드 → 재호출 루프")과 정합.
 const MAX_WAIT_S: u64 = 120;
@@ -21,17 +21,31 @@ const MAX_WAIT_S: u64 = 120;
 const PUBLISH_CONFIRM_S: u64 = 10;
 
 pub struct McpServer {
-    client: Client,
+    opts: ClientOptions,
+    /// **lazy-JOIN**: 첫 도구 호출 때 접속한다 (플랩 실측 후 변경) — MCP 호스트가
+    /// 도구 탐색용으로 프로세스를 여분 스폰해도, 쓰지 않는 인스턴스는 에이전트
+    /// 자리를 두고 경쟁하지 않는다 (2.2 테이크오버 전쟁 방지).
+    client: Option<Client>,
     /// 전달한 메시지의 hops 기록 — 반응 메시지(reply/ack/report)의 hops+1 계산용 (3.3).
     hops_by_id: HashMap<String, u32>,
 }
 
 impl McpServer {
-    pub fn new(client: Client) -> Self {
+    pub fn new(opts: ClientOptions) -> Self {
         Self {
-            client,
+            opts,
+            client: None,
             hops_by_id: HashMap::new(),
         }
+    }
+
+    /// 접속 확보 — 첫 호출 시 JOIN. Client 핸들은 clone이 저렴하다 (mpsc sender).
+    fn ensure_client(&mut self) -> Client {
+        if self.client.is_none() {
+            tracing::info!("first tool call — joining channel");
+            self.client = Some(Client::connect(self.opts.clone()));
+        }
+        self.client.as_ref().expect("client just set").clone()
     }
 
     /// stdio 루프 — 표준 입력이 닫히면 종료.
@@ -110,12 +124,9 @@ impl McpServer {
         self.hops_by_id.get(correlation_id).map_or(1, |h| h + 1)
     }
 
-    async fn publish(&self, spec: PublishSpec) -> (Value, bool) {
-        match tokio::time::timeout(
-            Duration::from_secs(PUBLISH_CONFIRM_S),
-            self.client.publish(spec),
-        )
-        .await
+    async fn publish(client: &Client, spec: PublishSpec) -> (Value, bool) {
+        match tokio::time::timeout(Duration::from_secs(PUBLISH_CONFIRM_S), client.publish(spec))
+            .await
         {
             Ok(Ok(id)) => (json!({ "status": "sent", "id": id.as_str() }), false),
             Ok(Err(err)) => (
@@ -135,6 +146,8 @@ impl McpServer {
     async fn call_tool(&mut self, name: &str, args: &Value) -> (Value, bool) {
         let s = |key: &str| args[key].as_str().map(str::to_owned);
         let timeout_s = args["timeout_s"].as_u64().unwrap_or(60).min(MAX_WAIT_S);
+        // lazy-JOIN: 실제 도구 사용 시점에만 채널에 접속한다
+        let client = self.ensure_client();
         match name {
             "send" => {
                 let Some(to) = s("to") else {
@@ -150,7 +163,7 @@ impl McpServer {
                 if let Some(ttl) = args["ttl_ms"].as_u64() {
                     spec.ttl_ms = Some(ttl);
                 }
-                self.publish(spec).await
+                Self::publish(&client, spec).await
             }
             "request" => {
                 let Some(to) = s("to") else {
@@ -162,13 +175,12 @@ impl McpServer {
                 let mut spec = PublishSpec::message(normalize_to(&to), payload);
                 spec.kind = Kind::Request;
                 spec.expects = Some(Expects::Reply);
-                let (sent, is_error) = self.publish(spec).await;
+                let (sent, is_error) = Self::publish(&client, spec).await;
                 if is_error {
                     return (sent, true);
                 }
                 let correlation = sent["id"].as_str().unwrap_or_default().to_owned();
-                match self
-                    .client
+                match client
                     .recv(
                         RecvFilter::Correlation(correlation.clone()),
                         Duration::from_secs(timeout_s),
@@ -204,7 +216,7 @@ impl McpServer {
                 };
                 spec.hops = self.reaction_hops(&correlation_id);
                 spec.correlation_id = Some(correlation_id);
-                self.publish(spec).await
+                Self::publish(&client, spec).await
             }
             "acknowledge" => {
                 let Some(correlation_id) = s("correlation_id") else {
@@ -222,10 +234,9 @@ impl McpServer {
                 spec.content_type = "application/json".to_owned();
                 spec.hops = self.reaction_hops(&correlation_id);
                 spec.correlation_id = Some(correlation_id);
-                self.publish(spec).await
+                Self::publish(&client, spec).await
             }
-            "wait_for_message" => match self
-                .client
+            "wait_for_message" => match client
                 .recv(RecvFilter::Any, Duration::from_secs(timeout_s))
                 .await
             {
@@ -243,8 +254,7 @@ impl McpServer {
                 let Some(correlation_id) = s("correlation_id") else {
                     return missing("correlation_id");
                 };
-                match self
-                    .client
+                match client
                     .recv(
                         RecvFilter::Correlation(correlation_id.clone()),
                         Duration::from_secs(timeout_s),
@@ -265,11 +275,7 @@ impl McpServer {
             "fetch_history" => {
                 let after_id = s("after_id");
                 let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
-                match self
-                    .client
-                    .fetch(after_id, limit, Duration::from_secs(15))
-                    .await
-                {
+                match client.fetch(after_id, limit, Duration::from_secs(15)).await {
                     Ok(messages) => {
                         let rendered: Vec<Value> = messages
                             .iter()
@@ -280,7 +286,7 @@ impl McpServer {
                     Err(message) => (json!({ "status": "error", "message": message }), true),
                 }
             }
-            "presence" => match self.client.presence(Duration::from_secs(15)).await {
+            "presence" => match client.presence(Duration::from_secs(15)).await {
                 Ok(entries) => (
                     json!({ "status": "ok",
                             "presence": serde_json::to_value(entries).expect("presence") }),
@@ -401,8 +407,8 @@ fn tool_definitions() -> Value {
 }
 
 /// 진입점 — 설정된 정체성으로 접속해 stdio MCP를 돌린다.
-pub async fn run_stdio(client: Client) -> anyhow::Result<()> {
-    McpServer::new(client).run().await
+pub async fn run_stdio(opts: ClientOptions) -> anyhow::Result<()> {
+    McpServer::new(opts).run().await
 }
 
 #[cfg(test)]
@@ -420,13 +426,8 @@ mod tests {
     #[tokio::test]
     async fn initialize_and_tools_list_shapes() {
         // 클라이언트 연결 없이 프로토콜 계층만 검증 (dead client — 도구 호출은 안 함)
-        let client = Client::connect(crate::client::ClientOptions::new(
-            "http://127.0.0.1:1",
-            "x",
-            "x",
-            "t",
-        ));
-        let mut mcp = McpServer::new(client);
+        let opts = ClientOptions::new("http://127.0.0.1:1", "x", "x", "t");
+        let mut mcp = McpServer::new(opts);
         let init = mcp
             .dispatch(
                 serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -453,5 +454,7 @@ mod tests {
             .await
             .is_none()
         );
+        // lazy-JOIN: 탐색성 요청(initialize·tools/list)만으로는 채널에 접속하지 않는다
+        assert!(mcp.client.is_none(), "discovery must not join the channel");
     }
 }

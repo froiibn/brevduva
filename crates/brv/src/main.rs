@@ -99,13 +99,17 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
+fn options_from_config() -> anyhow::Result<(BrvConfig, ClientOptions)> {
     let cfg = config::load()?;
     let token = config::load_token(&cfg)?;
     let mut opts = ClientOptions::new(&cfg.server, &cfg.channel, &cfg.agent, token);
     opts.description = cfg.description.clone();
-    let client = Client::connect(opts);
-    Ok((cfg, client))
+    Ok((cfg, opts))
+}
+
+fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
+    let (cfg, opts) = options_from_config()?;
+    Ok((cfg, Client::connect(opts)))
 }
 
 async fn init(
@@ -256,7 +260,8 @@ async fn listen() -> anyhow::Result<()> {
 }
 
 async fn mcp() -> anyhow::Result<()> {
-    let (cfg, client) = connect_from_config()?;
+    // lazy-JOIN: 여기서 접속하지 않는다 — 첫 도구 호출 때 McpServer가 접속 (플랩 방지)
+    let (cfg, opts) = options_from_config()?;
     tracing::info!(agent = %cfg.agent, channel = %cfg.channel, "brv mcp server on stdio");
-    brv::mcp::run_stdio(client).await
+    brv::mcp::run_stdio(opts).await
 }

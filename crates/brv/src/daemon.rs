@@ -126,11 +126,23 @@ async fn run_wake(wake: &WakeConfig, prompt: &str) -> anyhow::Result<()> {
         .map(|a| a.replace("{prompt}", prompt))
         .collect();
     tracing::info!(command = %wake.command, dir = %wake.dir, "waking session");
+    // 깨운 세션의 출력은 wake.log로 — 실패 원인 추적용 (버리면 디버깅 불가, 실측 교훈)
+    let log_path = crate::config::config_path()?
+        .parent()
+        .expect("config has parent")
+        .join("wake.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("cannot open wake log {log_path:?}"))?;
     let mut child = tokio::process::Command::new(&wake.command)
         .args(&args)
         .current_dir(&wake.dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(
+            log.try_clone().context("clone log handle")?,
+        ))
+        .stderr(std::process::Stdio::from(log))
         .spawn()
         .with_context(|| format!("cannot spawn wake command {:?}", wake.command))?;
     match tokio::time::timeout(Duration::from_secs(wake.timeout_s), child.wait()).await {
