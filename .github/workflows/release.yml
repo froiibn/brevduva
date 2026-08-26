@@ -84,9 +84,10 @@ jobs:
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
+        # -R 필수: 이 잡은 checkout이 없어 gh가 리포를 git에서 추론하지 못한다.
         # 재실행 시 릴리스가 이미 있으면 자산만 갱신 (--clobber)
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" \
             --title "brv $GITHUB_REF_NAME" \
             --notes "설치: macOS/Linux \`curl -fsSL https://brevduva.dev/install.sh | sh\` · Windows \`irm https://brevduva.dev/install.ps1 | iex\` — 또는 아래 자산을 직접 받아 SHA256SUMS로 검증." \
-          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          || gh release upload "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --clobber
