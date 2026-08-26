@@ -127,10 +127,14 @@ async fn run_wake(wake: &WakeConfig, prompt: &str) -> anyhow::Result<()> {
         .collect();
     tracing::info!(command = %wake.command, dir = %wake.dir, "waking session");
     // 깨운 세션의 출력은 wake.log로 — 실패 원인 추적용 (버리면 디버깅 불가, 실측 교훈)
-    let log_path = crate::config::config_path()?
+    let log_dir = crate::config::config_path()?
         .parent()
         .expect("config has parent")
-        .join("wake.log");
+        .to_path_buf();
+    // 신규 머신에는 설정 디렉터리가 아직 없다 (CI에서 실측) — 로그 열기 전에 보장
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("cannot create log dir {log_dir:?}"))?;
+    let log_path = log_dir.join("wake.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
