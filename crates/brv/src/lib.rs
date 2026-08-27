@@ -10,5 +10,6 @@
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod enroll;
 pub mod mcp;
 pub mod service;

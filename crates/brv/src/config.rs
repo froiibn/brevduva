@@ -99,11 +99,35 @@ fn keyring_entry(cfg: &BrvConfig) -> anyhow::Result<keyring::Entry> {
         .context("keyring unavailable")
 }
 
-/// 토큰 저장 — 키체인 우선. 실패 시 오류 (파일에 평문 저장은 하지 않는다).
-pub fn store_token(cfg: &BrvConfig, token: &str) -> anyhow::Result<()> {
-    keyring_entry(cfg)?
-        .set_password(token)
-        .context("keyring write failed — set BREVDUVA_TOKEN env var as a fallback")
+/// 토큰이 실제로 저장된 위치 — 호출자가 사용자에게 정확히 알려주기 위한 반환값.
+#[derive(Debug)]
+pub enum TokenStore {
+    Keyring,
+    File(PathBuf),
+}
+
+/// 토큰 저장 — 키체인 우선, 불가하면 토큰 파일(600) 폴백.
+/// 키체인 없는 헤드리스 리눅스에서 init이 실패하던 결함의 근본 수정 (2026-08-28, 페이즈 10) —
+/// load_token의 파일 폴백과 대칭이 됐다 (lucadm 배치 때는 수동으로 우회했던 경로).
+pub fn store_token(cfg: &BrvConfig, token: &str) -> anyhow::Result<TokenStore> {
+    if let Ok(entry) = keyring_entry(cfg)
+        && entry.set_password(token).is_ok()
+    {
+        return Ok(TokenStore::Keyring);
+    }
+    let path = config_path()?
+        .parent()
+        .expect("config has parent")
+        .join("token");
+    std::fs::create_dir_all(path.parent().expect("token path has parent"))?;
+    std::fs::write(&path, token)
+        .with_context(|| format!("keyring unavailable and token file write failed at {path:?}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(TokenStore::File(path))
 }
 
 /// 토큰 로드 우선순위: `BREVDUVA_TOKEN` env → OS 키체인 → 토큰 파일.

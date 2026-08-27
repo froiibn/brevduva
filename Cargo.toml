@@ -1,11 +1,11 @@
-# Brevduva 공개 워크스페이스 — 프로토콜 crate + 리시버(brv)
+﻿# Brevduva 공개 워크스페이스 — 프로토콜 crate + 리시버(brv)
 # 서버(클로즈드 리포)는 crates/brevduva-protocol에 path 의존한다 (형제 디렉터리 체크아웃 전제)
 [workspace]
 resolver = "3"
 members = ["crates/brevduva-protocol", "crates/brv"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/froiibn/brevduva"

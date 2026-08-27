@@ -23,26 +23,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 에이전트 등록 + 채널 생성 + grant + 로컬 설정까지 한 번에 (관리 API 사용)
+    /// 에이전트 연결 — 일회용 코드(--enroll, 권장) 또는 관리 API 키로
     Init {
-        /// 서버 베이스 URL (예: http://3.34.220.217:8080)
+        /// 서버 베이스 URL (예: https://api.brevduva.dev)
         #[arg(long)]
         server: String,
-        /// 관리 API 키 (BREVDUVA_ADMIN_KEY)
-        #[arg(long, env = "BREVDUVA_ADMIN_KEY")]
-        admin_key: String,
-        /// 이 머신의 에이전트 이름 (예: backend)
+        /// 일회용 연결 코드 (대시보드 "머신 연결"에서 발급) — 관리 키 불필요
         #[arg(long)]
-        agent: String,
-        /// 채널(프로젝트) 이름
-        #[arg(long)]
-        channel: String,
-        /// 능력 선언 소개문 — 동료 에이전트의 라우팅 판단 근거
+        enroll: Option<String>,
+        /// 관리 API 키 (BREVDUVA_ADMIN_KEY) — --enroll 사용 시 불필요
+        #[arg(
+            long,
+            env = "BREVDUVA_ADMIN_KEY",
+            required_unless_present = "enroll",
+            conflicts_with = "enroll"
+        )]
+        admin_key: Option<String>,
+        /// 이 머신의 에이전트 이름 (예: backend) — enroll에서는 코드가 결정
+        #[arg(long, required_unless_present = "enroll", conflicts_with = "enroll")]
+        agent: Option<String>,
+        /// 채널(프로젝트) 이름 — enroll에서는 부여된 채널 중 선택(생략 시 첫 채널)
+        #[arg(long, required_unless_present = "enroll")]
+        channel: Option<String>,
+        /// 능력 선언 소개문 — 동료 에이전트의 라우팅 판단 근거 (enroll은 발급 시 값 사용)
         #[arg(long, default_value = "")]
         description: String,
         /// 에이전트가 이미 있으면 토큰을 회전해 재사용
-        #[arg(long)]
+        #[arg(long, conflicts_with = "enroll")]
         rotate: bool,
+        /// enroll 후 Claude Code MCP 자동 등록을 생략
+        #[arg(long)]
+        no_mcp: bool,
     },
     /// 설정·서버·채널 상태 점검
     Status,
@@ -147,12 +158,28 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Init {
             server,
+            enroll,
             admin_key,
             agent,
             channel,
             description,
             rotate,
-        } => init(server, admin_key, agent, channel, description, rotate).await,
+            no_mcp,
+        } => match enroll {
+            Some(code) => enroll_init(server, code, channel, no_mcp).await,
+            None => {
+                // clap의 required_unless_present가 보장 — 여기 도달하면 전부 Some
+                init(
+                    server,
+                    admin_key.context("clap invariant: admin_key")?,
+                    agent.context("clap invariant: agent")?,
+                    channel.context("clap invariant: channel")?,
+                    description,
+                    rotate,
+                )
+                .await
+            }
+        },
         Cmd::Status => status().await,
         Cmd::Send {
             to,
@@ -186,6 +213,81 @@ fn options_from_config() -> anyhow::Result<(BrvConfig, ClientOptions)> {
 fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
     let (cfg, opts) = options_from_config()?;
     Ok((cfg, Client::connect(opts)))
+}
+
+fn token_store_note(stored: &config::TokenStore) -> String {
+    match stored {
+        config::TokenStore::Keyring => "토큰은 OS 키체인".to_owned(),
+        config::TokenStore::File(p) => format!("키체인 없음 — 토큰 파일 {p:?} (600 권한)"),
+    }
+}
+
+/// `brv init --enroll <코드>` — 대시보드 발급 코드 하나로 연결 (페이즈 10, PROTOCOL 10.1).
+async fn enroll_init(
+    server: String,
+    code: String,
+    channel: Option<String>,
+    no_mcp: bool,
+) -> anyhow::Result<()> {
+    let enrolled = brv::enroll::exchange(&server, code.trim(), channel.as_deref()).await?;
+    let stored = config::store_token(&enrolled.cfg, &enrolled.token)?;
+    let path = config::store(&enrolled.cfg)?;
+    println!(
+        "연결 완료 — 조직 {org} / 에이전트 {agent} / 채널 {ch}",
+        org = enrolled.org,
+        agent = enrolled.cfg.agent,
+        ch = enrolled.cfg.channel,
+    );
+    if enrolled.channels.len() > 1 {
+        println!(
+            "  부여된 다른 채널: {} (전환은 설정의 channel 값 또는 --channel)",
+            enrolled
+                .channels
+                .iter()
+                .filter(|c| **c != enrolled.cfg.channel)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("  설정: {path:?} / {}", token_store_note(&stored));
+    if no_mcp {
+        println!("에이전트에서 쓰려면: claude mcp add brevduva -- brv mcp");
+    } else {
+        register_mcp();
+    }
+    Ok(())
+}
+
+/// Claude Code MCP 자동 등록 (기본 켬, --no-mcp로 생략) — 실패는 온보딩 실패가 아니라 안내.
+/// --scope user: 기본 스코프(local)는 실행한 디렉터리에 묶여 온보딩 목적에 안 맞는다.
+fn register_mcp() {
+    match std::process::Command::new("claude")
+        .args([
+            "mcp", "add", "--scope", "user", "brevduva", "--", "brv", "mcp",
+        ])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            println!("Claude Code MCP 등록 완료 — 에이전트가 바로 채널을 쓸 수 있습니다");
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("already exists") {
+                println!("Claude Code MCP는 이미 등록되어 있습니다");
+            } else {
+                println!(
+                    "MCP 자동 등록 실패 — 수동 등록: claude mcp add brevduva -- brv mcp\n  ({})",
+                    err.trim()
+                );
+            }
+        }
+        Err(_) => {
+            println!(
+                "claude CLI가 없어 MCP 등록을 건너뜀 — 에이전트에서 쓰려면: claude mcp add brevduva -- brv mcp"
+            );
+        }
+    }
 }
 
 async fn init(
@@ -260,10 +362,13 @@ async fn init(
         description,
         wake,
     };
-    config::store_token(&cfg, &token)?;
+    let stored = config::store_token(&cfg, &token)?;
     let path = config::store(&cfg)?;
 
-    println!("초기화 완료 — 설정: {path:?} (토큰은 OS 키체인)");
+    println!(
+        "초기화 완료 — 설정: {path:?} ({})",
+        token_store_note(&stored)
+    );
     println!();
     println!("Claude Code에 연결하려면:");
     println!("  claude mcp add brevduva -- brv mcp");
