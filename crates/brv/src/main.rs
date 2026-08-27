@@ -57,6 +57,8 @@ enum Cmd {
     },
     /// 설정·서버·채널 상태 점검
     Status,
+    /// 이 에이전트가 참가할 수 있는 채널 목록 (토큰 기준, PROTOCOL 10.2)
+    Channels,
     /// 메시지 한 건 발행 (수동 테스트용)
     Send {
         #[arg(long)]
@@ -181,6 +183,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             }
         },
         Cmd::Status => status().await,
+        Cmd::Channels => channels().await,
         Cmd::Send {
             to,
             payload,
@@ -213,6 +216,24 @@ fn options_from_config() -> anyhow::Result<(BrvConfig, ClientOptions)> {
 fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
     let (cfg, opts) = options_from_config()?;
     Ok((cfg, Client::connect(opts)))
+}
+
+/// `brv channels` — 내 grant 채널 목록 (현재 설정 채널 표시).
+async fn channels() -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let token = config::load_token(&cfg)?;
+    let (org, agent, list) = brv::client::discover_channels(&cfg.server, &token).await?;
+    println!("에이전트 {agent} @ 조직 {org} — 참가 가능 채널:");
+    for ch in &list {
+        let marker = if *ch == cfg.channel { "* " } else { "  " };
+        println!("{marker}{ch}");
+    }
+    if list.is_empty() {
+        println!("  (없음 — 대시보드에서 채널 참가 권한을 부여하세요)");
+    } else {
+        println!("(* = 현재 설정의 채널. 전환: 설정 파일의 channel 값 수정)");
+    }
+    Ok(())
 }
 
 fn token_store_note(stored: &config::TokenStore) -> String {

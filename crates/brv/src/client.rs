@@ -585,6 +585,41 @@ enum ConnEnd {
     Closed,
 }
 
+/// 채널 발견 (PROTOCOL 10.2) — 토큰으로 자신의 grant 채널 조회. JOIN 불요라
+/// 세션·프레즌스에 영향이 없다. 반환: (org, agent, channels).
+pub async fn discover_channels(
+    server: &str,
+    token: &str,
+) -> anyhow::Result<(String, String, Vec<String>)> {
+    use anyhow::Context as _;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/agent/channels",
+            server.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("server unreachable")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "channel discovery rejected: {}",
+        body["message"].as_str().unwrap_or(status.as_str())
+    );
+    let get = |k: &str| body[k].as_str().unwrap_or_default().to_owned();
+    let channels = body["channels"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((get("org"), get("agent"), channels))
+}
+
 /// standby: long-poll PRESENCE 프로브(세션·큐 무접촉)로 자리가 빌 때까지 대기.
 /// 오류(서버 불가 등)는 "자리 비어 있음"으로 간주 — 재접속 경로의 백오프가 뒷일을 맡는다.
 async fn standby_until_free(opts: &ClientOptions) {

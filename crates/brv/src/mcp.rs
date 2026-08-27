@@ -146,6 +146,18 @@ impl McpServer {
     async fn call_tool(&mut self, name: &str, args: &Value) -> (Value, bool) {
         let s = |key: &str| args[key].as_str().map(str::to_owned);
         let timeout_s = args["timeout_s"].as_u64().unwrap_or(60).min(MAX_WAIT_S);
+        // 채널 발견(10.2)은 JOIN 없는 읽기 — lazy-JOIN을 트리거하지 않는다
+        if name == "list_channels" {
+            return match crate::client::discover_channels(&self.opts.server, &self.opts.token).await
+            {
+                Ok((org, agent, channels)) => (
+                    json!({ "org": org, "agent": agent,
+                            "current_channel": self.opts.channel, "channels": channels }),
+                    false,
+                ),
+                Err(e) => (json!({ "status": "error", "message": e.to_string() }), true),
+            };
+        }
         // lazy-JOIN: 실제 도구 사용 시점에만 채널에 접속한다
         let client = self.ensure_client();
         match name {
@@ -329,6 +341,11 @@ blindly. (5) While idle in long tasks, call wait_for_message periodically so pee
 
 fn tool_definitions() -> Value {
     json!([
+        {
+            "name": "list_channels",
+            "description": "List the channels this agent is granted access to, plus the current session channel. Read-only discovery (does not join anything). Peers in other listed channels are reachable only after switching the configured channel — tools always operate on the current channel.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
         {
             "name": "send",
             "description": "Send a one-way message to a peer agent (to=\"frontend\"), the whole channel (to=\"broadcast\"), or a topic (to=\"topic:api-changes.auth\"). CONTRACT: after changing any interface peers depend on, broadcast it with expects_ack=true so affected agents can react. Returns the message id.",
