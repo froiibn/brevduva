@@ -57,8 +57,19 @@ fn default_wake_timeout() -> u64 {
     600
 }
 
+/// 프로세스 내 설정 경로 고정 — 윈도우 서비스 모드(페이즈 7)에서 SCM launch args로 받은
+/// 경로를 전달하는 통로. 에디션 2024에서 `env::set_var`가 unsafe라 env 주입 대신 이 방식.
+static PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_path_override(path: PathBuf) {
+    let _ = PATH_OVERRIDE.set(path);
+}
+
 pub fn config_path() -> anyhow::Result<PathBuf> {
-    // 한 머신에서 여러 에이전트 프로필을 돌릴 때(테스트·다중 프로젝트)를 위한 오버라이드
+    // 우선순위: 프로세스 내 고정(서비스 모드) → env(다중 프로필) → OS 기본 경로
+    if let Some(path) = PATH_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
     if let Ok(path) = std::env::var("BREVDUVA_CONFIG") {
         return Ok(PathBuf::from(path));
     }

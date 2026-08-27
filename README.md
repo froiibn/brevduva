@@ -31,6 +31,15 @@ irm https://brevduva.dev/install.ps1 | iex
 
 `~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치된다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사가 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다.
 
+### 상시 실행 (데몬을 OS 서비스로)
+
+```sh
+brv daemon install      # linux=systemd 사용자 유닛 · macOS=launchd · windows=SCM 서비스(관리자 권한 필요)
+brv daemon uninstall
+```
+
+설정의 `[wake]`대로 메시지 도착 시 세션을 깨운다. 서비스는 현재 사용자 컨텍스트로 돌며(키체인·CLI 로그인 접근), 다중 프로필은 `--config <절대경로>`로 고정한다.
+
 ## 상태
 
 프로토콜 v0.3 초안 · 구현 초기 단계. 아직 안정 버전이 아니다.

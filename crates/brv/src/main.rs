@@ -61,11 +61,56 @@ enum Cmd {
     /// 로컬 MCP 서버 (stdio) — Claude Code 등 MCP 호스트용
     Mcp,
     /// 상주 데몬 — 메시지 도착 시 세션을 깨워 처리 (config의 [wake] 필요)
-    Daemon,
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonCmd>,
+    },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// `brv daemon`의 서비스 등록 서브커맨드 (페이즈 7) — 무인자는 기존 포그라운드 실행.
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// OS 서비스로 등록 (linux=systemd 사용자 유닛, macOS=launchd, windows=SCM 서비스)
+    Install {
+        /// 이 서비스가 쓸 설정 파일 절대 경로 (미지정 시 OS 기본 경로) — 다중 프로필용
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// OS 서비스 등록 해제
+    Uninstall,
+    /// (windows 전용) SCM이 호출하는 서비스 진입점 — 직접 실행하지 말 것
+    #[command(hide = true)]
+    ServiceRun {
+        #[arg(long)]
+        config: Option<String>,
+    },
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // 윈도우 서비스 모드: 콘솔이 없다 — 로그는 설정 디렉터리 파일로, 설정 경로는
+    // SCM launch args에서 (에디션 2024의 unsafe set_var 대신 프로세스 내 override).
+    // 런타임 진입 전에 분기 — SCM dispatcher는 자기 스레드를 점유한다
+    if let Cmd::Daemon {
+        action: Some(DaemonCmd::ServiceRun { config }),
+    } = &cli.cmd
+    {
+        #[cfg(windows)]
+        {
+            if let Some(c) = config {
+                config::set_path_override(c.into());
+            }
+            init_service_file_tracing()?;
+            return brv::service::service_run();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = config;
+            anyhow::bail!("service-run은 윈도우 SCM 전용이다");
+        }
+    }
+
     // stdout은 MCP 프로토콜 전용일 수 있다 — 로그는 항상 stderr로
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -73,8 +118,33 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    tokio::runtime::Runtime::new()?.block_on(async_main(cli.cmd))
+}
 
-    match Cli::parse().cmd {
+/// 서비스 프로세스의 로그 초기화 — stderr가 갈 곳이 없어 설정 디렉터리의 파일로.
+#[cfg(windows)]
+fn init_service_file_tracing() -> anyhow::Result<()> {
+    let dir = config::config_path()?
+        .parent()
+        .expect("config path has parent")
+        .to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon-service.log"))?;
+    tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    Ok(())
+}
+
+async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
         Cmd::Init {
             server,
             admin_key,
@@ -91,11 +161,17 @@ async fn main() -> anyhow::Result<()> {
         } => send(to, payload, expects_ack).await,
         Cmd::Listen => listen().await,
         Cmd::Mcp => mcp().await,
-        Cmd::Daemon => {
-            let cfg = config::load()?;
-            let token = config::load_token(&cfg)?;
-            brv::daemon::run(cfg, token).await
-        }
+        Cmd::Daemon { action } => match action {
+            None => {
+                let cfg = config::load()?;
+                let token = config::load_token(&cfg)?;
+                brv::daemon::run(cfg, token).await
+            }
+            Some(DaemonCmd::Install { config }) => brv::service::install(config.as_deref()),
+            Some(DaemonCmd::Uninstall) => brv::service::uninstall(),
+            // main()이 런타임 진입 전에 처리한다
+            Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run은 main에서 분기"),
+        },
     }
 }
 

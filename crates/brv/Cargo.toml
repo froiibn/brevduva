@@ -24,5 +24,16 @@ toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# OS 서비스 등록 (`brv daemon install`, 페이즈 7) — 윈도우는 SCM 진짜 서비스:
+# 서비스 계정=현재 사용자(키체인·claude 로그인이 사용자 프로필 소속), 암호는 설치 시 1회 입력
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+] }
+rpassword = "7.5.4"
+
 [lints]
 workspace = true

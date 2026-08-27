@@ -23,6 +23,17 @@ const DEBOUNCE: Duration = Duration::from_secs(2);
 const BATCH_CAP: usize = 20;
 
 pub async fn run(cfg: BrvConfig, token: String) -> anyhow::Result<()> {
+    run_with_shutdown(cfg, token, None).await
+}
+
+/// OS 서비스 모드(페이즈 7)용 진입점 — `shutdown` 채널이 true가 되면 유휴 대기 지점에서
+/// 정상 종료한다. 깨우기(wake)가 진행 중이면 완료 후 루프 상단에서 종료 — 세션을 중간에
+/// 죽이지 않는다 (SCM STOP은 wait hint로 버틴다).
+pub async fn run_with_shutdown(
+    cfg: BrvConfig,
+    token: String,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> anyhow::Result<()> {
     let wake = cfg
         .wake
         .clone()
@@ -38,11 +49,28 @@ pub async fn run(cfg: BrvConfig, token: String) -> anyhow::Result<()> {
     tracing::info!(agent = %cfg.agent, channel = %cfg.channel, journal = %journal.display(), "brv daemon up");
 
     loop {
+        if shutdown.as_ref().is_some_and(|s| *s.borrow()) {
+            tracing::info!("shutdown signal — daemon exiting");
+            return Ok(());
+        }
         // 첫 메시지는 무기한 대기 (내부적으로 재접속·standby가 알아서 돈다)
-        let Some(first) = client
-            .recv(RecvFilter::Any, Duration::from_secs(3600))
-            .await
-        else {
+        let first = if let Some(sd) = shutdown.as_mut() {
+            tokio::select! {
+                env = client.recv(RecvFilter::Any, Duration::from_secs(3600)) => env,
+                res = sd.changed() => {
+                    // 송신 측 소멸(Err)은 서비스 런타임이 끝난 것 — 종료로 취급 (busy loop 방지)
+                    if res.is_err() {
+                        return Ok(());
+                    }
+                    continue; // 루프 상단에서 플래그 재검사
+                }
+            }
+        } else {
+            client
+                .recv(RecvFilter::Any, Duration::from_secs(3600))
+                .await
+        };
+        let Some(first) = first else {
             continue;
         };
         let mut batch = vec![first];
