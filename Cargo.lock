@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "brevduva-protocol"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "schemars",
  "serde",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "brv"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "brevduva-protocol",

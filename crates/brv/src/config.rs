@@ -27,7 +27,8 @@ pub struct BrvConfig {
 /// 깨우기 설정 — 메시지 도착 시 실행할 명령 (예: `claude -p "{prompt}"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeConfig {
-    /// `always` | `never` (5.3: 항상/무시. 업무시간 정책은 잔여)
+    /// `always` | `never` (5.3: 항상/무시. 업무시간 정책은 2026-08-29 기각 —
+    /// 에이전트에 사람 리듬 투영은 모순, 비용 우려는 수요 확인 시 깨우기 빈도 상한으로)
     #[serde(default = "default_policy")]
     pub policy: String,
     /// 실행 파일 (전체 경로 권장 — PATH에 없을 수 있음)

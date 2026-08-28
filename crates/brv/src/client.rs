@@ -71,6 +71,8 @@ pub struct PublishSpec {
     pub ttl_ms: Option<u64>,
     pub hops: u32,
     pub meta: Map<String, Value>,
+    /// claim-check 참조 (3.2) — 보통 publish()의 투명 전환이 채운다 (직접 지정도 가능).
+    pub payload_ref: Option<brevduva_protocol::PayloadRef>,
 }
 
 impl PublishSpec {
@@ -85,6 +87,7 @@ impl PublishSpec {
             ttl_ms: None,
             hops: 0,
             meta: Map::new(),
+            payload_ref: None,
         }
     }
 }
@@ -122,22 +125,93 @@ enum Cmd {
     Presence(oneshot::Sender<Result<Vec<PresenceEntry>, String>>),
 }
 
+/// 인라인 임계값의 클라이언트 측 선검사 기준 (12.2 기본값) — 진실은 서버.
+/// 서버가 더 엄격하면 msg/too-large가 오고, 그때 업로드-재시도로 적응한다.
+const INLINE_LIMIT: usize = 262_144;
+
 /// 재연결·큐·ACK를 감춘 클라이언트 핸들. clone 가능.
 #[derive(Clone)]
 pub struct Client {
     cmds: mpsc::Sender<Cmd>,
+    /// 투명 claim-check(페이즈 17)의 HTTP 업로드용 접속 정보 — 액터 밖에서 업로드해야
+    /// 대용량 전송이 WS 루프(PING·전달)를 막지 않는다.
+    server: String,
+    channel: String,
+    token: String,
 }
 
 impl Client {
     pub fn connect(opts: ClientOptions) -> Self {
         let (tx, rx) = mpsc::channel(64);
+        let (server, channel, token) = (
+            opts.server.clone(),
+            opts.channel.clone(),
+            opts.token.clone(),
+        );
         tokio::spawn(actor(opts, rx));
-        Self { cmds: tx }
+        Self {
+            cmds: tx,
+            server,
+            channel,
+            token,
+        }
     }
 
     /// 발행 — 단절 중이면 재연결 후 같은 client_key로 재시도된다 (13.3).
     /// 호출자는 어댑터 정직성 규약(13.4)에 따라 자체 타임아웃을 걸어라.
+    ///
+    /// **투명 claim-check (페이즈 17, 3.2)**: 임계값 초과 페이로드는 blob으로 올리고 참조만
+    /// 싣는다 — 호출자는 크기 제한을 체감하지 않는다. 선검사(기본 256KB)를 통과했는데도
+    /// 서버가 msg/too-large를 주면(서버 설정이 더 엄격) 한 번 업로드 후 재시도한다.
     pub async fn publish(&self, spec: PublishSpec) -> Result<MessageId, ErrBody> {
+        // spawn: 호출자가 타임아웃으로 future를 떨어뜨려도(어댑터 정직성 규약 13.4의 10s 등)
+        // 업로드·발행은 끝까지 진행된다 — "미확인이지만 곧 발행됨" 안내가 거짓이 되지 않게.
+        let this = self.clone();
+        let handle = tokio::spawn(async move { this.publish_flow(spec).await });
+        handle.await.unwrap_or_else(|_| Err(dead_client_err()))
+    }
+
+    async fn publish_flow(&self, mut spec: PublishSpec) -> Result<MessageId, ErrBody> {
+        if spec.payload_ref.is_none()
+            && spec
+                .payload
+                .as_ref()
+                .is_some_and(|p| p.len() > INLINE_LIMIT)
+        {
+            self.offload(&mut spec).await?;
+        }
+        let first = self.publish_raw(spec.clone()).await;
+        match &first {
+            Err(e) if e.code == ErrorCode::MsgTooLarge && spec.payload.is_some() => {
+                self.offload(&mut spec).await?;
+                self.publish_raw(spec).await
+            }
+            _ => first,
+        }
+    }
+
+    /// 페이로드 → blob 업로드 + 참조 전환 (payload는 비운다).
+    async fn offload(&self, spec: &mut PublishSpec) -> Result<(), ErrBody> {
+        let payload = spec.payload.take().unwrap_or_default();
+        let r = upload_blob(
+            &self.server,
+            &self.channel,
+            &self.token,
+            &spec.content_type,
+            payload.into_bytes(),
+        )
+        .await
+        .map_err(|e| ErrBody {
+            code: ErrorCode::ServerInternal,
+            message: format!("claim-check upload failed: {e}"),
+            retryable: true,
+            retry_after_ms: None,
+        })?;
+        spec.payload_ref = Some(r);
+        Ok(())
+    }
+
+    async fn publish_raw(&self, spec: PublishSpec) -> Result<MessageId, ErrBody> {
         let (tx, rx) = oneshot::channel();
         if self
             .cmds
@@ -259,7 +333,7 @@ impl Actor {
             hops: spec.hops,
             content_type: spec.content_type.clone(),
             payload: spec.payload.clone(),
-            payload_ref: None,
+            payload_ref: spec.payload_ref.clone(),
             meta: spec.meta.clone(),
         })
     }
@@ -583,6 +657,73 @@ enum ConnEnd {
     /// 다른 세션이 자리를 가져감 (`agent/session-conflict` 수신, 2.2).
     TakenOver,
     Closed,
+}
+
+/// BLOB_PUT (PROTOCOL 3.2·5.2) — claim-check 업로드. 반환된 참조를 엔벨로프에 싣는다.
+pub async fn upload_blob(
+    server: &str,
+    channel: &str,
+    token: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<brevduva_protocol::PayloadRef> {
+    use anyhow::Context as _;
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/blobs?channel={channel}",
+            server.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .header("content-type", content_type)
+        .body(bytes)
+        .send()
+        .await
+        .context("server unreachable")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "blob upload rejected: {}",
+        body["message"].as_str().unwrap_or(status.as_str())
+    );
+    Ok(brevduva_protocol::PayloadRef {
+        id: body["id"].as_str().unwrap_or_default().to_owned(),
+        size: body["size"].as_u64().unwrap_or_default(),
+        sha256: body["sha256"].as_str().unwrap_or_default().to_owned(),
+        content_type: body["content_type"].as_str().unwrap_or_default().to_owned(),
+    })
+}
+
+/// BLOB_GET (5.2, Range 지원) — claim-check 다운로드. range = (start, inclusive_end?).
+/// 점진 읽기(소형 컨텍스트 보호)의 재료: 어댑터는 머리부터 잘라 읽는다.
+pub async fn download_blob(
+    server: &str,
+    channel: &str,
+    token: &str,
+    id: &str,
+    range: Option<(u64, Option<u64>)>,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context as _;
+    let mut req = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/blobs/{id}?channel={channel}",
+            server.trim_end_matches('/')
+        ))
+        .bearer_auth(token);
+    if let Some((start, end)) = range {
+        let end = end.map(|e| e.to_string()).unwrap_or_default();
+        req = req.header("range", format!("bytes={start}-{end}"));
+    }
+    let resp = req.send().await.context("server unreachable")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "blob download rejected: {}",
+            body["message"].as_str().unwrap_or(status.as_str())
+        );
+    }
+    Ok(resp.bytes().await.context("blob body")?.to_vec())
 }
 
 /// 채널 발견 (PROTOCOL 10.2) — 토큰으로 자신의 grant 채널 조회. JOIN 불요라

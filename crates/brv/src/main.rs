@@ -78,6 +78,20 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<DaemonCmd>,
     },
+    /// Claude Code 훅 연동 (페이즈 17) — 턴 종료 시 대기 메시지 확인
+    Hook {
+        #[command(subcommand)]
+        action: HookCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// ~/.claude/settings.json에 Stop 훅 등록 (멱등)
+    Install,
+    /// Stop 훅 진입점 — Claude Code가 호출한다 (직접 실행할 일 없음)
+    #[command(hide = true)]
+    Stop,
 }
 
 /// `brv daemon`의 서비스 등록 서브커맨드 (페이즈 7) — 무인자는 기존 포그라운드 실행.
@@ -201,6 +215,28 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             Some(DaemonCmd::Uninstall) => brv::service::uninstall(),
             // main()이 런타임 진입 전에 처리한다
             Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run은 main에서 분기"),
+        },
+        Cmd::Hook { action } => match action {
+            HookCmd::Install => {
+                println!("{}", brv::hook::install()?);
+                Ok(())
+            }
+            HookCmd::Stop => {
+                // 훅은 조용해야 한다 — 설정 부재·서버 장애는 침묵 종료 (세션을 방해하지 않음)
+                let Ok(cfg) = config::load() else {
+                    return Ok(());
+                };
+                let Ok(token) = config::load_token(&cfg) else {
+                    return Ok(());
+                };
+                let mut stdin_json = String::new();
+                use tokio::io::AsyncReadExt as _;
+                let _ = tokio::io::stdin().read_to_string(&mut stdin_json).await;
+                if let Some(block) = brv::hook::stop(&cfg, &token, &stdin_json).await {
+                    println!("{block}");
+                }
+                Ok(())
+            }
         },
     }
 }

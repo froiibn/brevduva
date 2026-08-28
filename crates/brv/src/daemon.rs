@@ -131,6 +131,15 @@ pub fn build_prompt(cfg: &BrvConfig, batch: &[Envelope]) -> String {
     let mut messages = String::new();
     for env in batch {
         messages.push_str(&serde_json::to_string(env).expect("envelope serializes"));
+        // 첨부(claim-check) 안내 (페이즈 17) — 본문이 참조뿐이면 읽는 방법을 함께 준다
+        if env.payload.is_none()
+            && let Some(r) = &env.payload_ref
+        {
+            messages.push_str(&format!(
+                "\n(payload is a {} byte attachment — read it with the brevduva MCP tool read_blob, id {:?})",
+                r.size, r.id
+            ));
+        }
         messages.push('\n');
     }
     format!(

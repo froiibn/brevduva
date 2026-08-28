@@ -119,6 +119,59 @@ impl McpServer {
         serde_json::to_value(env).expect("envelope serializes")
     }
 
+    /// 단건 수신 렌더 + claim-check 투명 해소 (페이즈 17, 3.2) — 첨부(payload_ref)가 있으면
+    /// 머리(HEAD_INCLUDE)를 자동으로 내려받아 payload로 채워준다. 나머지는 read_blob으로
+    /// 이어 읽는 점진 구조 — 대형 첨부가 컨텍스트를 통째로 삼키지 않게 한다.
+    async fn record_and_resolve(&mut self, env: &Envelope) -> Value {
+        const HEAD_INCLUDE: u64 = 16 * 1024;
+        let mut v = self.record_and_render(env);
+        let Some(r) = &env.payload_ref else {
+            return v;
+        };
+        if env.payload.is_some() {
+            return v; // 인라인이 이미 있으면 그대로 (3.2: 배타적이지만 방어)
+        }
+        let textish = r.content_type.starts_with("text/") || r.content_type.contains("json");
+        if !textish {
+            v["attachment_note"] = json!(format!(
+                "binary attachment ({} bytes, {}) — use the read_blob tool with id {:?} to read ranges",
+                r.size, r.content_type, r.id
+            ));
+            return v;
+        }
+        let end = HEAD_INCLUDE.min(r.size).saturating_sub(1);
+        match crate::client::download_blob(
+            &self.opts.server,
+            &self.opts.channel,
+            &self.opts.token,
+            &r.id,
+            Some((0, Some(end))),
+        )
+        .await
+        {
+            Ok(bytes) => {
+                let head = String::from_utf8_lossy(&bytes).into_owned();
+                let complete = r.size <= HEAD_INCLUDE;
+                v["payload"] = json!(head);
+                v["attachment_note"] = json!(if complete {
+                    format!("payload was a {} byte attachment — shown in full", r.size)
+                } else {
+                    format!(
+                        "payload is a {} byte attachment — first {} bytes shown. Read more with the read_blob tool: {{\"id\": {:?}, \"offset\": {}}}",
+                        r.size, HEAD_INCLUDE, r.id, HEAD_INCLUDE
+                    )
+                });
+            }
+            Err(e) => {
+                v["attachment_note"] = json!(format!(
+                    "attachment ({} bytes) could not be fetched: {e} — retry via the read_blob tool with id {:?}",
+                    r.size, r.id
+                ));
+            }
+        }
+        v
+    }
+
     /// 반응 메시지의 hops: 원본 hops + 1 (3.3 폭주 방지). 원본을 모르면 1.
     fn reaction_hops(&self, correlation_id: &str) -> u32 {
         self.hops_by_id.get(correlation_id).map_or(1, |h| h + 1)
@@ -155,6 +208,41 @@ impl McpServer {
                             "current_channel": self.opts.channel, "channels": channels }),
                     false,
                 ),
+                Err(e) => (json!({ "status": "error", "message": e.to_string() }), true),
+            };
+        }
+        // 첨부 점진 읽기 (페이즈 17, 3.2) — 순수 HTTP 읽기라 lazy-JOIN을 트리거하지 않는다
+        if name == "read_blob" {
+            let Some(id) = s("id") else {
+                return missing("id");
+            };
+            let offset = args["offset"].as_u64().unwrap_or(0);
+            let length = args["length"]
+                .as_u64()
+                .unwrap_or(16 * 1024)
+                .clamp(1, 64 * 1024);
+            return match crate::client::download_blob(
+                &self.opts.server,
+                &self.opts.channel,
+                &self.opts.token,
+                &id,
+                Some((offset, Some(offset + length - 1))),
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    let n = bytes.len() as u64;
+                    (
+                        json!({ "status": "ok", "id": id, "offset": offset, "bytes": n,
+                                "data": String::from_utf8_lossy(&bytes),
+                                "note": if n == length {
+                                    format!("range was full — more may remain; continue with offset {}", offset + n)
+                                } else {
+                                    "end of attachment reached".to_owned()
+                                } }),
+                        false,
+                    )
+                }
                 Err(e) => (json!({ "status": "error", "message": e.to_string() }), true),
             };
         }
@@ -200,7 +288,7 @@ impl McpServer {
                     .await
                 {
                     Some(env) => (
-                        json!({ "status": "replied", "reply": self.record_and_render(&env) }),
+                        json!({ "status": "replied", "reply": self.record_and_resolve(&env).await }),
                         false,
                     ),
                     None => (
@@ -253,7 +341,7 @@ impl McpServer {
                 .await
             {
                 Some(env) => (
-                    json!({ "status": "message", "message": self.record_and_render(&env) }),
+                    json!({ "status": "message", "message": self.record_and_resolve(&env).await }),
                     false,
                 ),
                 None => (
@@ -274,7 +362,7 @@ impl McpServer {
                     .await
                 {
                     Some(env) => (
-                        json!({ "status": "replied", "reply": self.record_and_render(&env) }),
+                        json!({ "status": "replied", "reply": self.record_and_resolve(&env).await }),
                         false,
                     ),
                     None => (
@@ -351,7 +439,7 @@ fn tool_definitions() -> Value {
             "description": "Send a one-way message to a peer agent (to=\"frontend\"), the whole channel (to=\"broadcast\"), or a topic (to=\"topic:api-changes.auth\"). CONTRACT: after changing any interface peers depend on, broadcast it with expects_ack=true so affected agents can react. Returns the message id.",
             "inputSchema": { "type": "object", "properties": {
                 "to": { "type": "string", "description": "agent name, \"broadcast\", or \"topic:{path}\"" },
-                "payload": { "type": "string", "description": "message body (markdown ok)" },
+                "payload": { "type": "string", "description": "message body (markdown ok). No practical size limit — oversized bodies are attached transparently (claim-check) and peers read them progressively" },
                 "expects_ack": { "type": "boolean", "description": "true for broadcasts that peers must confirm ({\"relevant\":bool} acks; a receipt-summary event arrives after the ack deadline)" },
                 "ttl_ms": { "type": "number", "description": "expiry in ms (default: channel setting, 24h)" }
             }, "required": ["to", "payload"] }
@@ -419,6 +507,15 @@ fn tool_definitions() -> Value {
             "name": "presence",
             "description": "See who is in the channel and whether they are listening right now (online/waiting = listening, idle/offline = queued delivery). Use before waiting on a peer: if they are idle, proceed instead of blocking.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "read_blob",
+            "description": "Read a range of a message attachment (payload_ref). Large payloads arrive as attachments; the first 16KB is shown inline automatically — use this to read the rest progressively instead of loading everything at once. Also works on payload_ref ids seen in fetch_history.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "attachment id from payload_ref (blob_…)" },
+                "offset": { "type": "number", "description": "byte offset to start from (default 0)" },
+                "length": { "type": "number", "description": "bytes to read (default 16384, max 65536)" }
+            }, "required": ["id"] }
         }
     ])
 }
