@@ -5,8 +5,9 @@
 //! 클라이언트는 테이크오버 신호를 받고 자동 standby로 물러났다가(2.2), 세션이 끝나
 //! 자리가 비면 프레즌스 프로브로 복귀한다 — 자리 다툼이 구조적으로 없다.
 //!
-//! 정직성 메모: 배치는 깨우기 **전에** 저널(jsonl)에 기록된다 — 깨우기가 실패해도
-//! 무엇이 소비됐는지 추적 가능 (전달 자체는 이미 서버에 ACK된 상태).
+//! 정직성 메모: 배치는 깨우기 **전에** 저널(jsonl)에 기록되고, 서버 확인(ACK)은
+//! **깨우기 스폰 성공 후**에만 보낸다 (페이즈 20) — 스폰 실패 시 메시지는 큐에 남아
+//! ack_wait 후 재전달·재시도되고, 반복 실패는 포이즌 표시로 대시보드에 드러난다.
 
 use std::time::Duration;
 
@@ -56,7 +57,7 @@ pub async fn run_with_shutdown(
         // 첫 메시지는 무기한 대기 (내부적으로 재접속·standby가 알아서 돈다)
         let first = if let Some(sd) = shutdown.as_mut() {
             tokio::select! {
-                env = client.recv(RecvFilter::Any, Duration::from_secs(3600)) => env,
+                pair = client.recv_manual(RecvFilter::Any, Duration::from_secs(3600)) => pair,
                 res = sd.changed() => {
                     // 송신 측 소멸(Err)은 서비스 런타임이 끝난 것 — 종료로 취급 (busy loop 방지)
                     if res.is_err() {
@@ -67,7 +68,7 @@ pub async fn run_with_shutdown(
             }
         } else {
             client
-                .recv(RecvFilter::Any, Duration::from_secs(3600))
+                .recv_manual(RecvFilter::Any, Duration::from_secs(3600))
                 .await
         };
         let Some(first) = first else {
@@ -80,14 +81,19 @@ pub async fn run_with_shutdown(
             if remaining.is_zero() {
                 break;
             }
-            match client.recv(RecvFilter::Any, remaining).await {
-                Some(env) => batch.push(env),
+            match client.recv_manual(RecvFilter::Any, remaining).await {
+                Some(pair) => batch.push(pair),
                 None => break,
             }
         }
-        journal_append(&journal, &batch).await;
+        let envelopes: Vec<Envelope> = batch.iter().map(|(env, _)| env.clone()).collect();
+        journal_append(&journal, &envelopes).await;
 
         if wake.policy != "always" {
+            // 깨우기 없는 정책 = 저널이 최종 목적지 — 여기서 소비 확정
+            for (_, token) in &batch {
+                client.confirm(*token).await;
+            }
             tracing::info!(
                 count = batch.len(),
                 "messages received but wake policy is {:?} — queued in journal only",
@@ -95,9 +101,28 @@ pub async fn run_with_shutdown(
             );
             continue;
         }
-        let prompt = build_prompt(&cfg, &batch);
-        if let Err(e) = run_wake(&wake, &prompt).await {
-            tracing::error!(error = %e, "wake failed — messages are in the journal");
+        let prompt = build_prompt(&cfg, &envelopes);
+        // 소비 확정은 **스폰 성공 시점** (페이즈 20, 2026-08-29 실사고의 근본 수정):
+        // 예전엔 수신 즉시 확인해서, 깨우기 실패(claude 경로 등) 시 메시지가 큐에서 이탈해
+        // 저널에만 남았다. 이제 스폰 실패면 확인하지 않는다 — ack_wait 후 재전달로 자동
+        // 재시도되고, 반복 실패는 max_deliver 소진 → 포이즌 표시로 대시보드에 드러난다.
+        // 완주가 아니라 스폰을 기준으로 하는 이유: 장시간 깨우기 동안 미확인분이 재전달되는
+        // 중복 폭주를 피하기 위함 (깨어난 세션의 크래시는 저널 + 세션 로그가 잡는다).
+        match spawn_wake(&wake, &prompt).await {
+            Ok(child) => {
+                for (_, token) in &batch {
+                    client.confirm(*token).await;
+                }
+                if let Err(e) = wait_wake(&wake, child).await {
+                    tracing::error!(error = %e, "wake session failed after spawn — see wake.log");
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "wake spawn failed — left unconfirmed; the queue will redeliver and retry"
+                );
+            }
         }
         // 깨어난 세션이 활동하는 동안 이 클라이언트는 standby — 종료 후 자동 복귀
     }
@@ -156,7 +181,8 @@ pub fn build_prompt(cfg: &BrvConfig, batch: &[Envelope]) -> String {
     )
 }
 
-async fn run_wake(wake: &WakeConfig, prompt: &str) -> anyhow::Result<()> {
+/// 깨우기 프로세스 시작 — 스폰 성공까지가 소비 확정의 기준 (페이즈 20).
+async fn spawn_wake(wake: &WakeConfig, prompt: &str) -> anyhow::Result<tokio::process::Child> {
     let args: Vec<String> = wake
         .args
         .iter()
@@ -177,7 +203,7 @@ async fn run_wake(wake: &WakeConfig, prompt: &str) -> anyhow::Result<()> {
         .append(true)
         .open(&log_path)
         .with_context(|| format!("cannot open wake log {log_path:?}"))?;
-    let mut child = tokio::process::Command::new(&wake.command)
+    let child = tokio::process::Command::new(&wake.command)
         .args(&args)
         .current_dir(&wake.dir)
         .stdout(std::process::Stdio::from(
@@ -186,6 +212,11 @@ async fn run_wake(wake: &WakeConfig, prompt: &str) -> anyhow::Result<()> {
         .stderr(std::process::Stdio::from(log))
         .spawn()
         .with_context(|| format!("cannot spawn wake command {:?}", wake.command))?;
+    Ok(child)
+}
+
+/// 깨우기 완주 대기 — 타임아웃 시 강제 종료 (스폰과 분리: 확정 시점은 스폰).
+async fn wait_wake(wake: &WakeConfig, mut child: tokio::process::Child) -> anyhow::Result<()> {
     match tokio::time::timeout(Duration::from_secs(wake.timeout_s), child.wait()).await {
         Ok(Ok(status)) => {
             tracing::info!(%status, "wake session finished");
@@ -278,6 +309,9 @@ mod tests {
             dir: ".".into(),
             timeout_s: 30,
         };
-        run_wake(&wake, "test").await.expect("wake command runs");
+        let child = spawn_wake(&wake, "test")
+            .await
+            .expect("wake command spawns");
+        wait_wake(&wake, child).await.expect("wake command runs");
     }
 }

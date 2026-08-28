@@ -116,7 +116,10 @@ enum Cmd {
         Box<PublishSpec>,
         oneshot::Sender<Result<MessageId, ErrBody>>,
     ),
-    Recv(RecvFilter, oneshot::Sender<Envelope>),
+    // bool = auto_ack: false면 전달만 하고 확인(ACK)을 유보한다 — Confirm이 마무리 (페이즈 20)
+    Recv(RecvFilter, bool, oneshot::Sender<(Envelope, u64)>),
+    // recv_manual로 받은 전달의 확인 — 깨우기 성공 등 "처리 보장" 시점에 호출
+    Confirm(u64),
     Fetch {
         after_id: Option<String>,
         limit: Option<u32>,
@@ -227,8 +230,23 @@ impl Client {
     /// 다음 메시지 수신 (소비 시 ACK). 타임아웃이면 None — 메시지는 큐에 남는다.
     pub async fn recv(&self, filter: RecvFilter, wait: Duration) -> Option<Envelope> {
         let (tx, rx) = oneshot::channel();
-        self.cmds.send(Cmd::Recv(filter, tx)).await.ok()?;
+        self.cmds.send(Cmd::Recv(filter, true, tx)).await.ok()?;
+        timeout(wait, rx).await.ok()?.ok().map(|(env, _)| env)
+    }
+
+    /// 확인 유보 수신 (페이즈 20) — 전달만 받고 ACK를 미룬다. 반환된 토큰으로 `confirm`을
+    /// 호출해야 소비가 확정되며, 확인 없이는 ack_wait 후 재전달된다 (처리 실패 = 자동 재시도).
+    /// 데몬의 "깨우기 성공 후 확인" 용도 — 2026-08-29 wake 실사고(도장 후 깨우기 실패로
+    /// 메시지가 큐에서 이탈)의 근본 수정.
+    pub async fn recv_manual(&self, filter: RecvFilter, wait: Duration) -> Option<(Envelope, u64)> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds.send(Cmd::Recv(filter, false, tx)).await.ok()?;
         timeout(wait, rx).await.ok()?.ok()
+    }
+
+    /// recv_manual 전달의 소비 확정 — best-effort (재접속으로 무효면 재전달이 대신한다).
+    pub async fn confirm(&self, token: u64) {
+        let _ = self.cmds.send(Cmd::Confirm(token)).await;
     }
 
     pub async fn fetch(
@@ -293,6 +311,9 @@ struct InboxItem {
     envelope: Envelope,
 }
 
+/// 수신 대기자: (필터, 자동 ACK 여부, 전달 통로 — 봉투와 confirm 토큰).
+type RecvWaiter = (RecvFilter, bool, oneshot::Sender<(Envelope, u64)>);
+
 struct Actor {
     opts: ClientOptions,
     seq: u64,
@@ -303,7 +324,10 @@ struct Actor {
     /// 소비 완료 id — 재전달 중복을 즉시 ACK로 흡수 (13.3의 수신 방향).
     consumed: VecDeque<String>,
     consumed_set: HashSet<String>,
-    waiters: Vec<(RecvFilter, oneshot::Sender<Envelope>)>,
+    waiters: Vec<RecvWaiter>,
+    /// 확인 유보 전달 (페이즈 20): server_seq → 메시지 id. 연결마다 seq 공간이 새로 시작하므로
+    /// 재접속 시 비운다 — 미확인분은 ack_wait 재전달이 다시 가져온다 (유실 없음).
+    unacked: HashMap<u64, String>,
     last_pong: Instant,
 }
 
@@ -351,7 +375,7 @@ impl Actor {
 
     /// 대기자와 큐를 맞춰본다 — 전달 성공 시에만 ACK (유실 방지: 전달 → ACK 순서).
     async fn satisfy_waiters(&mut self, ws: &mut Ws) {
-        self.waiters.retain(|(_, tx)| !tx.is_closed());
+        self.waiters.retain(|(_, _, tx)| !tx.is_closed());
         let mut w = 0;
         while w < self.waiters.len() {
             let matched = self
@@ -363,27 +387,74 @@ impl Actor {
                 continue;
             };
             let item = self.inbox.remove(pos).expect("position valid");
-            let (_, tx) = self.waiters.remove(w);
+            let (_, auto_ack, tx) = self.waiters.remove(w);
             let id = item.envelope.id.as_ref().map(|i| i.as_str().to_owned());
-            if tx.send(item.envelope.clone()).is_ok() {
-                let _ = send_frame(
-                    ws,
-                    &ClientFrame {
-                        seq: None,
-                        re: Some(item.server_seq),
-                        op: ClientOp::Ack,
-                    },
-                )
-                .await;
-                if let Some(id) = id {
-                    self.queued_ids.remove(&id);
-                    self.mark_consumed(id);
+            if tx.send((item.envelope.clone(), item.server_seq)).is_ok() {
+                if auto_ack {
+                    let _ = send_frame(
+                        ws,
+                        &ClientFrame {
+                            seq: None,
+                            re: Some(item.server_seq),
+                            op: ClientOp::Ack,
+                        },
+                    )
+                    .await;
+                    if let Some(id) = id {
+                        self.queued_ids.remove(&id);
+                        self.mark_consumed(id);
+                    }
+                } else {
+                    // 확인 유보 (페이즈 20) — Confirm이 올 때까지 서버 큐의 소유가 유지된다.
+                    // 확인이 안 오면 ack_wait 후 재전달 (처리 실패 = 자동 재시도의 재료)
+                    if let Some(id) = id {
+                        self.queued_ids.remove(&id);
+                        self.unacked.insert(item.server_seq, id);
+                    }
                 }
                 // 같은 인덱스에서 계속 (다음 대기자)
             } else {
                 // 수신자가 타임아웃으로 사라짐 — 메시지를 큐에 되돌린다 (유실 금지)
                 self.inbox.insert(pos.min(self.inbox.len()), item);
             }
+        }
+    }
+
+    /// recv_manual 전달의 확인 (페이즈 20) — ACK + 소비 표시 + 그 사이 도착한 중복 재전달 정리.
+    async fn handle_confirm(&mut self, ws: &mut Ws, seq: u64) {
+        let Some(id) = self.unacked.remove(&seq) else {
+            return; // 재접속으로 이미 무효 — 재전달이 새로 온다 (at-least-once)
+        };
+        let _ = send_frame(
+            ws,
+            &ClientFrame {
+                seq: None,
+                re: Some(seq),
+                op: ClientOp::Ack,
+            },
+        )
+        .await;
+        self.mark_consumed(id.clone());
+        // 확인 전에 ack_wait 재전달로 들어온 같은 id의 중복분 흡수 — ACK 후 제거
+        let mut dup_seqs = Vec::new();
+        self.inbox.retain(|item| {
+            let dup = item.envelope.id.as_ref().is_some_and(|x| x.as_str() == id);
+            if dup {
+                dup_seqs.push(item.server_seq);
+            }
+            !dup
+        });
+        for dup in dup_seqs {
+            self.queued_ids.remove(&id);
+            let _ = send_frame(
+                ws,
+                &ClientFrame {
+                    seq: None,
+                    re: Some(dup),
+                    op: ClientOp::Ack,
+                },
+            )
+            .await;
         }
     }
 
@@ -471,9 +542,12 @@ impl Actor {
                     }
                 }
             }
-            Cmd::Recv(filter, tx) => {
-                self.waiters.push((filter, tx));
+            Cmd::Recv(filter, auto_ack, tx) => {
+                self.waiters.push((filter, auto_ack, tx));
                 self.satisfy_waiters(ws).await;
+            }
+            Cmd::Confirm(seq) => {
+                self.handle_confirm(ws, seq).await;
             }
             Cmd::Fetch {
                 after_id,
@@ -550,6 +624,8 @@ impl Actor {
 
     /// 연결 유실 시: 응답 없는 PUB는 outbox에 남아 재발행되고, 조회성 요청은 오류로 해소.
     fn on_disconnect(&mut self) {
+        // 확인 유보분은 이 연결의 seq에 묶여 있었다 — 재전달이 새 seq로 다시 온다
+        self.unacked.clear();
         for (_, pending) in self.pending.drain() {
             match pending {
                 Pending::Pub(_) => {} // outbox가 진실 — 재발행된다
@@ -604,6 +680,7 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
         consumed: VecDeque::new(),
         consumed_set: HashSet::new(),
         waiters: Vec::new(),
+        unacked: HashMap::new(),
         last_pong: Instant::now(),
     };
     let mut attempt: u32 = 0;
