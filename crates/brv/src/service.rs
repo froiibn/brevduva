@@ -29,9 +29,18 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let config = require_absolute(config)?;
     let exe = std::env::current_exe()?;
-    let env_line = config
-        .map(|c| format!("Environment=BREVDUVA_CONFIG={c}\n"))
+    // 설치자 셸의 PATH를 유닛에 굽는다 (2026-08-29 실사고): systemd 기본 PATH에는
+    // ~/.local/bin 등이 없어 wake 명령("claude")을 못 찾는다 — 데몬은 메시지를 소비하고도
+    // 깨우기만 조용히 실패했다. %는 systemd 지정자라 이스케이프.
+    let path_line = std::env::var("PATH")
+        .map(|p| format!("Environment=\"PATH={}\"\n", p.replace('%', "%%")))
         .unwrap_or_default();
+    let env_line = format!(
+        "{path_line}{}",
+        config
+            .map(|c| format!("Environment=BREVDUVA_CONFIG={c}\n"))
+            .unwrap_or_default()
+    );
     let unit = format!(
         "# `brv daemon install`이 생성 — 수동 수정은 재실행 시 덮어써진다\n\
          [Unit]\n\
@@ -98,13 +107,20 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let home = dirs::home_dir().context("cannot resolve home dir")?;
     let log = home.join("Library/Logs/brv-daemon.log");
-    let env_block = config
-        .map(|c| {
-            format!(
-                "  <key>EnvironmentVariables</key>\n  <dict>\n    <key>BREVDUVA_CONFIG</key><string>{c}</string>\n  </dict>\n"
-            )
+    // 설치자 셸의 PATH를 굽는다 (2026-08-29 실사고 — systemd와 동일: launchd 기본 PATH에는
+    // 사용자 설치 경로가 없어 wake 명령을 못 찾는다). XML 이스케이프는 &·< 만 실질 위험.
+    let path_entry = std::env::var("PATH")
+        .map(|p| {
+            let p = p.replace('&', "&amp;").replace('<', "&lt;");
+            format!("    <key>PATH</key><string>{p}</string>\n")
         })
         .unwrap_or_default();
+    let config_entry = config
+        .map(|c| format!("    <key>BREVDUVA_CONFIG</key><string>{c}</string>\n"))
+        .unwrap_or_default();
+    let env_block = format!(
+        "  <key>EnvironmentVariables</key>\n  <dict>\n{path_entry}{config_entry}  </dict>\n"
+    );
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
