@@ -1,0 +1,17 @@
+# 업타임 프로브 (2026-08-28) — 10분마다 대시보드·API의 healthz를 확인한다.
+# 실패한 런은 GitHub가 리포 소유자에게 메일로 통지한다 — 별도 알림 인프라 없이
+# "서버 다운을 아무도 모르는" 빈칸을 메우는 최소 장치. 프로브 대상은 공개 URL뿐이다.
+name: uptime
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe healthz
+        run: |
+          curl -fsS --max-time 15 --retry 2 --retry-delay 5 https://brevduva.dev/healthz
+          curl -fsS --max-time 15 --retry 2 --retry-delay 5 https://api.brevduva.dev/healthz
