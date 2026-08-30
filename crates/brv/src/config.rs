@@ -47,15 +47,50 @@ fn default_policy() -> String {
     "always".to_owned()
 }
 fn default_wake_args() -> Vec<String> {
-    vec![
-        "-p".to_owned(),
-        "{prompt}".to_owned(),
-        "--allowedTools".to_owned(),
-        "mcp__brevduva__*".to_owned(),
-    ]
+    // 기본 = 가장 좁은 respond 프리셋 (페이즈 21에서 프리셋으로 일원화)
+    wake_preset_args("respond").expect("respond preset exists")
 }
 fn default_wake_timeout() -> u64 {
     600
+}
+
+/// 깨우기 권한 프리셋 (페이즈 21) — 무인(headless) 세션에 **사전 허용**할 도구 수준.
+/// 무인 실행은 권한을 물어볼 사람이 없어 이 목록이 전부다 — 기본은 가장 좁은 respond.
+/// 이 값은 로컬 신뢰 정책이라 의도적으로 설정 파일에만 산다 (서버·원격 메시지가 변경 불가).
+/// 프리셋은 Claude Code CLI 기준 — 다른 러너는 args를 직접 편집한다 (README 무인 모드 절).
+pub fn wake_preset_tools(level: &str) -> Option<&'static str> {
+    Some(match level {
+        "respond" => "mcp__brevduva__*",
+        "edit" => "mcp__brevduva__*,Read,Glob,Grep,Edit,Write",
+        "full" => "mcp__brevduva__*,Read,Glob,Grep,Edit,Write,Bash",
+        _ => return None,
+    })
+}
+
+/// 프리셋 → 실행 인자 열. `brv wake set --allow`와 기본값이 공유하는 단일 원천.
+pub fn wake_preset_args(level: &str) -> Option<Vec<String>> {
+    let tools = wake_preset_tools(level)?;
+    Some(vec![
+        "-p".to_owned(),
+        "{prompt}".to_owned(),
+        "--allowedTools".to_owned(),
+        tools.to_owned(),
+    ])
+}
+
+/// args의 `--allowedTools` 값 — `wake show` 표시와 깨우기 프롬프트의 정직성 라인이 쓴다.
+pub fn wake_allowed_tools(args: &[String]) -> Option<&str> {
+    args.iter()
+        .position(|a| a == "--allowedTools")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// args가 어느 프리셋 산출물인지 역판별 (`wake show`용) — 손 편집분은 None(custom).
+pub fn wake_preset_of(args: &[String]) -> Option<&'static str> {
+    ["respond", "edit", "full"]
+        .into_iter()
+        .find(|level| wake_preset_args(level).as_deref() == Some(args))
 }
 
 /// 프로세스 내 설정 경로 고정 — 윈도우 서비스 모드(페이즈 7)에서 SCM launch args로 받은
@@ -152,4 +187,63 @@ pub fn load_token(cfg: &BrvConfig) -> anyhow::Result<String> {
         .with_context(|| {
             format!("token not found — run `brv init`, set BREVDUVA_TOKEN, or place it at {token_file:?}")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_presets_widen_monotonically() {
+        // 프리셋은 좁은 것부터 넓어지는 포함 관계 — respond ⊂ edit ⊂ full
+        let respond = wake_preset_tools("respond").unwrap();
+        let edit = wake_preset_tools("edit").unwrap();
+        let full = wake_preset_tools("full").unwrap();
+        assert!(edit.starts_with(respond));
+        assert!(full.starts_with(edit));
+        assert!(full.contains("Bash") && !edit.contains("Bash"));
+        assert!(edit.contains("Edit") && !respond.contains("Edit"));
+        assert!(
+            wake_preset_tools("root").is_none(),
+            "unknown level rejected"
+        );
+    }
+
+    #[test]
+    fn default_args_are_respond_and_roundtrip() {
+        // 기본값 = respond 프리셋 (단일 원천), 역판별·도구 추출이 왕복한다
+        let args = default_wake_args();
+        assert_eq!(wake_preset_of(&args), Some("respond"));
+        assert_eq!(wake_allowed_tools(&args), Some("mcp__brevduva__*"));
+        assert!(args.iter().any(|a| a == "{prompt}"));
+        // 손 편집분(순서·값이 다름)은 custom 취급
+        let custom = vec!["-p".to_owned(), "{prompt}".to_owned()];
+        assert_eq!(wake_preset_of(&custom), None);
+        assert_eq!(wake_allowed_tools(&custom), None);
+    }
+
+    #[test]
+    fn wake_config_survives_toml_roundtrip() {
+        // "한번 설정하면 유지"의 최소 보증 — 직렬화 왕복에서 필드가 안 사라진다
+        // (재init 보존은 main의 init이 load→wake 이식으로 담당, 회귀는 phase10 e2e)
+        let cfg = BrvConfig {
+            server: "https://api.brevduva.dev".into(),
+            channel: "myapp".into(),
+            agent: "backend".into(),
+            description: String::new(),
+            wake: Some(WakeConfig {
+                policy: "always".into(),
+                command: "/home/user/.local/bin/claude".into(),
+                args: wake_preset_args("full").unwrap(),
+                dir: "/home/user/app".into(),
+                timeout_s: 900,
+            }),
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: BrvConfig = toml::from_str(&text).unwrap();
+        let wake = back.wake.unwrap();
+        assert_eq!(wake_preset_of(&wake.args), Some("full"));
+        assert_eq!(wake.timeout_s, 900);
+        assert_eq!(wake.command, "/home/user/.local/bin/claude");
+    }
 }

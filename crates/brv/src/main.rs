@@ -83,6 +83,39 @@ enum Cmd {
         #[command(subcommand)]
         action: HookCmd,
     },
+    /// 무인 모드 깨우기 설정 (페이즈 21) — 데몬이 메시지 도착 시 실행할 세션과 그 권한
+    Wake {
+        #[command(subcommand)]
+        action: WakeCmd,
+    },
+}
+
+/// `brv wake` — [wake]는 설정 파일에 저장되어 재부팅·데몬 재시작·재init 후에도 유지된다.
+/// 권한은 로컬 신뢰 정책: 이 머신의 파일로만 정해지고 서버·원격 메시지는 바꿀 수 없다.
+#[derive(Subcommand)]
+enum WakeCmd {
+    /// 깨우기 설정 생성·수정 — 지정한 값만 바꾸고 나머지는 유지 (멱등)
+    Set {
+        /// 무인 세션 권한: respond(응답 전용, 기본)|edit(+파일 편집)|full(+셸)
+        #[arg(long)]
+        allow: Option<String>,
+        /// 깨우기 실행 파일 — 미지정 시 PATH에서 claude를 찾아 절대 경로로 저장
+        #[arg(long)]
+        command: Option<String>,
+        /// 깨어난 세션의 작업 디렉터리 — 신규 설정에서 미지정 시 현재 디렉터리
+        #[arg(long)]
+        dir: Option<String>,
+        /// 깨운 세션의 최대 실행 시간(초)
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// always(도착 시 깨움)|never(저널 기록만)
+        #[arg(long)]
+        policy: Option<String>,
+    },
+    /// 현재 깨우기 설정과 실효 명령줄 표시
+    Show,
+    /// 무해한 프롬프트로 깨우기를 1회 실제 실행 — 명령 경로·환경이 동작하는지 검증
+    Test,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +249,17 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             // main()이 런타임 진입 전에 처리한다
             Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run은 main에서 분기"),
         },
+        Cmd::Wake { action } => match action {
+            WakeCmd::Set {
+                allow,
+                command,
+                dir,
+                timeout,
+                policy,
+            } => wake_set(allow, command, dir, timeout, policy),
+            WakeCmd::Show => wake_show(),
+            WakeCmd::Test => wake_test().await,
+        },
         Cmd::Hook { action } => match action {
             HookCmd::Install => {
                 println!("{}", brv::hook::install()?);
@@ -252,6 +296,165 @@ fn options_from_config() -> anyhow::Result<(BrvConfig, ClientOptions)> {
 fn connect_from_config() -> anyhow::Result<(BrvConfig, Client)> {
     let (cfg, opts) = options_from_config()?;
     Ok((cfg, Client::connect(opts)))
+}
+
+/// PATH에서 실행 파일 탐색 — 설정에는 항상 절대 경로로 저장하기 위함.
+/// 2026-08-29 실사고의 교훈: 서비스(systemd 등) 환경의 PATH에는 사용자 설치 경로가 없어
+/// 상대 이름 "claude"가 안 풀렸다. 설정 시점에 절대 경로로 못 박으면 재발하지 않는다.
+fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let exts: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        exts.iter().find_map(|ext| {
+            let p = dir.join(format!("{name}{ext}"));
+            p.is_file().then_some(p)
+        })
+    })
+}
+
+/// `brv wake set` — [wake]를 설정 파일에 굽는다. 지정한 값만 갱신하고 나머지는 유지(멱등).
+/// 설정 파일이 단일 진실이라 재부팅·데몬 재시작·재init(보존 코드 별도)에도 계속 유지된다.
+fn wake_set(
+    allow: Option<String>,
+    command: Option<String>,
+    dir: Option<String>,
+    timeout: Option<u64>,
+    policy: Option<String>,
+) -> anyhow::Result<()> {
+    let mut cfg = config::load()?; // 연결 설정(init) 위에 얹는다 — 미init이면 여기서 안내됨
+    let existing = cfg.wake.take();
+
+    let command = match command {
+        Some(c) if std::path::Path::new(&c).is_absolute() => c,
+        // 경로 구분자가 있으면 현재 디렉터리 기준, 맨 이름이면 PATH에서 — 결과는 항상 절대 경로
+        Some(c) if c.contains('/') || c.contains('\\') => std::fs::canonicalize(&c)
+            .with_context(|| format!("cannot resolve {c:?} from the current directory"))?
+            .to_string_lossy()
+            .into_owned(),
+        Some(c) => find_in_path(&c)
+            .with_context(|| format!("{c:?} not found in PATH — pass an absolute --command"))?
+            .to_string_lossy()
+            .into_owned(),
+        None => match &existing {
+            Some(w) => w.command.clone(),
+            None => find_in_path("claude")
+                .context(
+                    "claude not found in PATH — install Claude Code CLI, \
+                     or point --command at another agent runner (absolute path)",
+                )?
+                .to_string_lossy()
+                .into_owned(),
+        },
+    };
+    let dir = match dir.or_else(|| existing.as_ref().map(|w| w.dir.clone())) {
+        Some(d) => d,
+        // 신규 설정 기본 = 현재 디렉터리 — "프로젝트 루트에서 설정한다"는 자연 동작
+        None => std::env::current_dir()?.to_string_lossy().into_owned(),
+    };
+    let args = match &allow {
+        Some(level) => config::wake_preset_args(level)
+            .with_context(|| format!("unknown --allow {level:?} — one of: respond, edit, full"))?,
+        None => match &existing {
+            Some(w) => w.args.clone(),
+            None => config::wake_preset_args("respond").expect("respond preset exists"),
+        },
+    };
+    let policy = match policy.or_else(|| existing.as_ref().map(|w| w.policy.clone())) {
+        Some(p) if p == "always" || p == "never" => p,
+        Some(p) => anyhow::bail!("unknown --policy {p:?} — one of: always, never"),
+        None => "always".to_owned(),
+    };
+    let timeout_s = timeout
+        .or(existing.as_ref().map(|w| w.timeout_s))
+        .unwrap_or(600);
+
+    cfg.wake = Some(config::WakeConfig {
+        policy,
+        command,
+        args,
+        dir,
+        timeout_s,
+    });
+    let path = config::store(&cfg)?;
+    println!("wake configured — saved to {path:?} (survives reboots, daemon restarts, re-init)");
+    wake_show()?;
+    println!("\nnext: `brv wake test` to verify it actually spawns, then `brv daemon install`");
+    Ok(())
+}
+
+/// `brv wake show` — 저장된 설정과 실효 명령줄. "지금 깨워지면 정확히 이렇게 실행된다".
+fn wake_show() -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let Some(wake) = &cfg.wake else {
+        println!("no [wake] configured — run `brv wake set --allow respond|edit|full`");
+        return Ok(());
+    };
+    let level = config::wake_preset_of(&wake.args).unwrap_or("custom (hand-edited args)");
+    println!("agent    : {} (channel {})", cfg.agent, cfg.channel);
+    println!("policy   : {}", wake.policy);
+    println!("allow    : {level}");
+    println!(
+        "tools    : {}",
+        config::wake_allowed_tools(&wake.args).unwrap_or("(no --allowedTools in args)")
+    );
+    println!("command  : {}", wake.command);
+    println!("dir      : {}", wake.dir);
+    println!("timeout  : {}s", wake.timeout_s);
+    println!("effective: {} {}", wake.command, wake.args.join(" "));
+    Ok(())
+}
+
+/// `brv wake test` — 실제 깨우기와 같은 스폰 경로로 1회 실행해 환경을 검증한다.
+/// 2026-08-29 실사고(서비스 PATH에 claude 부재)를 설정 시점에 잡는 검사.
+async fn wake_test() -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let wake = cfg
+        .wake
+        .clone()
+        .context("no [wake] configured — run `brv wake set` first")?;
+    // 검증은 짧게 — 운영 timeout이 길어도 테스트 상한 120초
+    let capped = config::WakeConfig {
+        timeout_s: wake.timeout_s.min(120),
+        ..wake
+    };
+    let prompt = "This is `brv wake test` — a harness self-check, not a real task. \
+                  Print exactly `wake ok` and finish immediately. Do not call any tools.";
+    println!(
+        "spawning wake session: {} (dir {}, cap {}s)...",
+        capped.command, capped.dir, capped.timeout_s
+    );
+    let started = std::time::Instant::now();
+    let child = brv::daemon::spawn_wake(&capped, prompt).await?;
+    println!("spawn OK — waiting for the session to exit...");
+    let log_hint = config::config_path()?
+        .parent()
+        .expect("config has parent")
+        .join("wake.log");
+    let status = match tokio::time::timeout(Duration::from_secs(capped.timeout_s), async {
+        let mut child = child;
+        child.wait().await
+    })
+    .await
+    {
+        Ok(res) => res.context("wake process wait")?,
+        Err(_) => anyhow::bail!(
+            "wake session did not finish within {}s — check {log_hint:?}",
+            capped.timeout_s
+        ),
+    };
+    anyhow::ensure!(
+        status.success(),
+        "wake session exited with {status} — check {log_hint:?}"
+    );
+    println!(
+        "WAKE TEST OK ({:.1}s) — session output appended to {log_hint:?}",
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
 }
 
 /// `brv channels` — 내 grant 채널 목록 (현재 설정 채널 표시).
