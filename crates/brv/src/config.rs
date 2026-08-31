@@ -355,30 +355,68 @@ fn token_file(token_id: &str) -> anyhow::Result<PathBuf> {
         .join(format!("token-{}", token_id.replace('/', "-"))))
 }
 
-/// 토큰 저장 — 키체인 우선, 불가하면 토큰 파일(600) 폴백. 키는 바인딩의 token_id 기준.
-pub fn store_token(server: &str, binding: &Binding, token: &str) -> anyhow::Result<TokenStore> {
-    let id = binding.token_id();
-    if let Ok(entry) = keyring_entry(server, &id)
-        && entry.set_password(token).is_ok()
-    {
-        return Ok(TokenStore::Keyring);
-    }
-    let path = token_file(&id)?;
+fn write_token_file(token_id: &str, token: &str) -> anyhow::Result<PathBuf> {
+    let path = token_file(token_id)?;
     std::fs::create_dir_all(path.parent().expect("token path has parent"))?;
-    std::fs::write(&path, token)
-        .with_context(|| format!("keyring unavailable and token file write failed at {path:?}"))?;
+    std::fs::write(&path, token).with_context(|| format!("token file write failed at {path:?}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(TokenStore::File(path))
+    Ok(path)
+}
+
+/// 이 바이너리에서 키체인이 "조용히" 동작하는가 (2026-09-01 맥 실측의 근본 대응).
+/// macOS 키체인 ACL은 코드 서명 정체성 기준인데, 애드혹 서명(cargo·CI 기본)은 고정
+/// 정체성이 없어 **"항상 허용"조차 유지되지 않는다** — 토큰을 읽는 모든 표면(데몬 재기동·
+/// 세션 MCP·훅)에서 프롬프트 폭풍. 그런 빌드에서는 키체인을 쓰지 않고 파일 저장을
+/// 택한다(사용자 개입 0). Developer ID 서명 배포부터는 자동으로 키체인 사용에 복귀한다.
+fn keychain_is_reliable() -> bool {
+    // cfg!(런타임 분기)인 이유: cfg 속성으로 갈랐다가는 맥 전용 본문이 이 윈도우 개발
+    // 머신의 검사(clippy·test)를 영영 안 거친다 — 전 플랫폼 컴파일로 검증 사각을 없앤다
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    static RELIABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RELIABLE.get_or_init(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let Ok(out) = std::process::Command::new("codesign")
+            .arg("-dv")
+            .arg(&exe)
+            .output()
+        else {
+            return false; // 판별 불가 — 프롬프트 폭풍보다 파일 폴백이 안전한 기본
+        };
+        let info = String::from_utf8_lossy(&out.stderr);
+        out.status.success()
+            && !info.contains("Signature=adhoc")
+            && info.contains("TeamIdentifier=")
+            && !info.contains("TeamIdentifier=not set")
+    })
+}
+
+/// 토큰 저장 — 키체인 우선, 불가하면 토큰 파일(600) 폴백. 키는 바인딩의 token_id 기준.
+/// 키체인이 비신뢰(무서명 맥 빌드)면 처음부터 파일로 — 키체인을 건드리지 않아 프롬프트 0회.
+pub fn store_token(server: &str, binding: &Binding, token: &str) -> anyhow::Result<TokenStore> {
+    let id = binding.token_id();
+    if keychain_is_reliable()
+        && let Ok(entry) = keyring_entry(server, &id)
+        && entry.set_password(token).is_ok()
+    {
+        return Ok(TokenStore::Keyring);
+    }
+    Ok(TokenStore::File(write_token_file(&id, token)?))
 }
 
 /// 토큰 로드 우선순위: `BREVDUVA_TOKEN` env → 키체인(org 포함 키 → 구형 agent 키) →
 /// 토큰 파일(org 포함 → 구형 `token-{agent}`) → 구형 단일 파일(`token`, 바인딩이
 /// 하나일 때만 — 어느 에이전트 것인지 판별 불가). 구형 폴백들 덕에 기존 머신
 /// (org 없는 키로 저장됨)은 재enroll 없이 동작한다.
+/// 키체인 비신뢰 빌드는 파일을 먼저 보고, 키체인은 마지막에 한 번만 — 성공하면 파일로
+/// **자가 이전**해 그 프롬프트가 마지막이 된다 (기존 키체인 사용자 무개입 마이그레이션).
 /// env는 단일 바인딩 전용 편의 — 에이전트가 여럿이면 전원에게 같은 값이 가므로 부적합.
 pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("BREVDUVA_TOKEN") {
@@ -389,16 +427,32 @@ pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> 
     if binding.org.is_some() {
         ids.push(binding.agent.clone()); // 구형 키 폴백
     }
-    for candidate in &ids {
-        if let Ok(entry) = keyring_entry(&cfg.server, candidate)
-            && let Ok(token) = entry.get_password()
-        {
-            return Ok(token);
+    let from_files = |ids: &[String]| {
+        ids.iter().find_map(|c| {
+            token_file(c)
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|t| t.trim().to_owned())
+        })
+    };
+    let from_keyring = |ids: &[String]| {
+        ids.iter()
+            .find_map(|c| keyring_entry(&cfg.server, c).ok()?.get_password().ok())
+    };
+    if keychain_is_reliable() {
+        if let Some(t) = from_keyring(&ids) {
+            return Ok(t);
         }
-    }
-    for candidate in &ids {
-        if let Ok(t) = std::fs::read_to_string(token_file(candidate)?) {
-            return Ok(t.trim().to_owned());
+        if let Some(t) = from_files(&ids) {
+            return Ok(t);
+        }
+    } else {
+        if let Some(t) = from_files(&ids) {
+            return Ok(t);
+        }
+        if let Some(t) = from_keyring(&ids) {
+            let _ = write_token_file(&id, &t); // 자가 이전 — 다음부터 프롬프트 없음
+            return Ok(t);
         }
     }
     if cfg.bindings.len() <= 1 {
