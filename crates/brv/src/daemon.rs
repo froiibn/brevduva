@@ -266,8 +266,13 @@ async fn journal_append(
         .await
     {
         Ok(mut f) => {
+            // flush까지가 기록이다 (2026-09-01, CI 실측): tokio 파일 쓰기는 버퍼에 남은 채
+            // 반환될 수 있다 — "깨우기 전에 저널"이라는 정직성 보증이 성립하려면
+            // journal_append 반환 시점에 OS까지 내려가 있어야 한다
             if let Err(e) = f.write_all(lines.as_bytes()).await {
                 tracing::warn!(error = %e, "journal write failed");
+            } else if let Err(e) = f.flush().await {
+                tracing::warn!(error = %e, "journal flush failed");
             }
         }
         Err(e) => tracing::warn!(error = %e, "journal open failed"),
