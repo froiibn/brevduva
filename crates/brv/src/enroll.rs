@@ -1,15 +1,22 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 일회용 연결 코드 교환 (PROTOCOL.md 10.1) — `brv init --enroll`의 코어.
 //!
-//! 여기는 교환과 설정 구성만 담당한다 — 저장(키체인/파일)·안내 출력·MCP 등록은
-//! main이 맡는다. 이 분리로 서버 리포의 통합 테스트가 실제 교환 경로를 그대로 검증한다.
+//! 여기는 교환만 담당한다 — 설정 병합(바인딩 추가, 페이즈 27)·저장(키체인/파일)·
+//! 안내 출력·MCP 등록은 main이 맡는다. 이 분리로 서버 리포의 통합 테스트가 실제
+//! 교환 경로를 그대로 검증한다.
 
 use anyhow::Context as _;
 
-use crate::config::BrvConfig;
+use crate::config::Binding;
 
 pub struct Enrolled {
-    /// 저장할 설정 — channel은 부여받은 채널 중 선택된 하나, [wake]는 기존 설정에서 보존.
-    pub cfg: BrvConfig,
+    /// 교환에 쓴 서버 베이스 URL (정규화됨) — 설정 병합 시 서버 일치 검증에 쓴다.
+    pub server: String,
+    /// 설정에 추가할 바인딩 — channel은 부여받은 채널 중 선택된 하나.
+    /// wake_dir·wake_policy는 기본값 — 기존 바인딩 교체 시 main의 upsert가 보존한다.
+    pub binding: Binding,
     pub token: String,
     /// 이 코드로 grant된 전체 채널 목록 (안내 출력용).
     pub channels: Vec<String>,
@@ -61,17 +68,18 @@ pub async fn exchange(server: &str, code: &str, channel: Option<&str>) -> anyhow
             "이 코드에 참가 채널이 없습니다 — 대시보드에서 채널을 지정해 다시 발급하세요",
         )?,
     };
-    // 기존 설정의 [wake]는 보존 — 재설치·재연결이 깨우기 설정을 지우면 안 된다 (init과 동일 원칙)
-    let wake = crate::config::load()
-        .ok()
-        .and_then(|existing| existing.wake);
     Ok(Enrolled {
-        cfg: BrvConfig {
-            server: base,
-            channel: chosen,
+        server: base,
+        binding: Binding {
+            // org를 바인딩에 새긴다 (2026-09-01) — 조직 간 동명 에이전트의 토큰 키·선택자 구분
+            org: (!org.is_empty()).then(|| org.clone()),
             agent,
+            channel: chosen,
             description,
-            wake,
+            wake_dir: None,
+            wake_policy: "always".to_owned(),
+            wake_command: None,
+            wake_args: None,
         },
         token,
         channels,

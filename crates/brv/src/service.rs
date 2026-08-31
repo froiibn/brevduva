@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! OS 서비스 등록·해제 — `brv daemon install` / `uninstall` (페이즈 7).
 //!
 //! 공통 설계: 서비스는 **현재 사용자 컨텍스트**로 돈다 — 토큰 키체인과 wake용 CLI
@@ -355,8 +358,9 @@ fn run_service() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {
         let cfg = crate::config::load()?;
-        let token = crate::config::load_token(&cfg)?;
-        crate::daemon::run_with_shutdown(cfg, token, Some(stop_rx)).await
+        // 전 바인딩 토큰 일괄 로드 (페이즈 27) — 하나라도 없으면 기동 거부가 정직하다
+        let tokens = crate::config::load_tokens(&cfg)?;
+        crate::daemon::run_with_shutdown(cfg, tokens, Some(stop_rx)).await
     });
     set_status(
         &status_handle,

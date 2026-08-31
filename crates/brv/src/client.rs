@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! WS 클라이언트 코어 — PROTOCOL.md 13장(장애·재연결)의 **참조 구현**.
 //!
 //! - 재접속: 지수 백오프 + full jitter, JOIN 멱등 (13.2)
@@ -25,6 +28,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// 유휴 파킹 기본값 — ack_wait(기본 30s)×포이즌 임계(5)로 격리되기 한참 전에 자리를 내려놓는다.
+pub const DEFAULT_IDLE_PARK: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     /// 서버 베이스 URL (http/https) — ws(s)://…/v1/ws 로 유도.
@@ -38,6 +44,13 @@ pub struct ClientOptions {
     pub takeover_standby: bool,
     /// standby 중 자리 확인 주기 — long-poll PRESENCE 프로브 (세션·큐를 건드리지 않음).
     pub standby_probe: Duration,
+    /// **유휴 파킹** (2026-09-01, 방치 실측의 근본 수정): 명령·대기자·미해결 작업이 전부 없는
+    /// 상태가 이 시간을 넘으면 접속을 스스로 내려놓는다 — 메시지가 "듣지 않는 세션의 버퍼"에
+    /// 배달돼 미소비 재전달(ack_wait)로 격리 예산을 태우는 대신, 서버 큐에 안전하게 남는다.
+    /// 다음 명령이 오면 자동 재접속(재JOIN)해 밀린 것부터 받는다. 단, 확인 유보분(unacked —
+    /// 데몬 wake 실패 등 처리 실패 신호)이 있으면 파킹하지 않는다: 그 재전달·포이즌 가시화는
+    /// 페이즈 20의 의도된 실패 표면이다. None = 파킹 없음 (listen 등 상시 대기자 경로).
+    pub idle_park: Option<Duration>,
 }
 
 impl ClientOptions {
@@ -55,6 +68,7 @@ impl ClientOptions {
             description: String::new(),
             takeover_standby: false,
             standby_probe: Duration::from_secs(30),
+            idle_park: None,
         }
     }
 }
@@ -684,11 +698,12 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
         last_pong: Instant::now(),
     };
     let mut attempt: u32 = 0;
+    let mut resume_cmd: Option<Cmd> = None;
     loop {
         match connect_and_join(&mut state).await {
             Ok((ws, backlog)) => {
                 attempt = 0;
-                match run_connection(&mut state, ws, backlog, &mut cmds).await {
+                match run_connection(&mut state, ws, backlog, resume_cmd.take(), &mut cmds).await {
                     ConnEnd::Reconnect => state.on_disconnect(),
                     ConnEnd::TakenOver => {
                         state.on_disconnect();
@@ -699,6 +714,21 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
                             tracing::info!("agent slot free — resuming");
                         }
                         // 대화형(기본): 즉시 재접속 = 최신 연결이 자리를 가진다
+                    }
+                    ConnEnd::Park => {
+                        // 유휴 파킹 (2026-09-01): 미소비 버퍼는 서버 큐에 반납한다 —
+                        // 로컬 사본을 남기면 재JOIN 후 낡은 seq로 ACK하는 어긋남이 생긴다.
+                        // ACK 안 한 전달분은 재접속 시 서버가 다시 가져다준다 (유실 없음)
+                        state.on_disconnect();
+                        state.inbox.clear();
+                        state.queued_ids.clear();
+                        tracing::info!("idle — parking connection (messages queue server-side)");
+                        match cmds.recv().await {
+                            Some(cmd) => resume_cmd = Some(cmd), // 재접속 직후 처리
+                            None => return,                      // 핸들 전부 드롭 — 종료
+                        }
+                        tracing::info!("command arrived — resuming from park");
+                        continue; // 백오프 없이 즉시 재접속
                     }
                     ConnEnd::Closed => return,
                 }
@@ -733,6 +763,8 @@ enum ConnEnd {
     Reconnect,
     /// 다른 세션이 자리를 가져감 (`agent/session-conflict` 수신, 2.2).
     TakenOver,
+    /// 유휴 파킹 (idle_park 초과) — 접속을 내려놓고 다음 명령까지 대기 (2026-09-01).
+    Park,
     Closed,
 }
 
@@ -959,6 +991,7 @@ async fn run_connection(
     state: &mut Actor,
     mut ws: Ws,
     backlog: Vec<ServerFrame>,
+    resume_cmd: Option<Cmd>,
     cmds: &mut mpsc::Receiver<Cmd>,
 ) -> ConnEnd {
     for frame in backlog {
@@ -968,13 +1001,42 @@ async fn run_connection(
             state.handle_deliver(&mut ws, seq, *env).await;
         }
     }
+    // 파킹을 깨운 명령을 접속 직후 처리 (2026-09-01)
+    if let Some(cmd) = resume_cmd {
+        state.handle_cmd(&mut ws, cmd).await;
+    }
+    // 유휴 파킹 마감 — 명령마다 뒤로 밀리고, 도달 시점에 일이 남아 있으면 한 창 더 미룬다.
+    // 핑 틱에 얹지 않고 전용 타이머인 이유: 판정 시점이 창 폭보다 굵어지면(20s 틱) 방치
+    // 창이 격리 예산과 경합한다 — 파킹은 격리보다 확실히 먼저 일어나야 한다 (2026-09-01)
+    let mut park_at = state.opts.idle_park.map(|d| Instant::now() + d);
     let mut ping_tick = interval(Duration::from_secs(20));
     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             cmd = cmds.recv() => match cmd {
-                Some(cmd) => state.handle_cmd(&mut ws, cmd).await,
+                Some(cmd) => {
+                    if let Some(d) = state.opts.idle_park {
+                        park_at = Some(Instant::now() + d);
+                    }
+                    state.handle_cmd(&mut ws, cmd).await;
+                }
                 None => return ConnEnd::Closed, // 핸들 전부 드롭 — 종료
+            },
+            _ = tokio::time::sleep_until(park_at.unwrap_or_else(Instant::now)), if park_at.is_some() => {
+                // 유휴 파킹 판정 (2026-09-01): 명령이 끊긴 지 idle_park 초과 + 진행 중인 일 없음.
+                // unacked(확인 유보 = 처리 실패 신호)가 남아 있으면 파킹하지 않는다 —
+                // 그 재전달→포이즌 가시화는 페이즈 20의 의도된 실패 표면
+                state.waiters.retain(|(_, _, tx)| !tx.is_closed());
+                if state.waiters.is_empty()
+                    && state.pending.is_empty()
+                    && state.outbox.is_empty()
+                    && state.unacked.is_empty()
+                {
+                    let _ = ws.close(None).await;
+                    return ConnEnd::Park;
+                }
+                // 일이 진행 중 — 한 창 더 뒤로 (대기자 홀드 등은 명령 없이도 끝나므로 재확인)
+                park_at = state.opts.idle_park.map(|d| Instant::now() + d);
             },
             _ = ping_tick.tick() => {
                 // 13.1: 2회 연속 무응답(≈45s) 판정

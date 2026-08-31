@@ -1,43 +1,102 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! brv 설정 — 파일(비밀 제외) + OS 키체인(토큰).
 //!
 //! 원칙(PLAN·PROTOCOL 5.1): 클라이언트에 비밀 없음 — 토큰은 OS 키체인에 보관하고
 //! 설정 파일에는 넣지 않는다. 키체인이 없는 환경(일부 headless 리눅스)은
-//! `BREVDUVA_TOKEN` 환경 변수로 대체할 수 있다.
+//! `BREVDUVA_TOKEN` 환경 변수(단일 바인딩 전용)나 토큰 파일로 대체할 수 있다.
+//!
+//! **다중 바인딩 (페이즈 27)**: 한 머신의 brv 프로세스 하나가 여러 (에이전트, 채널)
+//! 바인딩을 수신한다. 설정은 전역(server, `[wake]` 공통)과 `[[binding]]` 배열로 나뉜다 —
+//! wake의 실행기·권한·타임아웃은 머신의 로컬 신뢰 정책이라 전역, 작업 디렉터리와
+//! 깨우기 여부는 프로젝트 속성이라 바인딩별. 페이즈 27 이전의 단수형(톱레벨
+//! channel/agent + [wake]의 dir/policy)은 읽기 시 바인딩 1개로 해석한다 (하위 호환 —
+//! 기존 머신은 재설정 불요, 다음 저장 때 신형으로 이행).
 
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-/// 설정 파일 본문 (`~/.config/brevduva/config.toml` 또는 %APPDATA%\brevduva\config.toml).
+/// (에이전트, 채널) 바인딩 하나 — 이 머신이 수행하는 정체성 (페이즈 27).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrvConfig {
-    /// 서버 베이스 URL (http/https) — WS 주소는 여기서 유도한다.
-    pub server: String,
-    pub channel: String,
+pub struct Binding {
+    /// 소속 조직 — 여러 조직의 동명 에이전트·채널 구분용 (2026-09-01 보강).
+    /// 채널·에이전트 이름은 org 스코프라, org 없이는 조직 간 충돌 시 토큰·선택자가 겹친다.
+    /// enroll이 채우며, 구형 설정(단일 조직 시절)에는 없다 → None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
     pub agent: String,
+    pub channel: String,
     /// 능력 선언의 소개문 (PROTOCOL.md 4장) — 동료가 라우팅 판단에 쓴다.
     #[serde(default)]
     pub description: String,
-    /// `brv daemon`의 세션 깨우기 설정 (5.3 CLI 어댑터 규약). 없으면 daemon 기동 거부.
+    /// 깨어난 세션의 작업 디렉터리 (해당 프로젝트 루트 — .mcp.json이 있는 곳).
+    /// 없으면 이 바인딩은 wake 불가 — 데몬 기동 시 검증한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake: Option<WakeConfig>,
+    pub wake_dir: Option<String>,
+    /// `always` | `never` — 이 바인딩의 깨우기 여부 (never = 저널 기록만).
+    /// 업무시간 정책은 2026-08-29 기각 — 에이전트에 사람 리듬 투영은 모순.
+    #[serde(default = "default_policy")]
+    pub wake_policy: String,
+    /// 이 바인딩 전용 깨우기 실행 파일 — 없으면 전역 `[wake].command` 상속.
+    /// 러너 혼용용 (2026-09-01): 한 머신에서 claude 바인딩과 codex 바인딩을 함께 굴린다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_command: Option<String>,
+    /// 이 바인딩 전용 깨우기 인자 — 없으면 전역 `[wake].args` 상속 (`{prompt}` 치환 동일).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_args: Option<Vec<String>>,
 }
 
-/// 깨우기 설정 — 메시지 도착 시 실행할 명령 (예: `claude -p "{prompt}"`).
+impl Binding {
+    /// 표시·선택자 표기 — `agent@channel`.
+    pub fn label(&self) -> String {
+        format!("{}@{}", self.agent, self.channel)
+    }
+
+    /// org까지 붙인 완전 표기 — `org/agent@channel` (org 미상이면 label과 동일).
+    pub fn full_label(&self) -> String {
+        match &self.org {
+            Some(o) => format!("{o}/{}", self.label()),
+            None => self.label(),
+        }
+    }
+
+    /// 토큰 저장·조회의 정체성 키 — org를 알면 `org/agent` (조직 간 동명 에이전트 구분),
+    /// 모르면 `agent` (구형 호환 — 기존 키체인 항목이 이 형태).
+    pub fn token_id(&self) -> String {
+        match &self.org {
+            Some(o) => format!("{o}/{}", self.agent),
+            None => self.agent.clone(),
+        }
+    }
+}
+
+/// 설정 파일 본문 (`~/.config/brevduva/config.toml` 또는 %APPDATA%\brevduva\config.toml).
+#[derive(Debug, Clone, Serialize)]
+pub struct BrvConfig {
+    /// 서버 베이스 URL (http/https) — WS 주소는 여기서 유도한다. 머신당 서버 하나
+    /// (프로필 분리는 `BREVDUVA_CONFIG`로 — 페이즈 27 결정).
+    pub server: String,
+    /// `brv daemon`의 세션 깨우기 실행기 (5.3 CLI 어댑터 규약). 없으면 daemon 기동 거부.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeConfig>,
+    /// 이 머신의 바인딩들 — 데몬은 전부 동시 수신, 단일 대상 명령은 `--binding`으로 선택.
+    #[serde(rename = "binding")]
+    pub bindings: Vec<Binding>,
+}
+
+/// 전역 깨우기 설정 — 무엇으로 깨울지 (예: `claude -p "{prompt}"`).
+/// 실행기·권한(args)·타임아웃은 머신의 로컬 신뢰 정책이라 바인딩과 무관하게 전역이다.
+/// 작업 디렉터리·정책은 바인딩 소관 (페이즈 27 분리).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeConfig {
-    /// `always` | `never` (5.3: 항상/무시. 업무시간 정책은 2026-08-29 기각 —
-    /// 에이전트에 사람 리듬 투영은 모순, 비용 우려는 수요 확인 시 깨우기 빈도 상한으로)
-    #[serde(default = "default_policy")]
-    pub policy: String,
     /// 실행 파일 (전체 경로 권장 — PATH에 없을 수 있음)
     pub command: String,
     /// 인자 목록 — `{prompt}` 자리에 메시지 프롬프트가 치환된다
     #[serde(default = "default_wake_args")]
     pub args: Vec<String>,
-    /// 실행 작업 디렉터리 (해당 프로젝트 루트 — .mcp.json이 있는 곳)
-    pub dir: String,
     /// 깨운 세션의 최대 실행 시간(초) — 초과 시 강제 종료
     #[serde(default = "default_wake_timeout")]
     pub timeout_s: u64,
@@ -93,6 +152,84 @@ pub fn wake_preset_of(args: &[String]) -> Option<&'static str> {
         .find(|level| wake_preset_args(level).as_deref() == Some(args))
 }
 
+impl BrvConfig {
+    /// 바인딩 선택 — 명령의 `--binding` 값(있으면)으로, 없으면 유일한 바인딩으로.
+    /// 복수 바인딩에서 미지정은 에러 — 조용히 엉뚱한 채널로 나가는 것보다 낫다 (페이즈 27).
+    pub fn select(&self, selector: Option<&str>) -> anyhow::Result<&Binding> {
+        match selector {
+            Some(sel) => self.find(sel),
+            None => match self.bindings.as_slice() {
+                [] => {
+                    anyhow::bail!("no bindings configured — run `brv init --enroll <code>` first")
+                }
+                [one] => Ok(one),
+                many => anyhow::bail!(
+                    "multiple bindings configured — pick one with --binding: {}",
+                    many.iter()
+                        .map(Binding::label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+        }
+    }
+
+    /// 선택자 해석 — 좁은 것부터: `org/agent@channel` > `agent@channel` > `org/agent` >
+    /// `agent`. 생략된 부분은 조건에서 빠지며, 결과가 유일하지 않으면 더 구체적인 형태를
+    /// 요구하는 에러를 낸다 (조직 간 동명 충돌 대비, 2026-09-01).
+    pub fn find(&self, selector: &str) -> anyhow::Result<&Binding> {
+        let (org, rest) = match selector.split_once('/') {
+            Some((o, r)) => (Some(o), r),
+            None => (None, selector),
+        };
+        let (agent, channel) = match rest.split_once('@') {
+            Some((a, c)) => (a, Some(c)),
+            None => (rest, None),
+        };
+        let mut hits = self.bindings.iter().filter(|b| {
+            b.agent == agent
+                && channel.is_none_or(|c| b.channel == c)
+                && org.is_none_or(|o| b.org.as_deref() == Some(o))
+        });
+        let first = hits
+            .next()
+            .with_context(|| format!("no binding matches {selector:?} — see `brv binding list`"))?;
+        anyhow::ensure!(
+            hits.next().is_none(),
+            "selector {selector:?} is ambiguous — be more specific (org/agent@channel): {}",
+            self.bindings
+                .iter()
+                .map(Binding::full_label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(first)
+    }
+
+    /// 바인딩 추가/교체 — 같은 (org, agent, channel)이 있으면 소개문만 갱신하고 운영 설정
+    /// (wake_dir·wake_policy·wake_command·wake_args)은 보존한다 (재init·재enroll이
+    /// 깨우기를 지우면 안 됨). org가 한쪽만 있으면 같은 것으로 보고 채운다 —
+    /// 구형(단일 조직) 바인딩이 재enroll로 org를 획득하는 경로. 반환: true = 기존 교체.
+    pub fn upsert_binding(&mut self, incoming: Binding) -> bool {
+        if let Some(existing) = self.bindings.iter_mut().find(|b| {
+            b.agent == incoming.agent
+                && b.channel == incoming.channel
+                && (b.org.is_none() || incoming.org.is_none() || b.org == incoming.org)
+        }) {
+            if incoming.org.is_some() {
+                existing.org = incoming.org;
+            }
+            if !incoming.description.is_empty() {
+                existing.description = incoming.description;
+            }
+            true
+        } else {
+            self.bindings.push(incoming);
+            false
+        }
+    }
+}
+
 /// 프로세스 내 설정 경로 고정 — 윈도우 서비스 모드(페이즈 7)에서 SCM launch args로 받은
 /// 경로를 전달하는 통로. 에디션 2024에서 `env::set_var`가 unsafe라 env 주입 대신 이 방식.
 static PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -113,11 +250,80 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(dir.join("brevduva").join("config.toml"))
 }
 
+/// 원본 파싱용 — 신형(`[[binding]]`)과 구형(톱레벨 channel/agent, [wake]의 dir/policy)을
+/// 한 구조로 받아 `normalize`가 신형으로 통일한다.
+#[derive(Deserialize)]
+struct RawConfig {
+    server: String,
+    #[serde(rename = "binding", default)]
+    bindings: Vec<Binding>,
+    wake: Option<RawWake>,
+    // ---- 구형 필드 (페이즈 27 이전 단수형) ----
+    channel: Option<String>,
+    agent: Option<String>,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct RawWake {
+    command: String,
+    #[serde(default = "default_wake_args")]
+    args: Vec<String>,
+    #[serde(default = "default_wake_timeout")]
+    timeout_s: u64,
+    // ---- 구형 필드 — 신형에서는 바인딩 소관 ----
+    dir: Option<String>,
+    #[serde(default = "default_policy")]
+    policy: String,
+}
+
+impl RawConfig {
+    fn normalize(self) -> BrvConfig {
+        let mut bindings = self.bindings;
+        if bindings.is_empty()
+            && let (Some(agent), Some(channel)) = (self.agent, self.channel)
+        {
+            // 구형 단수 설정 → 바인딩 1개로 해석. wake의 dir/policy도 바인딩으로 이동.
+            // org·러너 오버라이드는 구형에 없던 개념 — 미상(None)으로 두면 토큰 폴백이 감당
+            bindings.push(Binding {
+                org: None,
+                agent,
+                channel,
+                description: self.description,
+                wake_dir: self.wake.as_ref().and_then(|w| w.dir.clone()),
+                wake_policy: self
+                    .wake
+                    .as_ref()
+                    .map(|w| w.policy.clone())
+                    .unwrap_or_else(default_policy),
+                wake_command: None,
+                wake_args: None,
+            });
+        }
+        BrvConfig {
+            server: self.server,
+            wake: self.wake.map(|w| WakeConfig {
+                command: w.command,
+                args: w.args,
+                timeout_s: w.timeout_s,
+            }),
+            bindings,
+        }
+    }
+}
+
 pub fn load() -> anyhow::Result<BrvConfig> {
     let path = config_path()?;
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("config not found at {path:?} — run `brv init` first"))?;
-    toml::from_str(&text).context("config parse failed")
+    parse(&text)
+}
+
+/// 파싱+정규화 — load와 테스트가 공유하는 단일 경로.
+pub fn parse(text: &str) -> anyhow::Result<BrvConfig> {
+    let raw: RawConfig = toml::from_str(text).context("config parse failed")?;
+    Ok(raw.normalize())
 }
 
 pub fn store(cfg: &BrvConfig) -> anyhow::Result<PathBuf> {
@@ -127,12 +333,11 @@ pub fn store(cfg: &BrvConfig) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-fn keyring_entry(cfg: &BrvConfig) -> anyhow::Result<keyring::Entry> {
-    // 계정 키 = 에이전트@서버 — 채널은 넣지 않는다 (2026-08-27 수정).
-    // 토큰은 org 스코프(PROTOCOL.md 2.1·5.1)라 한 에이전트가 여러 채널에 참가한다 —
-    // 채널을 키에 넣으면 채널 추가마다 토큰을 못 찾는 스펙 위반이 된다 (실전 채널 분리에서 발견)
-    keyring::Entry::new("brevduva", &format!("{}@{}", cfg.agent, cfg.server))
-        .context("keyring unavailable")
+fn keyring_entry(server: &str, token_id: &str) -> anyhow::Result<keyring::Entry> {
+    // 계정 키 = 정체성@서버 — 채널은 넣지 않는다 (2026-08-27 수정: 토큰은 org 스코프라
+    // 한 에이전트가 여러 채널에 참가). 정체성은 org를 알면 `org/agent`(조직 간 동명
+    // 에이전트 충돌 방지, 2026-09-01), 구형(단일 조직 시절)은 `agent`.
+    keyring::Entry::new("brevduva", &format!("{token_id}@{server}")).context("keyring unavailable")
 }
 
 /// 토큰이 실제로 저장된 위치 — 호출자가 사용자에게 정확히 알려주기 위한 반환값.
@@ -142,19 +347,23 @@ pub enum TokenStore {
     File(PathBuf),
 }
 
-/// 토큰 저장 — 키체인 우선, 불가하면 토큰 파일(600) 폴백.
-/// 키체인 없는 헤드리스 리눅스에서 init이 실패하던 결함의 근본 수정 (2026-08-28, 페이즈 10) —
-/// load_token의 파일 폴백과 대칭이 됐다 (lucadm 배치 때는 수동으로 우회했던 경로).
-pub fn store_token(cfg: &BrvConfig, token: &str) -> anyhow::Result<TokenStore> {
-    if let Ok(entry) = keyring_entry(cfg)
+fn token_file(token_id: &str) -> anyhow::Result<PathBuf> {
+    // 파일명에 '/'는 불가 — org 구분자를 '-'로 (org·agent는 케밥 식별자라 안전)
+    Ok(config_path()?
+        .parent()
+        .expect("config has parent")
+        .join(format!("token-{}", token_id.replace('/', "-"))))
+}
+
+/// 토큰 저장 — 키체인 우선, 불가하면 토큰 파일(600) 폴백. 키는 바인딩의 token_id 기준.
+pub fn store_token(server: &str, binding: &Binding, token: &str) -> anyhow::Result<TokenStore> {
+    let id = binding.token_id();
+    if let Ok(entry) = keyring_entry(server, &id)
         && entry.set_password(token).is_ok()
     {
         return Ok(TokenStore::Keyring);
     }
-    let path = config_path()?
-        .parent()
-        .expect("config has parent")
-        .join("token");
+    let path = token_file(&id)?;
     std::fs::create_dir_all(path.parent().expect("token path has parent"))?;
     std::fs::write(&path, token)
         .with_context(|| format!("keyring unavailable and token file write failed at {path:?}"))?;
@@ -166,27 +375,57 @@ pub fn store_token(cfg: &BrvConfig, token: &str) -> anyhow::Result<TokenStore> {
     Ok(TokenStore::File(path))
 }
 
-/// 토큰 로드 우선순위: `BREVDUVA_TOKEN` env → OS 키체인 → 토큰 파일.
-/// 토큰 파일(설정 디렉터리의 `token`, 600 권한)은 키체인이 없는 headless 리눅스 서버용 —
-/// 데몬이 깨운 세션의 MCP도 같은 경로로 토큰을 찾는다 (2026-08-27, lucadm 배치에서 필요 확인).
-pub fn load_token(cfg: &BrvConfig) -> anyhow::Result<String> {
+/// 토큰 로드 우선순위: `BREVDUVA_TOKEN` env → 키체인(org 포함 키 → 구형 agent 키) →
+/// 토큰 파일(org 포함 → 구형 `token-{agent}`) → 구형 단일 파일(`token`, 바인딩이
+/// 하나일 때만 — 어느 에이전트 것인지 판별 불가). 구형 폴백들 덕에 기존 머신
+/// (org 없는 키로 저장됨)은 재enroll 없이 동작한다.
+/// env는 단일 바인딩 전용 편의 — 에이전트가 여럿이면 전원에게 같은 값이 가므로 부적합.
+pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("BREVDUVA_TOKEN") {
         return Ok(token);
     }
-    if let Ok(entry) = keyring_entry(cfg)
-        && let Ok(token) = entry.get_password()
-    {
-        return Ok(token);
+    let id = binding.token_id();
+    let mut ids = vec![id.clone()];
+    if binding.org.is_some() {
+        ids.push(binding.agent.clone()); // 구형 키 폴백
     }
-    let token_file = config_path()?
-        .parent()
-        .expect("config has parent")
-        .join("token");
-    std::fs::read_to_string(&token_file)
-        .map(|t| t.trim().to_owned())
-        .with_context(|| {
-            format!("token not found — run `brv init`, set BREVDUVA_TOKEN, or place it at {token_file:?}")
-        })
+    for candidate in &ids {
+        if let Ok(entry) = keyring_entry(&cfg.server, candidate)
+            && let Ok(token) = entry.get_password()
+        {
+            return Ok(token);
+        }
+    }
+    for candidate in &ids {
+        if let Ok(t) = std::fs::read_to_string(token_file(candidate)?) {
+            return Ok(t.trim().to_owned());
+        }
+    }
+    if cfg.bindings.len() <= 1 {
+        let legacy = config_path()?
+            .parent()
+            .expect("config has parent")
+            .join("token");
+        if let Ok(t) = std::fs::read_to_string(&legacy) {
+            return Ok(t.trim().to_owned());
+        }
+    }
+    anyhow::bail!(
+        "token for {id:?} not found — run `brv init --enroll`, set BREVDUVA_TOKEN, or place it at {:?}",
+        token_file(&id)?
+    )
+}
+
+/// 전 바인딩의 토큰 일괄 로드 (token_id → token) — 데몬·서비스 기동용.
+/// 바인딩이 하나라도 토큰이 없으면 에러 — 설정된 바인딩이 조용히 죽는 것보다 낫다.
+pub fn load_tokens(cfg: &BrvConfig) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for b in &cfg.bindings {
+        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(b.token_id()) {
+            e.insert(load_token(cfg, b)?);
+        }
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -222,28 +461,184 @@ mod tests {
         assert_eq!(wake_allowed_tools(&custom), None);
     }
 
+    fn binding(agent: &str, channel: &str) -> Binding {
+        Binding {
+            org: None,
+            agent: agent.into(),
+            channel: channel.into(),
+            description: String::new(),
+            wake_dir: None,
+            wake_policy: default_policy(),
+            wake_command: None,
+            wake_args: None,
+        }
+    }
+
     #[test]
-    fn wake_config_survives_toml_roundtrip() {
-        // "한번 설정하면 유지"의 최소 보증 — 직렬화 왕복에서 필드가 안 사라진다
-        // (재init 보존은 main의 init이 load→wake 이식으로 담당, 회귀는 phase10 e2e)
+    fn multi_binding_config_survives_toml_roundtrip() {
+        // 신형: 전역 [wake] + [[binding]] 배열(org·러너 오버라이드 포함)이 왕복 보존 (페이즈 27)
         let cfg = BrvConfig {
             server: "https://api.brevduva.dev".into(),
-            channel: "myapp".into(),
-            agent: "backend".into(),
-            description: String::new(),
             wake: Some(WakeConfig {
-                policy: "always".into(),
                 command: "/home/user/.local/bin/claude".into(),
                 args: wake_preset_args("full").unwrap(),
-                dir: "/home/user/app".into(),
                 timeout_s: 900,
             }),
+            bindings: vec![
+                Binding {
+                    org: Some("acme".into()),
+                    wake_dir: Some("/home/user/app".into()),
+                    ..binding("backend", "saju-engine")
+                },
+                Binding {
+                    wake_policy: "never".into(),
+                    wake_command: Some("/usr/bin/codex".into()),
+                    wake_args: Some(vec!["exec".into(), "{prompt}".into()]),
+                    ..binding("docs", "myapp")
+                },
+            ],
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
-        let back: BrvConfig = toml::from_str(&text).unwrap();
+        let back = parse(&text).unwrap();
+        assert_eq!(back.bindings.len(), 2);
         let wake = back.wake.unwrap();
         assert_eq!(wake_preset_of(&wake.args), Some("full"));
         assert_eq!(wake.timeout_s, 900);
-        assert_eq!(wake.command, "/home/user/.local/bin/claude");
+        assert_eq!(back.bindings[0].org.as_deref(), Some("acme"));
+        assert_eq!(back.bindings[0].full_label(), "acme/backend@saju-engine");
+        assert_eq!(back.bindings[0].token_id(), "acme/backend");
+        assert_eq!(back.bindings[0].wake_dir.as_deref(), Some("/home/user/app"));
+        assert_eq!(back.bindings[1].wake_policy, "never");
+        assert_eq!(
+            back.bindings[1].wake_command.as_deref(),
+            Some("/usr/bin/codex")
+        );
+        assert_eq!(back.bindings[1].token_id(), "docs");
+    }
+
+    #[test]
+    fn legacy_single_config_reads_as_one_binding() {
+        // 구형(페이즈 27 이전): 톱레벨 channel/agent + [wake]의 dir/policy →
+        // 바인딩 1개로 해석되고 dir/policy가 바인딩으로 이동한다 (기존 머신 재설정 불요)
+        let cfg = parse(
+            r#"
+            server = "https://api.brevduva.dev"
+            channel = "myapp"
+            agent = "backend"
+            description = "백엔드"
+            [wake]
+            policy = "never"
+            command = "claude"
+            dir = "C:\\test-backend"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.bindings.len(), 1);
+        let b = &cfg.bindings[0];
+        assert_eq!((b.agent.as_str(), b.channel.as_str()), ("backend", "myapp"));
+        assert_eq!(b.description, "백엔드");
+        assert_eq!(b.wake_dir.as_deref(), Some("C:\\test-backend"));
+        assert_eq!(b.wake_policy, "never");
+        let wake = cfg.wake.as_ref().unwrap();
+        assert_eq!(wake.command, "claude");
+        assert_eq!(wake.timeout_s, 600);
+        assert!(wake.args.iter().any(|a| a.contains("{prompt}")));
+        // 재저장은 신형으로 — 구형 필드가 남지 않는다
+        let stored =
+            toml::to_string_pretty(&parse(&toml::to_string_pretty(&cfg).unwrap()).unwrap());
+        assert!(!stored.unwrap().contains("policy = \"never\"\ncommand"));
+    }
+
+    #[test]
+    fn select_and_find_resolve_bindings() {
+        let mut cfg = BrvConfig {
+            server: "http://127.0.0.1:8080".into(),
+            wake: None,
+            bindings: vec![binding("backend", "saju-engine")],
+        };
+        // 단일 바인딩: 무지정 선택 OK
+        assert_eq!(cfg.select(None).unwrap().channel, "saju-engine");
+        cfg.bindings.push(binding("docs", "myapp"));
+        cfg.bindings.push(binding("backend", "myapp"));
+        // 복수 바인딩: 무지정은 에러 (조용한 오발신 방지)
+        assert!(cfg.select(None).is_err());
+        // agent@channel 정확 일치
+        assert_eq!(cfg.select(Some("backend@myapp")).unwrap().channel, "myapp");
+        // 에이전트 단독: 유일하면 통과, 중복이면 에러
+        assert_eq!(cfg.find("docs").unwrap().channel, "myapp");
+        assert!(cfg.find("backend").is_err());
+        assert!(cfg.find("ghost").is_err());
+    }
+
+    #[test]
+    fn org_disambiguates_same_named_bindings() {
+        // 2026-09-01 보강: 다른 조직의 동명 agent@channel은 org 접두로만 구분된다
+        let cfg = BrvConfig {
+            server: "http://127.0.0.1:8080".into(),
+            wake: None,
+            bindings: vec![
+                Binding {
+                    org: Some("acme".into()),
+                    ..binding("backend", "myapp")
+                },
+                Binding {
+                    org: Some("personal".into()),
+                    ..binding("backend", "myapp")
+                },
+            ],
+        };
+        // org 없는 선택자는 애매 — 완전 표기 요구
+        assert!(cfg.find("backend@myapp").is_err());
+        assert!(cfg.find("backend").is_err());
+        // org 접두로 유일 결정
+        assert_eq!(
+            cfg.find("acme/backend@myapp").unwrap().org.as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            cfg.find("personal/backend").unwrap().org.as_deref(),
+            Some("personal")
+        );
+        // 토큰 키도 org로 갈라진다 (키체인 덮어쓰기 방지의 핵심)
+        assert_ne!(cfg.bindings[0].token_id(), cfg.bindings[1].token_id());
+    }
+
+    #[test]
+    fn upsert_preserves_operational_settings() {
+        // 재enroll(같은 agent@channel)이 wake_dir·policy·러너 오버라이드를 지우면 안 된다
+        let mut cfg = BrvConfig {
+            server: "http://127.0.0.1:8080".into(),
+            wake: None,
+            bindings: vec![Binding {
+                wake_dir: Some("/app".into()),
+                wake_policy: "never".into(),
+                wake_command: Some("/usr/bin/codex".into()),
+                description: "old".into(),
+                ..binding("backend", "myapp")
+            }],
+        };
+        // 구형(org 없음) 바인딩에 org 있는 enroll이 오면 — 교체 + org 채움
+        let replaced = cfg.upsert_binding(Binding {
+            org: Some("personal".into()),
+            description: "new".into(),
+            ..binding("backend", "myapp")
+        });
+        assert!(replaced);
+        assert_eq!(cfg.bindings.len(), 1);
+        let b = &cfg.bindings[0];
+        assert_eq!(b.org.as_deref(), Some("personal"));
+        assert_eq!(b.description, "new");
+        assert_eq!(b.wake_dir.as_deref(), Some("/app"));
+        assert_eq!(b.wake_policy, "never");
+        assert_eq!(b.wake_command.as_deref(), Some("/usr/bin/codex"));
+        // 같은 이름이라도 다른 org면 별개 바인딩으로 추가
+        assert!(!cfg.upsert_binding(Binding {
+            org: Some("acme".into()),
+            ..binding("backend", "myapp")
+        }));
+        assert_eq!(cfg.bindings.len(), 2);
+        // 새 (agent, channel)도 추가
+        assert!(!cfg.upsert_binding(binding("backend", "other")));
+        assert_eq!(cfg.bindings.len(), 3);
     }
 }

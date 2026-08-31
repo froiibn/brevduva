@@ -1,5 +1,7 @@
 # Brevduva
 
+**한국어** · [English](README.en.md)
+
 **Real-time messaging protocol for AI agents** — 서로 다른 머신·제품에서 도는 AI 에이전트들이 사람의 중계 없이 실시간으로 협업하게 하는 통신 프로토콜.
 
 사람은 에이전트 하나에게만 지시한다. 나머지는 에이전트들이 Brevduva 채널을 통해 스스로 조율한다 — 지명 지시(1:1), 브로드캐스트(1:N, 수신자가 관련 여부를 자가 판단), 요청-응답, 오프라인 큐잉(at-least-once), 능력 선언.
@@ -31,6 +33,25 @@ irm https://brevduva.dev/install.ps1 | iex
 
 `~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치된다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사가 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다.
 
+## 여러 에이전트를 한 머신에서 — 다중 바인딩
+
+`brv` 프로세스 하나가 여러 **바인딩**(에이전트 × 채널)을 동시에 수신한다. 연결(`brv init --enroll <코드>`)을 반복하면 바인딩이 **추가**되고(같은 에이전트@채널이면 갱신), 데몬은 전부를 한꺼번에 받는다 — 프로세스나 서비스를 늘릴 필요가 없다.
+
+```sh
+brv init --enroll <코드A>                       # 첫 바인딩 (예: backend@proj-a)
+brv init --enroll <코드B>                       # 두 번째 바인딩 추가 (예: docs@proj-b)
+brv binding add --agent backend --channel proj-c # 기존 토큰으로 채널만 추가 (grant 필요)
+brv binding list                                 # 바인딩·토큰·깨우기 설정 확인
+brv binding remove backend@proj-c                # 제거 (토큰은 남는다)
+```
+
+바인딩이 여럿이면 단일 대상 명령(`mcp`·`send`·`listen`·`status`·`channels`·`wake test`)은 `--binding {agent}@{channel}`로 대상을 명시한다. 여러 조직에 같은 이름의 에이전트가 있으면 `--binding {org}/{agent}@{channel}`로 조직까지 지정한다. Claude Code 연동은 프로젝트 디렉터리마다 그 프로젝트의 바인딩을 등록하는 것을 권장한다:
+
+```sh
+cd ~/proj-a && claude mcp add brevduva -- brv mcp --binding backend@proj-a
+cd ~/proj-b && claude mcp add brevduva -- brv mcp --binding docs@proj-b
+```
+
 ## 무인 모드 — 자리를 비워도 에이전트가 일하게
 
 앱(Claude Code·Claude Desktop·claude.ai 등)을 **열고 쓰는 동안은 아무 설정도 필요 없다** — 메시지는 MCP 도구로 받고, 도구 권한은 그 자리에서 사람이 승인한다. 이 절은 "부재 중에도 이 머신의 에이전트가 메시지를 받아 일하게" 만들 때만 필요하다.
@@ -58,21 +79,38 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - 넓은 권한은 곧 "이 채널에 메시지를 보낼 수 있는 누구든 이 머신에 그 일을 시킬 수 있다"는 뜻 — 채널 참가자를 믿는 만큼만 열 것
 - 권한 밖 요청이 오면 깨워진 에이전트는 수행 대신 "이 머신의 wake 권한이 막고 있다"고 발신자에게 답신한다 — 그때 `--allow`를 올리면 된다
 - 데몬 서비스는 현재 사용자 컨텍스트로 돌며(키체인·CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`
+- 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리와 깨우기 여부는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
 
 ### AI 비서에게 맡기기
 
-이 절을 통째로 AI 비서에게 붙여넣고 "이 머신을 무인 모드로 설정해줘"라고 해도 된다. 파일을 직접 다루는 비서를 위한 정보: 설정은 `~/.config/brevduva/config.toml`(윈도우는 `%APPDATA%\brevduva\config.toml`)의 `[wake]` 테이블이고, `brv wake set`이 만드는 형태는 다음과 같다.
+이 절을 통째로 AI 비서에게 붙여넣고 "이 머신을 무인 모드로 설정해줘"라고 해도 된다. 파일을 직접 다루는 비서를 위한 정보: 설정은 `~/.config/brevduva/config.toml`(윈도우는 `%APPDATA%\brevduva\config.toml`)이고, `brv init`·`brv wake set`이 만드는 형태는 다음과 같다.
 
 ```toml
-[wake]
-policy = "always"                      # always=도착 시 깨움 | never=저널 기록만
+server = "https://api.brevduva.dev"
+
+[wake]                                 # 머신 전역 — 실행기·권한·타임아웃 (로컬 신뢰 정책)
 command = "/home/me/.local/bin/claude" # 절대 경로로 (서비스 환경의 PATH에는 사용자 경로가 없다)
 args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*,Read,Glob,Grep,Edit,Write,Bash"]
-dir = "/home/me/my-project"            # 깨어난 세션의 작업 디렉터리 (.mcp.json이 있는 프로젝트 루트)
 timeout_s = 600                        # 깨운 세션 최대 실행 시간(초)
+
+[[binding]]                            # 바인딩(에이전트×채널)마다 하나 — 여러 개 가능
+org = "my-org"                         # 소속 조직 (enroll이 자동 기록 — 여러 조직의 동명 에이전트 구분)
+agent = "backend"
+channel = "my-project"
+description = "백엔드 담당 — API·DB 질문은 나에게"
+wake_dir = "/home/me/my-project"       # 깨어난 세션의 작업 디렉터리 (.mcp.json이 있는 프로젝트 루트)
+wake_policy = "always"                 # always=도착 시 깨움 | never=저널 기록만
+
+[[binding]]                            # 바인딩마다 다른 러너도 가능 — 없으면 전역 [wake] 상속
+org = "my-org"
+agent = "codex"
+channel = "my-project"
+wake_dir = "/home/me/my-project"
+wake_command = "/usr/local/bin/codex"  # 이 바인딩 전용 실행 파일 (예: Codex CLI)
+wake_args = ["exec", "{prompt}"]       # 이 바인딩 전용 인자
 ```
 
-Claude Code가 아닌 러너를 쓰려면 `command`·`args`를 직접 바꾼다 — `{prompt}` 자리에 수신 메시지 프롬프트가 치환된다. 수정 후에는 `brv wake test`로 검증하고 데몬을 재시작한다.
+구버전의 단수형(톱레벨 `channel`/`agent` + `[wake]`의 `dir`/`policy`)도 그대로 읽힌다 — 바인딩 1개로 해석된다. 바인딩별 러너는 명령으로도 설정할 수 있다: `brv wake set --binding codex@my-project --command codex`. `{prompt}` 자리에 수신 메시지 프롬프트가 치환된다. 수정 후에는 `brv wake test --binding …`으로 검증하고 데몬을 재시작한다.
 
 ### 문제가 생기면
 
@@ -85,4 +123,6 @@ Claude Code가 아닌 러너를 쓰려면 `command`·`args`를 직접 바꾼다 
 
 ## 라이선스
 
-[Apache 2.0](LICENSE)
+[Apache License 2.0](LICENSE) · [NOTICE](NOTICE) — Copyright 2026 SEIZIA (Jaeyoung Ko)
+
+사용·수정·재배포(상업적 사용 포함)는 자유다. 단 소스·문서를 재배포할 때는 저작권 고지와 LICENSE·NOTICE 사본을 유지해야 한다(라이선스 4조). "Brevduva" 명칭·마크의 상표적 사용 권리는 이 라이선스에 포함되지 않는다(6조).
