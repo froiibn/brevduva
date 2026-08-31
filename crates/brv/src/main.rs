@@ -107,6 +107,11 @@ enum Cmd {
     },
     /// 상주 데몬 — 전 바인딩 동시 수신, 메시지 도착 시 세션을 깨워 처리 (config의 [wake] 필요)
     Daemon {
+        /// 설정 파일 절대 경로 (미지정 시 BREVDUVA_CONFIG env → OS 기본 경로).
+        /// 서비스가 아닌 실행 표면(작업 스케줄러 로그온 작업 등)에서 프로필을 고정하는 통로
+        /// — 2026-09-01, 윈도우 PIN 전용 사용자의 무암호 상주 경로에서 필요 실측
+        #[arg(long)]
+        config: Option<String>,
         #[command(subcommand)]
         action: Option<DaemonCmd>,
     },
@@ -219,6 +224,7 @@ fn main() -> anyhow::Result<()> {
     // 런타임 진입 전에 분기 — SCM dispatcher는 자기 스레드를 점유한다
     if let Cmd::Daemon {
         action: Some(DaemonCmd::ServiceRun { config }),
+        ..
     } = &cli.cmd
     {
         #[cfg(windows)]
@@ -313,8 +319,12 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         } => send(to, payload, expects_ack, binding.as_deref()).await,
         Cmd::Listen { binding } => listen(binding.as_deref()).await,
         Cmd::Mcp { binding } => mcp(binding.as_deref()).await,
-        Cmd::Daemon { action } => match action {
+        Cmd::Daemon { config, action } => match action {
             None => {
+                // 포그라운드 프로필 고정 (2026-09-01) — 서비스 모드의 PATH_OVERRIDE와 같은 통로
+                if let Some(c) = config {
+                    config::set_path_override(c.into());
+                }
                 let cfg = config::load()?;
                 let tokens = config::load_tokens(&cfg)?;
                 brv::daemon::run(cfg, tokens).await
