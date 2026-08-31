@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 식별자 — org / channel / agent 이름 (PROTOCOL.md 2.1).
 //!
 //! 규칙: `[a-z0-9-]{1,64}` 소문자 케밥 케이스. `_` 접두는 시스템 예약

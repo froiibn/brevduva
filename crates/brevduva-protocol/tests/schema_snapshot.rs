@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 스키마 스냅샷 테스트 — `schemas/`가 타입 정의와 1:1인지 강제한다.
 //!
 //! 스키마가 달라지는 변경은 `BREVDUVA_UPDATE_SCHEMAS=1 cargo test`로 스냅샷을

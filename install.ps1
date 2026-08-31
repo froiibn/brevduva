@@ -1,3 +1,4 @@
+# Copyright 2026 SEIZIA (Jaeyoung Ko) — SPDX-License-Identifier: Apache-2.0
 # Brevduva 리시버(brv) 설치 — Windows x86_64
 #
 #   irm https://brevduva.dev/install.ps1 | iex

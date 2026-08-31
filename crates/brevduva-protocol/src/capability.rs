@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 능력 선언 (capability advertisement) — PROTOCOL.md 4장.
 //!
 //! JOIN 시 선언, 변경 시 `event`로 채널 전파. 원칙: 프로토콜은 멍청하게,

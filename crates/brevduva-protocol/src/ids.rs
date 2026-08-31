@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 메시지 ID·멱등 키·타임스탬프 (PROTOCOL.md 3장, 13.3).
 //!
 //! - `id`: 서버 발급 ULID — 시간 정렬 가능, 수신 측 중복 제거의 기준

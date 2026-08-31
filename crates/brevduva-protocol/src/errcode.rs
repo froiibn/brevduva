@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 에러 코드 — `{범주}/{코드}` 문자열 (PROTOCOL.md 8장).
 //!
 //! 알려진 코드는 enum으로 고정하되, 미래 서버가 새 코드를 보내도 클라이언트가

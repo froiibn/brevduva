@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! JSON Schema 생성 — 스펙 정식화의 산출물 (PROTOCOL.md 15장 "스키마 정식화").
 //!
 //! 리포 루트 `schemas/`의 파일들이 이 함수의 출력 스냅샷이다. 스키마 변경은

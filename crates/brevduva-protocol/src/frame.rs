@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 컨트롤 프레임 — WebSocket 위의 모든 통신 단위 (PROTOCOL.md 7장).
 //!
 //! 형태: `{ "op": "...", "seq"?: n, "re"?: n, "body"?: {...} }`

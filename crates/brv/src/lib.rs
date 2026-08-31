@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! brv — Brevduva 리시버·CLI의 라이브러리 표면.
 //!
 //! 바이너리(main)와 서버 리포의 E2E 통합 테스트가 같은 코드를 쓴다.

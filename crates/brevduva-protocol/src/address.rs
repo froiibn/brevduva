@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 메시지 주소 — 엔벨로프의 `to` 필드 (PROTOCOL.md 2.3).
 //!
 //! 와이어 표현은 문자열: `agent:{name}` | `topic:{path}` | `broadcast`.

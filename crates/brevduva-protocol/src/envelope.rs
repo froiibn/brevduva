@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 메시지 엔벨로프 — 모든 메시지의 공통 스키마 (PROTOCOL.md 3장).
 //!
 //! 직렬화는 v1에서 JSON(UTF-8). `id`·`ts`는 서버가 채우므로 클라이언트 발행 시점에는

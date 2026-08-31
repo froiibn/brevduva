@@ -1,4 +1,5 @@
 #!/bin/sh
+# Copyright 2026 SEIZIA (Jaeyoung Ko) — SPDX-License-Identifier: Apache-2.0
 # Brevduva 리시버(brv) 설치 — macOS(arm64/x86_64) · Linux(x86_64/aarch64, musl 정적 바이너리)
 #
 #   curl -fsSL https://brevduva.dev/install.sh | sh

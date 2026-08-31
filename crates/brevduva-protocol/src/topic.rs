@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 토픽 path와 구독 필터 (PROTOCOL.md 2.3).
 //!
 //! - path: `[a-z0-9-]` 세그먼트를 `.`으로 연결 (예: `api-changes.auth`)

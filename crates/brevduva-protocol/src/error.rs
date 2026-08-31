@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 파싱·검증 실패 타입.
 //!
 //! 원칙(PROTOCOL.md 8장): 에러 메시지는 에이전트(LLM)가 읽고 스스로 정정할 수 있게

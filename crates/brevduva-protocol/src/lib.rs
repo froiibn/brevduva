@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! Brevduva 프로토콜 공유 crate.
 //!
 //! [PROTOCOL.md](https://github.com/froiibn/brevduva/blob/main/PROTOCOL.md)의 코드화 —

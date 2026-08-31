@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 로컬 MCP 서버 — stdio 위 JSON-RPC (newline-delimited).
 //!
 //! 도구 설명이 곧 제품이다 (PLAN.md "자율 협업 유도"): 언제 동료에게 알리고 물어야

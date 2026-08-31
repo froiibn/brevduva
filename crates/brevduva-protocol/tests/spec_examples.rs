@@ -1,3 +1,6 @@
+// Copyright 2026 SEIZIA (Jaeyoung Ko)
+// SPDX-License-Identifier: Apache-2.0
+
 //! 스펙 예시 동형 테스트 — PROTOCOL.md의 예시 구조가 crate 타입으로 그대로
 //! 표현되는지 검증하는 회귀 지점. 스펙 예시의 `01J5X...` 류 자리표시자는
 //! 유효한 ULID로 치환했다 (구조는 동일).
