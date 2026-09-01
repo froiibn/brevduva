@@ -33,7 +33,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # aws-lc-sys(TLS 암호 구현) 빌드 요구: musl은 musl-gcc, 윈도우 MSVC는 NASM
       - name: musl toolchain
