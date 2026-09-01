@@ -117,6 +117,7 @@ wake_args = ["exec", "{prompt}"]       # 이 바인딩 전용 인자
 
 - `brv wake test` 실패: 명령이 절대 경로인지, 세션 출력 로그(설정 디렉터리의 `wake.log`)에 무엇이 남았는지 확인
 - 깨우기는 됐는데 일을 못 한다: `brv wake show`의 `allow` 수준이 부족한 경우 — `brv wake set --allow edit|full`
+- 깨우기는 됐는데 세션이 brevduva 도구를 못 쓴다(응답 불능): Claude Code의 MCP 등록(`claude mcp get brevduva`)에 옛 `--env BREVDUVA_CONFIG=…`가 남아 있는지 확인 — **등록에 박힌 env는 데몬이 자동 전파한 값을 덮어쓴다**. 등록에서 env를 지우거나 현행 설정 경로로 갱신할 것
 
 ## 상태
 
