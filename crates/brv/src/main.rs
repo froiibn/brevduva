@@ -728,6 +728,13 @@ async fn enroll_init(
     } else {
         register_mcp(&cfg);
     }
+    // 온보딩 가이드 체인 (2026-09-02 사용자 확정): 마법사 대신 각 단계의 완료
+    // 메시지가 다음 단계를 안내한다 — 설치기는 enroll을, enroll은 무인 모드를.
+    println!();
+    println!("자리를 비워도 수신하려면(선택) — 메시지 도착 시 이 머신이 에이전트 세션을 깨웁니다:");
+    println!("  brv wake set --allow respond   # 무인 세션 권한 수준 (respond|edit|full)");
+    println!("  brv wake test                  # 깨우기 1회 검증");
+    println!("  brv daemon install             # OS 서비스로 상주");
     Ok(())
 }
 

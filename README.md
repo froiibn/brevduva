@@ -31,7 +31,7 @@ curl -fsSL https://brevduva.dev/install.sh | sh
 irm https://brevduva.dev/install.ps1 | iex
 ```
 
-`~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치된다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사가 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다.
+`~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치되고, 그 경로가 PATH에 없으면 자동으로 등록한다(유닉스는 셸 설정에 마커 달린 한 줄 — `BRV_NO_MODIFY_PATH=1`로 거부 가능, 윈도우는 사용자 PATH). 설치가 끝나면 다음 단계(머신 연결 `brv init --enroll`)를 화면에 안내한다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사, PATH 등록이 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다.
 
 ## 여러 에이전트를 한 머신에서 — 다중 바인딩
 

@@ -5,8 +5,9 @@
 #   curl -fsSL https://brevduva.dev/install.sh | sh
 #
 # 하는 일: GitHub Releases 최신 버전에서 플랫폼에 맞는 바이너리를 받아
-# SHA256 검증 후 ~/.local/bin/brv 로 설치한다 (BRV_INSTALL_DIR로 변경 가능).
-# 그 외에는 아무것도 건드리지 않는다.
+# SHA256 검증 후 ~/.local/bin/brv 로 설치하고(BRV_INSTALL_DIR로 변경 가능),
+# 설치 경로가 PATH에 없으면 셸 설정에 마커 달린 한 줄을 추가한다
+# (BRV_NO_MODIFY_PATH=1 로 거부 가능 — 그때는 안내만 출력). 그 외에는 건드리지 않는다.
 set -eu
 
 REPO="froiibn/brevduva"
@@ -56,8 +57,45 @@ mkdir -p "$dest"
 install -m 755 "$tmp/brv" "$dest/brv"
 
 echo "설치 완료: $dest/brv — $("$dest/brv" --version)"
+
+# PATH 자동 등록 (2026-09-02, 실측 UX: 새 서버 첫 설치마다 수동 추가를 요구하던 것을 흡수).
+# rustup/uv 관행을 따른다: 마커 달린 한 줄을 셸 설정에 추가, 이미 있으면 건너뜀(멱등).
+# 대상: ~/.profile(로그인 셸, 없으면 생성) + ~/.bashrc(있을 때) + ~/.zshrc(있거나 zsh 사용 시).
 case ":$PATH:" in
   *":$dest:"*) ;;
-  *) echo "주의: $dest 가 PATH에 없습니다. 셸 설정에 추가하세요:"
-     echo "  export PATH=\"$dest:\$PATH\"" ;;
+  *)
+    if [ "${BRV_NO_MODIFY_PATH:-0}" = 1 ]; then
+      echo "주의: $dest 가 PATH에 없습니다. 셸 설정에 추가하세요:"
+      echo "  export PATH=\"$dest:\$PATH\""
+    else
+      # $HOME 하위면 \$HOME 변수로 기록 — 리터럴 경로보다 이식성 좋음
+      case "$dest" in
+        "$HOME"/*) path_line="export PATH=\"\$HOME/${dest#"$HOME"/}:\$PATH\" # brevduva installer" ;;
+        *) path_line="export PATH=\"$dest:\$PATH\" # brevduva installer" ;;
+      esac
+      added=""
+      for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
+        case "$rc" in
+          "$HOME/.bashrc") [ -e "$rc" ] || continue ;;
+          "$HOME/.zshrc") if [ ! -e "$rc" ]; then case "${SHELL:-}" in *zsh*) ;; *) continue ;; esac; fi ;;
+        esac
+        grep -qs "# brevduva installer" "$rc" && continue
+        printf '\n%s\n' "$path_line" >> "$rc"
+        added="$added ${rc##*/}"
+      done
+      if [ -n "$added" ]; then
+        echo "PATH에 $dest 추가됨($added ) — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
+      else
+        echo "PATH 항목은 셸 설정에 이미 있습니다 — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
+      fi
+      echo "  export PATH=\"$dest:\$PATH\""
+      case "${SHELL:-}" in
+        *fish*) echo "fish 사용 시: fish_add_path $dest" ;;
+      esac
+    fi ;;
 esac
+
+echo ""
+echo "다음 단계 — 계정과 이 머신을 연결하세요:"
+echo "  1) https://brevduva.dev 대시보드 → 머신 연결에서 등록 코드 발급 (brvenr_ 로 시작)"
+echo "  2) brv init --server https://api.brevduva.dev --enroll <코드>"

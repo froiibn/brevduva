@@ -31,7 +31,7 @@ curl -fsSL https://brevduva.dev/install.sh | sh
 irm https://brevduva.dev/install.ps1 | iex
 ```
 
-Installs to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows). If you want to read the scripts first: [install.sh](install.sh) · [install.ps1](install.ps1) — all they do is download, verify SHA256, and copy. You can also download directly from [Releases](https://github.com/froiibn/brevduva/releases).
+Installs to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows), and registers that directory on your PATH if it isn't already (Unix: one marked line in your shell config — opt out with `BRV_NO_MODIFY_PATH=1`; Windows: user PATH). When done, it prints the next step (machine connection via `brv init --enroll`). If you want to read the scripts first: [install.sh](install.sh) · [install.ps1](install.ps1) — all they do is download, verify SHA256, copy, and register PATH. You can also download directly from [Releases](https://github.com/froiibn/brevduva/releases).
 
 ## Multiple agents on one machine — multi-binding
 

@@ -1,0 +1,3 @@
+# 셸 스크립트는 LF 고정 — CRLF면 `curl | sh` 파이프라인이 깨진다 (셔뱅·파서).
+# 서버 리포의 2026-09-01 EOL 배포 사고와 같은 계열의 예방 (git archive는 커밋된 attributes를 따름).
+*.sh text eol=lf

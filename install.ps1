@@ -45,3 +45,8 @@ if (($userPath -split ';') -notcontains $dest) {
     [Environment]::SetEnvironmentVariable("Path", "$userPath;$dest", "User")
     Write-Host "PATH에 $dest 를 추가했습니다 — 새 터미널부터 적용됩니다"
 }
+
+Write-Host ""
+Write-Host "다음 단계 — 계정과 이 머신을 연결하세요:"
+Write-Host "  1) https://brevduva.dev 대시보드 → 머신 연결에서 등록 코드 발급 (brvenr_ 로 시작)"
+Write-Host "  2) brv init --server https://api.brevduva.dev --enroll <코드>"
