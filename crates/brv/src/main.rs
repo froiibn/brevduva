@@ -30,16 +30,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 에이전트 연결 — 일회용 코드(--enroll, 권장) 또는 관리 API 키로. 기존 설정에는
-    /// 바인딩이 **추가**된다 (같은 에이전트@채널이면 갱신)
+    /// Connect an agent — with a one-time code (--enroll, recommended) or an admin
+    /// API key. Bindings are **added** to an existing config (same agent@channel updates it)
     Init {
-        /// 서버 베이스 URL (예: https://api.brevduva.dev)
+        /// Server base URL (e.g. https://api.brevduva.dev)
         #[arg(long)]
         server: String,
-        /// 일회용 연결 코드 (대시보드 "머신 연결"에서 발급) — 관리 키 불필요
+        /// One-time enroll code (issued in the dashboard's "Connect a machine") — no admin key needed
         #[arg(long)]
         enroll: Option<String>,
-        /// 관리 API 키 (BREVDUVA_ADMIN_KEY) — --enroll 사용 시 불필요
+        /// Admin API key (BREVDUVA_ADMIN_KEY) — not needed with --enroll
         #[arg(
             long,
             env = "BREVDUVA_ADMIN_KEY",
@@ -47,80 +47,80 @@ enum Cmd {
             conflicts_with = "enroll"
         )]
         admin_key: Option<String>,
-        /// 이 머신의 에이전트 이름 (예: backend) — enroll에서는 코드가 결정
+        /// Agent name for this machine (e.g. backend) — with enroll, the code decides
         #[arg(long, required_unless_present = "enroll", conflicts_with = "enroll")]
         agent: Option<String>,
-        /// 채널(프로젝트) 이름 — enroll에서는 부여된 채널 중 선택(생략 시 첫 채널)
+        /// Channel (project) name — with enroll, picks among granted channels (defaults to the first)
         #[arg(long, required_unless_present = "enroll")]
         channel: Option<String>,
-        /// 능력 선언 소개문 — 동료 에이전트의 라우팅 판단 근거 (enroll은 발급 시 값 사용)
+        /// Capability-declaration description — how peer agents decide to route to you (enroll uses the issued value)
         #[arg(long, default_value = "")]
         description: String,
-        /// 에이전트가 이미 있으면 토큰을 회전해 재사용
+        /// If the agent already exists, rotate its token and reuse it
         #[arg(long, conflicts_with = "enroll")]
         rotate: bool,
-        /// enroll 후 Claude Code MCP 자동 등록을 생략
+        /// Skip the automatic Claude Code MCP registration after enroll
         #[arg(long)]
         no_mcp: bool,
     },
-    /// 바인딩(에이전트×채널) 관리 — 목록·추가·제거 (페이즈 27)
+    /// Manage bindings (agent × channel) — list, add, remove
     Binding {
         #[command(subcommand)]
         action: BindingCmd,
     },
-    /// 설정·서버·채널 상태 점검
+    /// Check config, server, and channel status
     Status {
-        /// 프레즌스를 조회할 바인딩 ({agent}@{channel} 또는 유일한 에이전트 이름)
+        /// Binding whose channel presence to query ({agent}@{channel}, or a unique agent name)
         #[arg(long)]
         binding: Option<String>,
     },
-    /// 이 에이전트가 참가할 수 있는 채널 목록 (토큰 기준, PROTOCOL 10.2)
+    /// List channels this agent may join (by token, PROTOCOL 10.2)
     Channels {
-        /// 조회할 바인딩 — 바인딩이 여럿일 때 필수
+        /// Binding to query — required when multiple bindings exist
         #[arg(long)]
         binding: Option<String>,
     },
-    /// 메시지 한 건 발행 (수동 테스트용)
+    /// Publish one message (for manual testing)
     Send {
         #[arg(long)]
         to: String,
         #[arg(long)]
         payload: String,
-        /// broadcast에 ack 수집을 요구 (11장)
+        /// Request ack collection on a broadcast (chapter 11)
         #[arg(long)]
         expects_ack: bool,
-        /// 발신 바인딩 — 바인딩이 여럿일 때 필수
+        /// Sending binding — required when multiple bindings exist
         #[arg(long)]
         binding: Option<String>,
     },
-    /// 수신 메시지를 줄 단위 JSON으로 출력 (수동 테스트용, Ctrl+C로 종료)
+    /// Print received messages as line-delimited JSON (for manual testing, Ctrl+C to stop)
     Listen {
-        /// 수신 바인딩 — 바인딩이 여럿일 때 필수
+        /// Receiving binding — required when multiple bindings exist
         #[arg(long)]
         binding: Option<String>,
     },
-    /// 로컬 MCP 서버 (stdio) — Claude Code 등 MCP 호스트용
+    /// Local MCP server (stdio) — for MCP hosts such as Claude Code
     Mcp {
-        /// 이 세션의 바인딩 — 바인딩이 여럿일 때 필수 (프로젝트별 .mcp.json에 박아두라)
+        /// Binding for this session — required when multiple bindings exist (pin it in each project's .mcp.json)
         #[arg(long)]
         binding: Option<String>,
     },
-    /// 상주 데몬 — 전 바인딩 동시 수신, 메시지 도착 시 세션을 깨워 처리 (config의 [wake] 필요)
+    /// Resident daemon — receives on all bindings at once and wakes a session per message (needs [wake] in config)
     Daemon {
-        /// 설정 파일 절대 경로 (미지정 시 BREVDUVA_CONFIG env → OS 기본 경로).
-        /// 서비스가 아닌 실행 표면(작업 스케줄러 로그온 작업 등)에서 프로필을 고정하는 통로
-        /// — 2026-09-01, 윈도우 PIN 전용 사용자의 무암호 상주 경로에서 필요 실측
+        // 서비스가 아닌 실행 표면(작업 스케줄러 로그온 작업 등)에서 프로필을 고정하는 통로
+        // — 2026-09-01, 윈도우 PIN 전용 사용자의 무암호 상주 경로에서 필요 실측
+        /// Absolute path to the config file (default: BREVDUVA_CONFIG env, then the OS path)
         #[arg(long)]
         config: Option<String>,
         #[command(subcommand)]
         action: Option<DaemonCmd>,
     },
-    /// Claude Code 훅 연동 (페이즈 17) — 턴 종료 시 전 바인딩의 대기 메시지 확인
+    /// Claude Code hook integration — checks pending messages across bindings at turn end
     Hook {
         #[command(subcommand)]
         action: HookCmd,
     },
-    /// 무인 모드 깨우기 설정 (페이즈 21) — 데몬이 메시지 도착 시 실행할 세션과 그 권한
+    /// Unattended wake settings — what the daemon runs on message arrival, and with what allowance
     Wake {
         #[command(subcommand)]
         action: WakeCmd,
@@ -129,21 +129,21 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum BindingCmd {
-    /// 설정된 바인딩 목록 (+토큰 유무·깨우기 설정)
+    /// List configured bindings (+token presence, wake settings)
     List,
-    /// 기존 토큰으로 바인딩 추가 — 같은 에이전트를 다른 채널에도 (grant는 서버에서 검증)
+    /// Add a binding with an existing token — same agent on another channel (grant is checked server-side)
     Add {
-        /// 에이전트 이름 (이미 이 머신에 토큰이 있어야 함 — 없으면 enroll 먼저)
+        /// Agent name (its token must already be on this machine — enroll first if not)
         #[arg(long)]
         agent: String,
-        /// 참가할 채널 (대시보드에서 grant 부여 후)
+        /// Channel to join (after granting it in the dashboard)
         #[arg(long)]
         channel: String,
-        /// 능력 선언 소개문
+        /// Capability-declaration description
         #[arg(long, default_value = "")]
         description: String,
     },
-    /// 바인딩 제거 — 토큰은 남는다 (같은 에이전트의 다른 바인딩이 쓸 수 있음)
+    /// Remove a binding — the token stays (other bindings of the same agent may use it)
     Remove {
         /// {agent}@{channel}
         selector: String,
@@ -155,34 +155,34 @@ enum BindingCmd {
 /// 페이즈 27 분리: 실행기·권한·타임아웃은 전역, 작업 디렉터리·정책은 바인딩별.
 #[derive(Subcommand)]
 enum WakeCmd {
-    /// 깨우기 설정 생성·수정 — 지정한 값만 바꾸고 나머지는 유지 (멱등)
+    /// Create or update wake settings — changes only the values you pass (idempotent)
     Set {
-        /// 무인 세션 권한: respond(응답 전용, 기본)|edit(+파일 편집)|full(+셸).
-        /// --binding과 함께면 그 바인딩 전용 인자 오버라이드, 아니면 전역
+        /// Unattended-session allowance: respond (reply only, default)|edit (+file edits)|full (+shell).
+        /// With --binding, overrides args for that binding only; otherwise global
         #[arg(long)]
         allow: Option<String>,
-        /// 깨우기 실행 파일 — 미지정 시 PATH에서 claude를 찾아 절대 경로로 저장.
-        /// --binding과 함께면 그 바인딩 전용 러너 오버라이드(codex 등), 아니면 전역
+        /// Wake executable — if omitted, finds claude on PATH and stores its absolute path.
+        /// With --binding, overrides the runner for that binding only (e.g. codex); otherwise global
         #[arg(long)]
         command: Option<String>,
-        /// 깨어난 세션의 작업 디렉터리 — **바인딩별** (신규 단일 바인딩에서 미지정 시 현재 디렉터리)
+        /// Working directory for woken sessions — **per binding** (new single binding defaults to the current directory)
         #[arg(long)]
         dir: Option<String>,
-        /// 깨운 세션의 최대 실행 시간(초) — 항상 전역 (머신 정책)
+        /// Max run time for a woken session in seconds — always global (machine policy)
         #[arg(long)]
         timeout: Option<u64>,
-        /// always(도착 시 깨움)|never(저널 기록만) — **바인딩별**
+        /// always (wake on arrival)|never (journal only) — **per binding**
         #[arg(long)]
         policy: Option<String>,
-        /// 바인딩별 값(--dir/--policy, 그리고 오버라이드로서의 --command/--allow)의 대상
+        /// Target binding for per-binding values (--dir/--policy, and --command/--allow as overrides)
         #[arg(long)]
         binding: Option<String>,
     },
-    /// 현재 깨우기 설정과 실효 명령줄 표시
+    /// Show current wake settings and the effective command line
     Show,
-    /// 무해한 프롬프트로 깨우기를 1회 실제 실행 — 명령 경로·환경이 동작하는지 검증
+    /// Run one real wake with a harmless prompt — verifies the command path and environment
     Test {
-        /// 어느 바인딩의 wake_dir에서 실행할지 — 바인딩이 여럿일 때 필수
+        /// Which binding's wake_dir to run in — required when multiple bindings exist
         #[arg(long)]
         binding: Option<String>,
     },
@@ -190,9 +190,9 @@ enum WakeCmd {
 
 #[derive(Subcommand)]
 enum HookCmd {
-    /// ~/.claude/settings.json에 Stop 훅 등록 (멱등)
+    /// Register the Stop hook in ~/.claude/settings.json (idempotent)
     Install,
-    /// Stop 훅 진입점 — Claude Code가 호출한다 (직접 실행할 일 없음)
+    /// Stop-hook entry point — invoked by Claude Code (never run directly)
     #[command(hide = true)]
     Stop,
 }
@@ -200,15 +200,15 @@ enum HookCmd {
 /// `brv daemon`의 서비스 등록 서브커맨드 (페이즈 7) — 무인자는 기존 포그라운드 실행.
 #[derive(Subcommand)]
 enum DaemonCmd {
-    /// OS 서비스로 등록 (linux=systemd 사용자 유닛, macOS=launchd, windows=SCM 서비스)
+    /// Register as an OS service (linux=systemd user unit, macOS=launchd, windows=SCM service)
     Install {
-        /// 이 서비스가 쓸 설정 파일 절대 경로 (미지정 시 OS 기본 경로) — 다중 프로필용
+        /// Absolute path to the config file this service uses (default: OS path) — for multiple profiles
         #[arg(long)]
         config: Option<String>,
     },
-    /// OS 서비스 등록 해제
+    /// Unregister the OS service
     Uninstall,
-    /// (windows 전용) SCM이 호출하는 서비스 진입점 — 직접 실행하지 말 것
+    /// (windows only) service entry point invoked by SCM — never run directly
     #[command(hide = true)]
     ServiceRun {
         #[arg(long)]
@@ -238,7 +238,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(windows))]
         {
             let _ = config;
-            anyhow::bail!("service-run은 윈도우 SCM 전용이다");
+            anyhow::bail!("service-run is Windows SCM only");
         }
     }
 
@@ -332,7 +332,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             Some(DaemonCmd::Install { config }) => brv::service::install(config.as_deref()),
             Some(DaemonCmd::Uninstall) => brv::service::uninstall(),
             // main()이 런타임 진입 전에 처리한다
-            Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run은 main에서 분기"),
+            Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run branches in main"),
         },
         Cmd::Wake { action } => match action {
             WakeCmd::Set {
@@ -638,7 +638,7 @@ async fn channels(binding_sel: Option<&str>) -> anyhow::Result<()> {
     let binding = cfg.select(binding_sel)?;
     let token = config::load_token(&cfg, binding)?;
     let (org, agent, list) = brv::client::discover_channels(&cfg.server, &token).await?;
-    println!("에이전트 {agent} @ 조직 {org} — 참가 가능 채널:");
+    println!("agent {agent} @ org {org} — channels this token may join:");
     for ch in &list {
         // 같은 정체성(org까지 동일한 에이전트)의 바인딩만 * 표시
         let bound = cfg
@@ -649,17 +649,19 @@ async fn channels(binding_sel: Option<&str>) -> anyhow::Result<()> {
         println!("{marker}{ch}");
     }
     if list.is_empty() {
-        println!("  (없음 — 대시보드에서 채널 참가 권한을 부여하세요)");
+        println!("  (none — grant channel access in the dashboard)");
     } else {
-        println!("(* = 이 머신에 바인딩됨. 추가: brv binding add --agent {agent} --channel <ch>)");
+        println!(
+            "(* = bound on this machine. add: brv binding add --agent {agent} --channel <ch>)"
+        );
     }
     Ok(())
 }
 
 fn token_store_note(stored: &config::TokenStore) -> String {
     match stored {
-        config::TokenStore::Keyring => "토큰은 OS 키체인".to_owned(),
-        config::TokenStore::File(p) => format!("키체인 없음 — 토큰 파일 {p:?} (600 권한)"),
+        config::TokenStore::Keyring => "token in the OS keychain".to_owned(),
+        config::TokenStore::File(p) => format!("no usable keychain — token file {p:?} (mode 600)"),
     }
 }
 
@@ -671,7 +673,7 @@ fn merge_binding(server: &str, binding: Binding) -> anyhow::Result<(BrvConfig, b
         let existing = config::load()?;
         anyhow::ensure!(
             existing.server == server,
-            "config already targets {} — 설정 하나는 서버 하나다. 다른 서버는 BREVDUVA_CONFIG 프로필로 분리하라",
+            "config already targets {} — one config, one server. Use a separate BREVDUVA_CONFIG profile for another server",
             existing.server
         );
         existing
@@ -699,19 +701,19 @@ async fn enroll_init(
     let stored = config::store_token(&cfg.server, &binding, &enrolled.token)?;
     let path = config::store(&cfg)?;
     println!(
-        "연결 완료 — 조직 {org} / 에이전트 {agent} / 채널 {ch}{note}",
+        "connected — org {org} / agent {agent} / channel {ch}{note}",
         org = enrolled.org,
         agent = binding.agent,
         ch = binding.channel,
         note = if replaced {
-            " (기존 바인딩 갱신 — 토큰 회전됨)"
+            " (existing binding updated — token rotated)"
         } else {
             ""
         },
     );
     if enrolled.channels.len() > 1 {
         println!(
-            "  부여된 다른 채널: {} (추가 수신: brv binding add --agent {} --channel <ch>)",
+            "  also granted: {} (receive there too: brv binding add --agent {} --channel <ch>)",
             enrolled
                 .channels
                 .iter()
@@ -722,19 +724,21 @@ async fn enroll_init(
             binding.agent,
         );
     }
-    println!("  설정: {path:?} / {}", token_store_note(&stored));
+    println!("  config: {path:?} / {}", token_store_note(&stored));
     if no_mcp {
-        println!("에이전트에서 쓰려면: claude mcp add brevduva -- brv mcp");
+        println!("to use from an agent: claude mcp add brevduva -- brv mcp");
     } else {
         register_mcp(&cfg);
     }
     // 온보딩 가이드 체인 (2026-09-02 사용자 확정): 마법사 대신 각 단계의 완료
     // 메시지가 다음 단계를 안내한다 — 설치기는 enroll을, enroll은 무인 모드를.
     println!();
-    println!("자리를 비워도 수신하려면(선택) — 메시지 도착 시 이 머신이 에이전트 세션을 깨웁니다:");
-    println!("  brv wake set --allow respond   # 무인 세션 권한 수준 (respond|edit|full)");
-    println!("  brv wake test                  # 깨우기 1회 검증");
-    println!("  brv daemon install             # OS 서비스로 상주");
+    println!(
+        "to receive while you're away (optional) — this machine wakes an agent session per message:"
+    );
+    println!("  brv wake set --allow respond   # unattended-session allowance (respond|edit|full)");
+    println!("  brv wake test                  # verify one wake actually works");
+    println!("  brv daemon install             # register the resident OS service");
     Ok(())
 }
 
@@ -744,7 +748,9 @@ async fn enroll_init(
 /// 프로젝트별 등록(--binding 포함)을 안내한다 (페이즈 27).
 fn register_mcp(cfg: &BrvConfig) {
     if cfg.bindings.len() > 1 {
-        println!("바인딩이 여럿이라 MCP 전역 자동 등록을 건너뜁니다 — 프로젝트 디렉터리마다:");
+        println!(
+            "multiple bindings — skipping global MCP auto-registration. In each project directory:"
+        );
         for b in &cfg.bindings {
             println!(
                 "  claude mcp add brevduva -- brv mcp --binding {}",
@@ -760,22 +766,22 @@ fn register_mcp(cfg: &BrvConfig) {
         .output()
     {
         Ok(out) if out.status.success() => {
-            println!("Claude Code MCP 등록 완료 — 에이전트가 바로 채널을 쓸 수 있습니다");
+            println!("Claude Code MCP registered — the agent can use the channel right away");
         }
         Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr);
             if err.contains("already exists") {
-                println!("Claude Code MCP는 이미 등록되어 있습니다");
+                println!("Claude Code MCP is already registered");
             } else {
                 println!(
-                    "MCP 자동 등록 실패 — 수동 등록: claude mcp add brevduva -- brv mcp\n  ({})",
+                    "MCP auto-registration failed — register manually: claude mcp add brevduva -- brv mcp\n  ({})",
                     err.trim()
                 );
             }
         }
         Err(_) => {
             println!(
-                "claude CLI가 없어 MCP 등록을 건너뜀 — 에이전트에서 쓰려면: claude mcp add brevduva -- brv mcp"
+                "claude CLI not found — skipping MCP registration. To use from an agent: claude mcp add brevduva -- brv mcp"
             );
         }
     }
@@ -861,31 +867,31 @@ async fn init(
     let path = config::store(&cfg)?;
 
     println!(
-        "초기화 완료{} — 설정: {path:?} ({})",
+        "initialized{} — config: {path:?} ({})",
         if replaced {
-            " (기존 바인딩 갱신)"
+            " (existing binding updated)"
         } else {
             ""
         },
         token_store_note(&stored)
     );
     println!();
-    println!("Claude Code에 연결하려면:");
+    println!("to connect Claude Code:");
     println!("  claude mcp add brevduva -- brv mcp");
     println!();
-    println!("수동 확인: brv status / brv listen / brv send --to <agent> --payload \"...\"");
+    println!("manual checks: brv status / brv listen / brv send --to <agent> --payload \"...\"");
     Ok(())
 }
 
 /// `brv binding list` — 바인딩 목록 + 토큰 유무·깨우기 설정.
 fn binding_list() -> anyhow::Result<()> {
     let cfg = config::load()?;
-    println!("서버 {} — 바인딩 {}개:", cfg.server, cfg.bindings.len());
+    println!("server {} — {} binding(s):", cfg.server, cfg.bindings.len());
     for b in &cfg.bindings {
         let token = if config::load_token(&cfg, b).is_ok() {
             "token ok"
         } else {
-            "token MISSING — enroll 필요"
+            "token MISSING — enroll needed"
         };
         println!(
             "  {:34} {token:28} wake {:6} {}",
@@ -898,7 +904,7 @@ fn binding_list() -> anyhow::Result<()> {
         }
     }
     if cfg.bindings.is_empty() {
-        println!("  (없음 — brv init --enroll <code> 로 연결하세요)");
+        println!("  (none — connect with brv init --enroll <code>)");
     }
     Ok(())
 }
@@ -925,12 +931,14 @@ async fn binding_add(agent: String, channel: String, description: String) -> any
             wake_args: None,
         });
     let token = config::load_token(&cfg, &probe).with_context(|| {
-        format!("agent {agent:?}의 토큰이 이 머신에 없다 — 먼저 `brv init --enroll`로 연결하라")
+        format!(
+            "no token for agent {agent:?} on this machine — connect with `brv init --enroll` first"
+        )
     })?;
     let (org, _, granted) = brv::client::discover_channels(&cfg.server, &token).await?;
     anyhow::ensure!(
         granted.contains(&channel),
-        "agent {agent:?}는 채널 {channel:?}에 grant가 없다 — 대시보드에서 부여하라 (가능: {})",
+        "agent {agent:?} has no grant for channel {channel:?} — grant it in the dashboard (granted: {})",
         granted.join(", ")
     );
     let (cfg, replaced) = merge_binding(
@@ -948,10 +956,10 @@ async fn binding_add(agent: String, channel: String, description: String) -> any
     )?;
     let path = config::store(&cfg)?;
     println!(
-        "바인딩 {} — {path:?}",
-        if replaced { "갱신" } else { "추가" }
+        "binding {} — {path:?}",
+        if replaced { "updated" } else { "added" }
     );
-    println!("데몬 수신은 재시작 후 반영: brv daemon (또는 OS 서비스 재시작)");
+    println!("the daemon picks this up after a restart: brv daemon (or restart the OS service)");
     Ok(())
 }
 
@@ -964,9 +972,11 @@ fn binding_remove(selector: &str) -> anyhow::Result<()> {
     let (full, token_id) = (found.full_label(), found.token_id());
     cfg.bindings.retain(|b| b.full_label() != full);
     let path = config::store(&cfg)?;
-    println!("바인딩 {full} 제거 — {path:?}");
+    println!("binding {full} removed — {path:?}");
     if !cfg.bindings.iter().any(|b| b.token_id() == token_id) {
-        println!("  (이 에이전트의 토큰은 키체인에 남아 있다 — 회수하려면 대시보드에서 토큰 회전)");
+        println!(
+            "  (the agent's token stays in the keychain — to revoke it, rotate the token in the dashboard)"
+        );
     }
     Ok(())
 }
@@ -974,7 +984,7 @@ fn binding_remove(selector: &str) -> anyhow::Result<()> {
 async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
     let cfg = config::load()?;
     println!(
-        "설정: 서버 {} / 바인딩 {}개",
+        "config: server {} / {} binding(s)",
         cfg.server,
         cfg.bindings.len()
     );
@@ -986,10 +996,10 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
         .send()
         .await;
     match health {
-        Ok(resp) if resp.status().is_success() => println!("서버: OK"),
-        Ok(resp) => println!("서버: 응답 이상 ({})", resp.status()),
+        Ok(resp) if resp.status().is_success() => println!("server: OK"),
+        Ok(resp) => println!("server: unexpected response ({})", resp.status()),
         Err(e) => {
-            println!("서버: 연결 불가 — {e}");
+            println!("server: unreachable — {e}");
             return Ok(());
         }
     }
@@ -1000,16 +1010,16 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
             let (_, client) = connect_from_config(Some(&binding.label()))?;
             match client.presence(Duration::from_secs(10)).await {
                 Ok(entries) => {
-                    println!("채널 {} 프레즌스:", binding.channel);
+                    println!("channel {} presence:", binding.channel);
                     for e in entries {
                         println!("  {:10} {:?}", e.agent.as_str(), e.state);
                     }
                 }
-                Err(e) => println!("프레즌스 조회 실패: {e}"),
+                Err(e) => println!("presence query failed: {e}"),
             }
         }
         Err(_) if !cfg.bindings.is_empty() => {
-            println!("(채널 프레즌스는 --binding {{agent}}@{{channel}} 지정 시 조회)");
+            println!("(channel presence is shown with --binding {{agent}}@{{channel}})");
         }
         Err(e) => return Err(e),
     }

@@ -18,16 +18,16 @@ $tmp = Join-Path $env:TEMP ("brv-install-" + [guid]::NewGuid().ToString("n"))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 
 try {
-    Write-Host "다운로드: $base/$asset"
+    Write-Host "downloading: $base/$asset"
     Invoke-WebRequest "$base/$asset" -OutFile "$tmp\$asset" -UseBasicParsing
     Invoke-WebRequest "$base/SHA256SUMS" -OutFile "$tmp\SHA256SUMS" -UseBasicParsing
 
     $line = Select-String -Path "$tmp\SHA256SUMS" -Pattern ([regex]::Escape($asset)) | Select-Object -First 1
-    if (-not $line) { throw "SHA256SUMS에 $asset 항목이 없습니다" }
+    if (-not $line) { throw "no entry for $asset in SHA256SUMS" }
     $expected = ($line.Line -split '\s+')[0].ToLower()
     $actual = (Get-FileHash "$tmp\$asset" -Algorithm SHA256).Hash.ToLower()
-    if ($expected -ne $actual) { throw "체크섬 불일치 — 다운로드가 손상되었거나 변조되었습니다" }
-    Write-Host "체크섬 확인 완료"
+    if ($expected -ne $actual) { throw "checksum mismatch — the download is corrupted or was tampered with" }
+    Write-Host "checksum verified"
 
     Expand-Archive "$tmp\$asset" -DestinationPath $tmp -Force
     New-Item -ItemType Directory -Force $dest | Out-Null
@@ -38,15 +38,15 @@ finally {
 }
 
 $exe = Join-Path $dest "brv.exe"
-Write-Host "설치 완료: $exe — $(& $exe --version)"
+Write-Host "installed: $exe — $(& $exe --version)"
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (($userPath -split ';') -notcontains $dest) {
     [Environment]::SetEnvironmentVariable("Path", "$userPath;$dest", "User")
-    Write-Host "PATH에 $dest 를 추가했습니다 — 새 터미널부터 적용됩니다"
+    Write-Host "added $dest to your user PATH — new terminals pick it up"
 }
 
 Write-Host ""
-Write-Host "다음 단계 — 계정과 이 머신을 연결하세요:"
-Write-Host "  1) https://brevduva.dev 대시보드 → 머신 연결에서 등록 코드 발급 (brvenr_ 로 시작)"
-Write-Host "  2) brv init --server https://api.brevduva.dev --enroll <코드>"
+Write-Host "next — connect this machine to your account:"
+Write-Host "  1) https://brevduva.dev dashboard → Connect a machine → issue an enroll code (starts with brvenr_)"
+Write-Host "  2) brv init --server https://api.brevduva.dev --enroll <code>"

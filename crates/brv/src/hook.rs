@@ -120,7 +120,7 @@ pub fn install() -> anyhow::Result<String> {
         })
     });
     if already {
-        return Ok(format!("이미 등록되어 있습니다 — {}", path.display()));
+        return Ok(format!("already registered — {}", path.display()));
     }
     stops
         .as_array_mut()
@@ -131,7 +131,7 @@ pub fn install() -> anyhow::Result<String> {
     std::fs::create_dir_all(path.parent().expect("settings path has parent"))?;
     std::fs::write(&path, serde_json::to_string_pretty(&root)?)?;
     Ok(format!(
-        "Stop 훅 등록 완료 — {} (Claude Code 세션이 턴을 마칠 때마다 대기 메시지를 확인합니다)",
+        "Stop hook registered — {} (Claude Code sessions check pending messages at each turn end)",
         path.display()
     ))
 }

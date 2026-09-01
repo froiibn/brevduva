@@ -20,22 +20,22 @@ case "$os" in
     case "$arch" in
       arm64) target="aarch64-apple-darwin" ;;
       x86_64) target="x86_64-apple-darwin" ;;
-      *) echo "지원하지 않는 macOS 아키텍처: $arch" >&2; exit 1 ;;
+      *) echo "unsupported macOS architecture: $arch" >&2; exit 1 ;;
     esac ;;
   Linux)
     case "$arch" in
       x86_64) target="x86_64-unknown-linux-musl" ;;
       aarch64 | arm64) target="aarch64-unknown-linux-musl" ;;
-      *) echo "지원하지 않는 Linux 아키텍처: $arch" >&2; exit 1 ;;
+      *) echo "unsupported Linux architecture: $arch" >&2; exit 1 ;;
     esac ;;
-  *) echo "지원하지 않는 OS: $os (Windows는 install.ps1 사용)" >&2; exit 1 ;;
+  *) echo "unsupported OS: $os (use install.ps1 on Windows)" >&2; exit 1 ;;
 esac
 
 asset="brv-$target.tar.gz"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-echo "다운로드: $BASE/$asset"
+echo "downloading: $BASE/$asset"
 curl -fsSL "$BASE/$asset" -o "$tmp/$asset"
 curl -fsSL "$BASE/SHA256SUMS" -o "$tmp/SHA256SUMS"
 
@@ -49,14 +49,14 @@ grep " $asset\$" "$tmp/SHA256SUMS" > "$tmp/sum.txt"
     shasum -a 256 -c sum.txt > /dev/null
   fi
 )
-echo "체크섬 확인 완료"
+echo "checksum verified"
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 dest="${BRV_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$dest"
 install -m 755 "$tmp/brv" "$dest/brv"
 
-echo "설치 완료: $dest/brv — $("$dest/brv" --version)"
+echo "installed: $dest/brv — $("$dest/brv" --version)"
 
 # PATH 자동 등록 (2026-09-02, 실측 UX: 새 서버 첫 설치마다 수동 추가를 요구하던 것을 흡수).
 # rustup/uv 관행을 따른다: 마커 달린 한 줄을 셸 설정에 추가, 이미 있으면 건너뜀(멱등).
@@ -65,7 +65,7 @@ case ":$PATH:" in
   *":$dest:"*) ;;
   *)
     if [ "${BRV_NO_MODIFY_PATH:-0}" = 1 ]; then
-      echo "주의: $dest 가 PATH에 없습니다. 셸 설정에 추가하세요:"
+      echo "note: $dest is not on your PATH. Add it to your shell config:"
       echo "  export PATH=\"$dest:\$PATH\""
     else
       # $HOME 하위면 \$HOME 변수로 기록 — 리터럴 경로보다 이식성 좋음
@@ -84,18 +84,18 @@ case ":$PATH:" in
         added="$added ${rc##*/}"
       done
       if [ -n "$added" ]; then
-        echo "PATH에 $dest 추가됨(${added# }) — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
+        echo "added $dest to PATH (${added# }) — new shells pick it up. For this shell right now:"
       else
-        echo "PATH 항목은 셸 설정에 이미 있습니다 — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
+        echo "the PATH entry is already in your shell config — new shells pick it up. For this shell right now:"
       fi
       echo "  export PATH=\"$dest:\$PATH\""
       case "${SHELL:-}" in
-        *fish*) echo "fish 사용 시: fish_add_path $dest" ;;
+        *fish*) echo "for fish: fish_add_path $dest" ;;
       esac
     fi ;;
 esac
 
 echo ""
-echo "다음 단계 — 계정과 이 머신을 연결하세요:"
-echo "  1) https://brevduva.dev 대시보드 → 머신 연결에서 등록 코드 발급 (brvenr_ 로 시작)"
-echo "  2) brv init --server https://api.brevduva.dev --enroll <코드>"
+echo "next — connect this machine to your account:"
+echo "  1) https://brevduva.dev dashboard → Connect a machine → issue an enroll code (starts with brvenr_)"
+echo "  2) brv init --server https://api.brevduva.dev --enroll <code>"

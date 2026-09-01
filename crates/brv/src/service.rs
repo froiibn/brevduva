@@ -19,7 +19,7 @@ fn require_absolute(config: Option<&str>) -> anyhow::Result<Option<&str>> {
     if let Some(c) = config {
         anyhow::ensure!(
             std::path::Path::new(c).is_absolute(),
-            "--config 는 절대 경로여야 합니다 (서비스는 다른 작업 디렉터리에서 뜬다): {c}"
+            "--config must be an absolute path (services start in a different working directory): {c}"
         );
     }
     Ok(config)
@@ -71,11 +71,11 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     if run_cmd("loginctl", &["enable-linger"]).is_err() {
         let user = std::env::var("USER").unwrap_or_default();
         println!(
-            "주의: linger 활성화 실패 — 부팅 시 자동 기동하려면 수동 실행: sudo loginctl enable-linger {user}"
+            "warning: enabling linger failed — for start-on-boot run manually: sudo loginctl enable-linger {user}"
         );
     }
     println!(
-        "등록 완료: systemd 사용자 유닛 {SERVICE_NAME} (로그: journalctl --user -u {SERVICE_NAME} -f)"
+        "registered: systemd user unit {SERVICE_NAME} (logs: journalctl --user -u {SERVICE_NAME} -f)"
     );
     Ok(())
 }
@@ -94,7 +94,7 @@ pub fn uninstall() -> anyhow::Result<()> {
         std::fs::remove_file(&unit)?;
     }
     let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
-    println!("해제 완료: {SERVICE_NAME}");
+    println!("unregistered: {SERVICE_NAME}");
     Ok(())
 }
 
@@ -166,7 +166,7 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
         ],
     )?;
     println!(
-        "등록 완료: LaunchAgent {LAUNCHD_LABEL} (로그인 시 자동 기동, 로그: {})",
+        "registered: LaunchAgent {LAUNCHD_LABEL} (starts at login, logs: {})",
         log.display()
     );
     Ok(())
@@ -189,7 +189,7 @@ pub fn uninstall() -> anyhow::Result<()> {
     if plist.exists() {
         std::fs::remove_file(&plist)?;
     }
-    println!("해제 완료: {LAUNCHD_LABEL}");
+    println!("unregistered: {LAUNCHD_LABEL}");
     Ok(())
 }
 
@@ -199,8 +199,8 @@ fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let status = std::process::Command::new(program)
         .args(args)
         .status()
-        .with_context(|| format!("{program} 실행 실패 — 설치돼 있는가?"))?;
-    anyhow::ensure!(status.success(), "{program} {args:?} 실패 ({status})");
+        .with_context(|| format!("failed to run {program} — is it installed?"))?;
+    anyhow::ensure!(status.success(), "{program} {args:?} failed ({status})");
     Ok(())
 }
 
@@ -221,15 +221,15 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".into());
     let account = format!("{domain}\\{user}");
     println!(
-        "서비스 계정: {account} — 키체인 토큰과 wake용 claude 로그인이 이 사용자 프로필에 있어 사용자 계정으로 등록합니다."
+        "service account: {account} — registering under your user account, since the keychain token and the claude login for wake live in this user profile."
     );
     let password = rpassword::prompt_password(format!(
-        "{account} 의 Windows 암호 (SCM에 저장, 화면 비표시): "
+        "Windows password for {account} (stored by SCM, not echoed): "
     ))?;
 
     let manager =
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .context("서비스 관리자 열기 실패 — 관리자 권한 터미널에서 실행하세요")?;
+            .context("failed to open the service manager — run from an administrator terminal")?;
     grant_service_logon_right(&account)?;
 
     let mut launch_arguments = vec![OsString::from("daemon"), OsString::from("service-run")];
@@ -251,12 +251,12 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     };
     let service = manager
         .create_service(&info, ServiceAccess::START)
-        .context("서비스 생성 실패 — 이미 등록돼 있으면 `brv daemon uninstall` 후 재시도")?;
-    service
-        .start::<&std::ffi::OsStr>(&[])
-        .context("서비스 시작 실패 — 로그온 오류(1069)면 입력한 암호를 의심하라")?;
+        .context("failed to create the service — if already registered, `brv daemon uninstall` and retry")?;
+    service.start::<&std::ffi::OsStr>(&[]).context(
+        "failed to start the service — on logon failure (1069), suspect the password you entered",
+    )?;
     println!(
-        "등록·시작 완료: 서비스 {SERVICE_NAME} (부팅 시 자동 시작, 로그: 설정 디렉터리의 daemon-service.log)"
+        "registered and started: service {SERVICE_NAME} (starts at boot, logs: daemon-service.log in the config directory)"
     );
     Ok(())
 }
@@ -268,13 +268,13 @@ pub fn uninstall() -> anyhow::Result<()> {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("서비스 관리자 열기 실패")?;
+        .context("failed to open the service manager")?;
     let service = manager
         .open_service(
             SERVICE_NAME,
             ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
         )
-        .context("서비스가 등록돼 있지 않다 (또는 관리자 권한 필요)")?;
+        .context("the service is not registered (or administrator rights are required)")?;
     if service
         .query_status()
         .map(|s| s.current_state != ServiceState::Stopped)
@@ -292,8 +292,8 @@ pub fn uninstall() -> anyhow::Result<()> {
             }
         }
     }
-    service.delete().context("서비스 삭제 실패")?;
-    println!("해제 완료: {SERVICE_NAME}");
+    service.delete().context("failed to delete the service")?;
+    println!("unregistered: {SERVICE_NAME}");
     Ok(())
 }
 
@@ -303,7 +303,7 @@ pub fn uninstall() -> anyhow::Result<()> {
 pub fn service_run() -> anyhow::Result<()> {
     use anyhow::Context as _;
     windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main)
-        .context("SCM dispatcher 실패 — service-run은 SCM 전용이다 (직접 실행 금지)")?;
+        .context("SCM dispatcher failed — service-run is SCM-only (never run directly)")?;
     Ok(())
 }
 
@@ -424,7 +424,10 @@ fn grant_service_logon_right(account: &str) -> anyhow::Result<()> {
             &mut sid_use,
         );
     }
-    anyhow::ensure!(sid_len > 0, "계정 SID 크기 조회 실패: {account}");
+    anyhow::ensure!(
+        sid_len > 0,
+        "failed to query SID size for account {account}"
+    );
     let mut sid = vec![0u8; sid_len as usize];
     let mut dom = vec![0u16; dom_len as usize];
     // SAFETY: 조회된 크기만큼 할당한 버퍼를 전달 — 수명은 이 함수 내
@@ -439,7 +442,7 @@ fn grant_service_logon_right(account: &str) -> anyhow::Result<()> {
             &mut sid_use,
         )
     };
-    anyhow::ensure!(ok != 0, "계정 SID 조회 실패: {account}");
+    anyhow::ensure!(ok != 0, "failed to look up SID for account {account}");
 
     // SAFETY: zeroed LSA_OBJECT_ATTRIBUTES + Length 설정은 문서화된 초기화 규약
     let mut attrs: LSA_OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
@@ -454,9 +457,11 @@ fn grant_service_logon_right(account: &str) -> anyhow::Result<()> {
             &mut policy,
         )
     };
-    anyhow::ensure!(status == 0, "LsaOpenPolicy 실패 (win32 오류 {})", unsafe {
-        LsaNtStatusToWinError(status)
-    });
+    anyhow::ensure!(
+        status == 0,
+        "LsaOpenPolicy failed (win32 error {})",
+        unsafe { LsaNtStatusToWinError(status) }
+    );
 
     let mut right: Vec<u16> = "SeServiceLogonRight".encode_utf16().collect();
     let lsa_right = LSA_UNICODE_STRING {
@@ -471,10 +476,10 @@ fn grant_service_logon_right(account: &str) -> anyhow::Result<()> {
     unsafe { LsaClose(policy) };
     anyhow::ensure!(
         status == 0,
-        "SeServiceLogonRight 부여 실패 (win32 오류 {})",
+        "failed to grant SeServiceLogonRight (win32 error {})",
         unsafe { LsaNtStatusToWinError(status) }
     );
-    println!("서비스 로그온 권한(SeServiceLogonRight) 부여 완료: {account}");
+    println!("service logon right (SeServiceLogonRight) granted: {account}");
     Ok(())
 }
 
@@ -482,10 +487,12 @@ fn grant_service_logon_right(account: &str) -> anyhow::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn install(_config: Option<&str>) -> anyhow::Result<()> {
-    anyhow::bail!("이 OS는 서비스 등록을 지원하지 않는다 — `brv daemon`을 직접 상주 실행하라")
+    anyhow::bail!(
+        "service registration is not supported on this OS — run `brv daemon` directly as a resident process"
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn uninstall() -> anyhow::Result<()> {
-    anyhow::bail!("이 OS는 서비스 등록을 지원하지 않는다")
+    anyhow::bail!("service registration is not supported on this OS")
 }

@@ -37,7 +37,7 @@ pub async fn exchange(server: &str, code: &str, channel: Option<&str>) -> anyhow
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!(
-            "enroll 거부: {}",
+            "enroll rejected: {}",
             body["message"]
                 .as_str()
                 .unwrap_or("invalid or expired code")
@@ -65,7 +65,7 @@ pub async fn exchange(server: &str, code: &str, channel: Option<&str>) -> anyhow
         // 서버가 소모 전에 검증했으므로 여기 도달했다면 유효
         Some(c) => c.to_owned(),
         None => channels.first().cloned().context(
-            "이 코드에 참가 채널이 없습니다 — 대시보드에서 채널을 지정해 다시 발급하세요",
+            "this code carries no channels — reissue it in the dashboard with channels attached",
         )?,
     };
     Ok(Enrolled {

@@ -60,10 +60,9 @@ pub async fn run_with_shutdown(
     tokens: HashMap<String, String>,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> anyhow::Result<()> {
-    let wake = cfg
-        .wake
-        .clone()
-        .context("daemon requires a `[wake]` section in config.toml — 무엇으로 세션을 깨울지 정의하라 (command)")?;
+    let wake = cfg.wake.clone().context(
+        "daemon requires a `[wake]` section in config.toml — define what wakes a session (command)",
+    )?;
     anyhow::ensure!(
         !cfg.bindings.is_empty(),
         "no bindings configured — run `brv init --enroll <code>` first"
