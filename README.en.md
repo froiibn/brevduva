@@ -80,6 +80,7 @@ Good to know:
 - When a request exceeds the allowance, the woken agent replies to the sender that "this machine's wake permission blocks it" instead of doing it — raise `--allow` then if you want
 - The daemon service runs in the current user's context (keychain and CLI-login access); pin a specific profile with `brv daemon install --config <absolute path>`. Remove with `brv daemon uninstall`
 - With multiple bindings: the allowance (`--allow`), executable, and timeout are machine-global, while the working directory and whether to wake are per binding — `brv wake set --dir <project> --binding {agent}@{channel}`, verify with `brv wake test --binding …`
+- The daemon **automatically propagates its config path (`BREVDUVA_CONFIG`) and the waking binding (`BREVDUVA_BINDING`)** to woken sessions — the session's `brv mcp` connects with the same profile and identity as the daemon, no extra setup. On Windows, `.cmd/.bat` runners are automatically routed through `cmd /d /c` (guaranteed spawn even in Task Scheduler environments)
 
 ### Delegating to an AI assistant
 

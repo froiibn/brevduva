@@ -218,7 +218,7 @@ async fn binding_loop(
         // 재시도되고, 반복 실패는 max_deliver 소진 → 포이즌 표시로 대시보드에 드러난다.
         // 완주가 아니라 스폰을 기준으로 하는 이유: 장시간 깨우기 동안 미확인분이 재전달되는
         // 중복 폭주를 피하기 위함 (깨어난 세션의 크래시는 저널 + 세션 로그가 잡는다).
-        match spawn_wake(&wake, dir, &prompt).await {
+        match spawn_wake(&wake, dir, &binding.full_label(), &prompt).await {
             Ok(child) => {
                 for (_, token) in &batch {
                     client.confirm(*token).await;
@@ -323,12 +323,34 @@ pub fn build_prompt(binding: &Binding, wake: &WakeConfig, batch: &[Envelope]) ->
     )
 }
 
+/// 윈도우 스크립트 러너 보정 (2026-09-02, codex 수제 수정의 제품 승격): `.cmd/.bat`는
+/// 실행 파일이 아니라 `cmd /d /c`를 통해야 한다 — 대화형 셸의 wake test는 통과하지만
+/// 작업 스케줄러 환경에서는 직접 스폰이 실패한다 (2026-09-01 실측). `windows` 인자로
+/// 분기하는 이유: cfg 게이트로 가르면 이 개발 머신 밖 플랫폼 경로가 검사 사각이 된다.
+fn script_wrap(windows: bool, command: &str, args: &[String]) -> (String, Vec<String>) {
+    let lower = command.to_ascii_lowercase();
+    if windows && (lower.ends_with(".cmd") || lower.ends_with(".bat")) {
+        let mut wrapped = vec!["/d".to_owned(), "/c".to_owned(), command.to_owned()];
+        wrapped.extend(args.iter().cloned());
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_owned());
+        (cmd, wrapped)
+    } else {
+        (command.to_owned(), args.to_vec())
+    }
+}
+
 /// 깨우기 프로세스 시작 — 스폰 성공까지가 소비 확정의 기준 (페이즈 20).
 /// dir은 바인딩의 wake_dir (페이즈 27 — 전역 [wake]에서 바인딩으로 이동).
+/// binding_label은 깨운 세션에 `BREVDUVA_BINDING`으로 전파 — 세션의 `brv mcp`가
+/// 데몬과 같은 설정(`BREVDUVA_CONFIG`)·같은 바인딩으로 접속하게 하는 통로
+/// (2026-09-01 실사고: 깨운 세션이 기본 경로의 무효 토큰을 읽어 답신 불능 — 래퍼
+/// 스크립트로 수제 우회되던 것을 제품 동작으로 승격).
 /// pub인 이유: `brv wake test`(페이즈 21)가 실제 깨우기와 **같은 코드 경로**로 검증한다.
 pub async fn spawn_wake(
     wake: &WakeConfig,
     dir: &str,
+    binding_label: &str,
     prompt: &str,
 ) -> anyhow::Result<tokio::process::Child> {
     let args: Vec<String> = wake
@@ -336,7 +358,9 @@ pub async fn spawn_wake(
         .iter()
         .map(|a| a.replace("{prompt}", prompt))
         .collect();
-    tracing::info!(command = %wake.command, dir = %dir, "waking session");
+    let (command, args) = script_wrap(cfg!(windows), &wake.command, &args);
+    let config_path = crate::config::config_path()?;
+    tracing::info!(command = %command, dir = %dir, binding = %binding_label, "waking session");
     // 깨운 세션의 출력은 wake.log로 — 실패 원인 추적용 (버리면 디버깅 불가, 실측 교훈)
     let log_dir = crate::config::config_path()?
         .parent()
@@ -351,15 +375,18 @@ pub async fn spawn_wake(
         .append(true)
         .open(&log_path)
         .with_context(|| format!("cannot open wake log {log_path:?}"))?;
-    let child = tokio::process::Command::new(&wake.command)
+    let child = tokio::process::Command::new(&command)
         .args(&args)
         .current_dir(dir)
+        // 깨운 세션(과 그 자식 brv mcp)이 데몬과 같은 프로필·바인딩을 보게 (위 문서 주석)
+        .env("BREVDUVA_CONFIG", &config_path)
+        .env("BREVDUVA_BINDING", binding_label)
         .stdout(std::process::Stdio::from(
             log.try_clone().context("clone log handle")?,
         ))
         .stderr(std::process::Stdio::from(log))
         .spawn()
-        .with_context(|| format!("cannot spawn wake command {:?}", wake.command))?;
+        .with_context(|| format!("cannot spawn wake command {command:?}"))?;
     Ok(child)
 }
 
@@ -515,9 +542,28 @@ mod tests {
             },
             timeout_s: 30,
         };
-        let child = spawn_wake(&wake, ".", "test")
+        let child = spawn_wake(&wake, ".", "backend@myapp", "test")
             .await
             .expect("wake command spawns");
         wait_wake(&wake, child).await.expect("wake command runs");
+    }
+
+    #[test]
+    fn script_runners_get_cmd_wrapped_on_windows() {
+        // 2026-09-02: .cmd/.bat는 cmd /d /c 경유 — 작업 스케줄러 환경 직접 스폰 실패 실측
+        let args = vec!["-p".to_owned(), "hi".to_owned()];
+        let (cmd, wrapped) = script_wrap(true, r"C:\brevduva\wake-claude.cmd", &args);
+        assert!(cmd.to_ascii_lowercase().ends_with("cmd.exe"));
+        assert_eq!(
+            wrapped,
+            vec!["/d", "/c", r"C:\brevduva\wake-claude.cmd", "-p", "hi"]
+        );
+        // .BAT 대문자도, 비스크립트(.exe)는 무변경, 비윈도우도 무변경
+        let (cmd, _) = script_wrap(true, r"C:\x\run.BAT", &[]);
+        assert!(cmd.to_ascii_lowercase().ends_with("cmd.exe"));
+        let (cmd, same) = script_wrap(true, r"C:\x\claude.exe", &args);
+        assert_eq!((cmd.as_str(), &same), (r"C:\x\claude.exe", &args));
+        let (cmd, same) = script_wrap(false, "/usr/bin/run.cmd", &args);
+        assert_eq!((cmd.as_str(), &same), ("/usr/bin/run.cmd", &args));
     }
 }

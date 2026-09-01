@@ -80,6 +80,7 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - 권한 밖 요청이 오면 깨워진 에이전트는 수행 대신 "이 머신의 wake 권한이 막고 있다"고 발신자에게 답신한다 — 그때 `--allow`를 올리면 된다
 - 데몬 서비스는 현재 사용자 컨텍스트로 돌며(키체인·CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`
 - 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리와 깨우기 여부는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
+- 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)와 깨운 바인딩(`BREVDUVA_BINDING`)을 자동 전파**한다 — 세션 안의 `brv mcp`가 별도 설정 없이 데몬과 같은 프로필·같은 정체성으로 접속한다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장)
 
 ### AI 비서에게 맡기기
 

@@ -603,7 +603,7 @@ async fn wake_test(binding_sel: Option<&str>) -> anyhow::Result<()> {
         capped.timeout_s
     );
     let started = std::time::Instant::now();
-    let child = brv::daemon::spawn_wake(&capped, &dir, prompt).await?;
+    let child = brv::daemon::spawn_wake(&capped, &dir, &binding.full_label(), prompt).await?;
     println!("spawn OK — waiting for the session to exit...");
     let log_hint = config::config_path()?
         .parent()
@@ -1046,6 +1046,11 @@ async fn listen(binding_sel: Option<&str>) -> anyhow::Result<()> {
 }
 
 async fn mcp(binding_sel: Option<&str>) -> anyhow::Result<()> {
+    // 선택자 폴백: --binding → BREVDUVA_BINDING env — 데몬이 깨운 세션의 MCP가 "누가
+    // 깨웠는지"를 이어받는 통로 (2026-09-02). 바인딩이 여럿인 머신에서도 깨운 세션이
+    // 올바른 정체성으로 붙는다 (플래그 없는 user-scope 등록 + 다중 바인딩 = select 불가였음)
+    let env_sel = std::env::var("BREVDUVA_BINDING").ok();
+    let binding_sel = binding_sel.or(env_sel.as_deref());
     // lazy-JOIN: 여기서 접속하지 않는다 — 첫 도구 호출 때 McpServer가 접속 (플랩 방지)
     let (_, binding, mut opts) = options_from_config(binding_sel)?;
     // 유휴 파킹 (2026-09-01): 도구 호출이 끊긴 세션은 자리를 내려놓는다 — 방치된 대화형
