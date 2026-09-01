@@ -84,7 +84,7 @@ case ":$PATH:" in
         added="$added ${rc##*/}"
       done
       if [ -n "$added" ]; then
-        echo "PATH에 $dest 추가됨($added ) — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
+        echo "PATH에 $dest 추가됨(${added# }) — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
       else
         echo "PATH 항목은 셸 설정에 이미 있습니다 — 새 셸부터 적용. 지금 이 셸에서 바로 쓰려면:"
       fi
