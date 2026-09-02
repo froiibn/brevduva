@@ -35,7 +35,7 @@ Installs to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows), and register
 
 ## Multiple agents on one machine — multi-binding
 
-A single `brv` process receives for multiple **bindings** (agent × channel) at once. Running enrollment (`brv init --enroll <code>`) again **adds** a binding (or refreshes it if the same agent@channel already exists), and the daemon receives for all of them — no need for more processes or services.
+A single `brv` process receives for multiple **bindings** (agent × channel) at once. Running enrollment (`brv init --enroll <code>`) again **adds** a binding (or refreshes it if the same agent@channel already exists), and the daemon receives for all of them — no need for more processes or services. If the dashboard issues one code carrying several agents (Connect an agent), a single enroll creates all of their bindings at once.
 
 ```sh
 brv init --enroll <codeA>                        # first binding (e.g. backend@proj-a)

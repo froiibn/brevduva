@@ -665,30 +665,37 @@ fn token_store_note(stored: &config::TokenStore) -> String {
     }
 }
 
-/// init/enroll 결과를 기존 설정에 병합 — 페이즈 27: 덮어쓰기가 아니라 바인딩 upsert.
+/// 설정 파일을 병합용으로 연다 — 없으면 새 설정, 있으면 서버 일치 검증(설정 하나=서버 하나).
 /// 파손된 기존 설정은 정직하게 실패한다 (덮어써서 다른 바인딩을 날리지 않는다).
-fn merge_binding(server: &str, binding: Binding) -> anyhow::Result<(BrvConfig, bool)> {
+fn open_config_for(server: &str) -> anyhow::Result<BrvConfig> {
     let path = config::config_path()?;
-    let mut cfg = if path.exists() {
+    if path.exists() {
         let existing = config::load()?;
         anyhow::ensure!(
             existing.server == server,
             "config already targets {} — one config, one server. Use a separate BREVDUVA_CONFIG profile for another server",
             existing.server
         );
-        existing
+        Ok(existing)
     } else {
-        BrvConfig {
+        Ok(BrvConfig {
             server: server.to_owned(),
             wake: None,
             bindings: Vec::new(),
-        }
-    };
+        })
+    }
+}
+
+/// init/binding add 결과를 기존 설정에 병합 — 페이즈 27: 덮어쓰기가 아니라 바인딩 upsert.
+fn merge_binding(server: &str, binding: Binding) -> anyhow::Result<(BrvConfig, bool)> {
+    let mut cfg = open_config_for(server)?;
     let replaced = cfg.upsert_binding(binding);
     Ok((cfg, replaced))
 }
 
 /// `brv init --enroll <코드>` — 대시보드 발급 코드 하나로 연결 (페이즈 10, PROTOCOL 10.1).
+/// 다중 에이전트 코드(2026-09-02)는 나열된 (에이전트, 채널) 쌍 전부를 한 번에 바인딩한다 —
+/// 설정은 한 번 열어 전부 upsert하고 한 번 저장한다.
 async fn enroll_init(
     server: String,
     code: String,
@@ -696,34 +703,46 @@ async fn enroll_init(
     no_mcp: bool,
 ) -> anyhow::Result<()> {
     let enrolled = brv::enroll::exchange(&server, code.trim(), channel.as_deref()).await?;
-    let binding = enrolled.binding.clone();
-    let (cfg, replaced) = merge_binding(&enrolled.server, enrolled.binding)?;
-    let stored = config::store_token(&cfg.server, &binding, &enrolled.token)?;
-    let path = config::store(&cfg)?;
-    println!(
-        "connected — org {org} / agent {agent} / channel {ch}{note}",
-        org = enrolled.org,
-        agent = binding.agent,
-        ch = binding.channel,
-        note = if replaced {
-            " (existing binding updated — token rotated)"
-        } else {
-            ""
-        },
-    );
-    if enrolled.channels.len() > 1 {
+    let mut cfg = open_config_for(&enrolled.server)?;
+    let mut stored = None;
+    for ea in &enrolled.agents {
+        let mut channels = Vec::with_capacity(ea.bindings.len());
+        let mut replaced = false;
+        for b in &ea.bindings {
+            channels.push(b.channel.clone());
+            replaced |= cfg.upsert_binding(b.clone());
+        }
+        // 토큰은 에이전트당 하나 — 첫 바인딩의 정체성 키(org/agent)로 저장
+        let agent = &ea.bindings[0];
+        stored = Some(config::store_token(&cfg.server, agent, &ea.token)?);
         println!(
-            "  also granted: {} (receive there too: brv binding add --agent {} --channel <ch>)",
-            enrolled
-                .channels
-                .iter()
-                .filter(|c| **c != binding.channel)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            binding.agent,
+            "connected — org {org} / agent {agent} / channel{s} {chs}{note}",
+            org = enrolled.org,
+            agent = agent.agent,
+            s = if channels.len() > 1 { "s" } else { "" },
+            chs = channels.join(", "),
+            note = if replaced {
+                " (existing binding updated — token rotated)"
+            } else {
+                ""
+            },
         );
+        let unbound: Vec<&str> = ea
+            .channels
+            .iter()
+            .filter(|c| !channels.contains(c))
+            .map(String::as_str)
+            .collect();
+        if !unbound.is_empty() {
+            println!(
+                "  also granted: {} (receive there too: brv binding add --agent {} --channel <ch>)",
+                unbound.join(", "),
+                agent.agent,
+            );
+        }
     }
+    let stored = stored.context("enroll response listed no agents")?;
+    let path = config::store(&cfg)?;
     println!("  config: {path:?} / {}", token_store_note(&stored));
     if no_mcp {
         println!("to use from an agent: claude mcp add brevduva -- brv mcp");
@@ -744,6 +763,10 @@ async fn enroll_init(
 
 /// Claude Code MCP 자동 등록 (기본 켬, --no-mcp로 생략) — 실패는 온보딩 실패가 아니라 안내.
 /// --scope user: 기본 스코프(local)는 실행한 디렉터리에 묶여 온보딩 목적에 안 맞는다.
+/// 등록에는 지금 enroll한 설정 경로를 env(BREVDUVA_CONFIG)로 박는다 — 데몬이 깨운 세션에
+/// 주입하는 것과 같은 규약. 이미 등록돼 있으면 지우고 다시 등록해 **낡은 등록이 현행 설정을
+/// 가리지 않게** 한다 (2026-09-01 실사고: 옛 프로필 env가 박힌 등록이 데몬 주입을 덮어 깨운
+/// 세션의 MCP가 즉사 — Claude는 서버 정의 env로 상속 env를 덮는다).
 /// 바인딩이 여럿이면 자동 등록하지 않는다 — 전역 `brv mcp`는 바인딩 선택이 안 되므로,
 /// 프로젝트별 등록(--binding 포함)을 안내한다 (페이즈 27).
 fn register_mcp(cfg: &BrvConfig) {
@@ -759,19 +782,39 @@ fn register_mcp(cfg: &BrvConfig) {
         }
         return;
     }
-    match std::process::Command::new("claude")
-        .args([
-            "mcp", "add", "--scope", "user", "brevduva", "--", "brv", "mcp",
-        ])
-        .output()
-    {
+    let config_env = config::config_path()
+        .map(|p| format!("BREVDUVA_CONFIG={}", p.display()))
+        .ok();
+    let add = || {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args(["mcp", "add", "--scope", "user"]);
+        if let Some(env) = &config_env {
+            cmd.args(["--env", env]);
+        }
+        cmd.args(["brevduva", "--", "brv", "mcp"]).output()
+    };
+    match add() {
         Ok(out) if out.status.success() => {
             println!("Claude Code MCP registered — the agent can use the channel right away");
         }
         Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr);
             if err.contains("already exists") {
-                println!("Claude Code MCP is already registered");
+                let removed = std::process::Command::new("claude")
+                    .args(["mcp", "remove", "brevduva", "-s", "user"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                match add() {
+                    Ok(out) if removed && out.status.success() => {
+                        println!(
+                            "Claude Code MCP registration refreshed — it now points at this config"
+                        );
+                    }
+                    _ => println!(
+                        "Claude Code MCP is already registered but could not be refreshed — redo manually: claude mcp remove brevduva -s user && claude mcp add --scope user brevduva -- brv mcp"
+                    ),
+                }
             } else {
                 println!(
                     "MCP auto-registration failed — register manually: claude mcp add brevduva -- brv mcp\n  ({})",

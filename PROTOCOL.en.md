@@ -285,15 +285,25 @@ issued in the admin UI (or via the management API) *is* the authentication — t
 
 ```
 POST /v1/enroll
-{ "code": "<the issued one-time code>", "channel": "<optional: default channel>" }
+{ "code": "<the issued one-time code>", "channel": "<optional: default channel — single-agent codes only>" }
 
 → 200
-{ "org": "...", "agent": "...", "token": "...", "channels": ["..."], "description": "..." }
+{ "org": "...", "agent": "...", "token": "...", "channels": ["..."], "description": "...",
+  "agents": [ { "agent": "...", "token": "...", "channels": ["..."], "description": "..." }, ... ] }
 ```
 
-`channel` selects which of the granted channels to use as the default, and is **validated
-before the code is consumed** — naming a channel that was not granted is rejected with
-`400 enroll/channel-not-granted` and the code is not consumed (a typo must not force a reissue).
+One code may carry **several agents** (chosen at issuance). The response to such a code
+includes an `agents` array, and the client binds **every** listed (agent, channel) pair —
+setting up a new machine takes a single exchange. The top-level `agent`/`token`/`channels`/
+`description` are a copy of the first agent, so older clients unaware of `agents` still work
+with the first agent. Single-agent codes carry no `agents` field.
+
+For single-agent codes, `channel` selects which of the granted channels to use as the default,
+and is **validated before the code is consumed** — naming a channel that was not granted is
+rejected with `400 enroll/channel-not-granted`, and naming one on a multi-agent code with
+`400 enroll/channel-select-unsupported`; either way the code is not consumed (a typo must not
+force a reissue). A value that is not a code at all (e.g. an agent token) is answered with
+`400 enroll/not-a-code` so the mistake is named.
 
 - A code is shown once at issuance, is **consumed by a single exchange**, and has a short
   lifetime (default 15 minutes). Of concurrent exchanges, only one succeeds

@@ -279,15 +279,24 @@ GET    /v1/channels/{ch}/presence
 
 ```
 POST /v1/enroll
-{ "code": "<발급받은 일회용 코드>", "channel": "<선택: 기본 채널>" }
+{ "code": "<발급받은 일회용 코드>", "channel": "<선택: 기본 채널 — 단일 에이전트 코드 전용>" }
 
 → 200
-{ "org": "...", "agent": "...", "token": "...", "channels": ["..."], "description": "..." }
+{ "org": "...", "agent": "...", "token": "...", "channels": ["..."], "description": "...",
+  "agents": [ { "agent": "...", "token": "...", "channels": ["..."], "description": "..." }, ... ] }
 ```
 
-`channel`은 부여 목록 중 기본으로 쓸 채널의 선택이며 **코드 소모 전에 검증**된다 —
-부여되지 않은 채널을 지정하면 `400 enroll/channel-not-granted`로 거부되고 코드는
-소모되지 않는다 (오타가 재발급을 강요하지 않게).
+코드 하나에는 **에이전트 여러 명**이 담길 수 있다(발급 시 지정). 그런 코드의 응답에는
+`agents` 배열이 오고, 클라이언트는 나열된 (에이전트, 채널) 쌍 **전부**에 바인딩한다 —
+새 머신 셋업이 교환 한 번으로 끝난다. 톱레벨 `agent`/`token`/`channels`/`description`은
+첫 에이전트의 사본이라 `agents`를 모르는 구형 클라이언트도 첫 에이전트로 동작한다.
+단일 에이전트 코드의 응답에는 `agents`가 없다.
+
+`channel`은 단일 에이전트 코드에서 부여 목록 중 기본으로 쓸 채널의 선택이며 **코드 소모
+전에 검증**된다 — 부여되지 않은 채널을 지정하면 `400 enroll/channel-not-granted`, 다중
+에이전트 코드에 지정하면 `400 enroll/channel-select-unsupported`로 거부되고 코드는 소모되지
+않는다 (오타가 재발급을 강요하지 않게). 코드가 아닌 값(예: 에이전트 토큰)을 넣으면
+`400 enroll/not-a-code`로 구분해 안내한다.
 
 ### 10.2 에이전트 채널 발견
 
