@@ -3,14 +3,17 @@
 
 //! OS 서비스 등록·해제 — `brv daemon install` / `uninstall` (페이즈 7).
 //!
-//! 공통 설계: 서비스는 **현재 사용자 컨텍스트**로 돈다 — 토큰 키체인과 wake용 CLI
-//! 로그인(claude 등)이 사용자 프로필 소속이라 시스템 계정(LocalSystem/LaunchDaemon)은
-//! 동작하지 않기 때문. 머신당 서비스 1개(이름 고정), 프로필 선택은 `--config`로.
+//! 공통 설계: **깨우기는 사용자 컨텍스트**에서 일어나야 한다 — 토큰·wake용 CLI 로그인
+//! (claude 등)·프로젝트가 사용자 프로필 소속이라서. 머신당 서비스 1개(이름 고정), 프로필
+//! 선택은 `--config`로.
 //!
 //! - Linux: systemd 사용자 유닛 + `loginctl enable-linger`(부팅 시 로그인 없이 기동)
 //! - macOS: LaunchAgent (로그인 시 기동 + KeepAlive)
-//! - Windows: SCM 진짜 서비스 (부팅 시 기동). 설치 시 계정 암호 1회 입력(SCM 저장) +
-//!   `SeServiceLogonRight` LSA 부여 (services.msc GUI와 달리 API 등록은 자동 부여가 없다)
+//! - Windows: SCM 진짜 서비스, **LocalSystem** (2026-09-03 사용자 확정 "리시버는 전달자일 뿐" —
+//!   종전의 사용자 계정 서비스는 암호 입력이 필수라 무암호 상주가 불가능했다). 듣기는 시스템
+//!   계정이, 깨우기는 로그온한 사용자의 토큰을 빌려 그 사용자 명의로 (winspawn.rs — 백신·
+//!   업데이트 에이전트와 같은 구조). 설치는 관리자 터미널 1회, 이후 재기동은 소유자 권한으로
+//!   (서비스 DACL 부여). 토큰은 파일 저장 — 시스템 계정은 사용자 자격 증명 저장소를 못 본다
 
 pub const SERVICE_NAME: &str = "brv-daemon";
 
@@ -242,7 +245,11 @@ fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- Windows: SCM 서비스
+// ---------------------------------------------------------------- Windows: SCM 서비스 (LocalSystem)
+
+/// 서비스 실행 인자(`--wake-user`)로 받은 깨울 사용자 — svc_main은 함수 포인터라 늦게 공급.
+#[cfg(windows)]
+static WAKE_USER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 #[cfg(windows)]
 pub fn install(config: Option<&str>) -> anyhow::Result<()> {
@@ -253,28 +260,33 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    let config = require_absolute(config)?;
+    // 설정 경로는 항상 절대 경로로 굽는다 — 시스템 계정의 기본 경로는 사용자 것과 다르다
+    let config_path = match require_absolute(config)? {
+        Some(c) => std::path::PathBuf::from(c),
+        None => crate::config::config_path()?,
+    };
+    crate::config::set_path_override(config_path.clone());
     let exe = std::env::current_exe()?;
     let user = std::env::var("USERNAME").context("USERNAME env")?;
-    let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".into());
-    let account = format!("{domain}\\{user}");
-    println!(
-        "service account: {account} — registering under your user account, since the keychain token and the claude login for wake live in this user profile."
-    );
-    let password = rpassword::prompt_password(format!(
-        "Windows password for {account} (stored by SCM, not echoed): "
-    ))?;
+
+    // 토큰을 파일로 — 시스템 계정은 사용자의 자격 증명 저장소를 못 본다. 윈도우의 load_token은
+    // 파일 우선 + 저장소→파일 자가 이전이라, 여기서 한 번 돌려 서비스가 읽을 파일을 보장한다
+    let cfg = crate::config::load()?;
+    crate::config::load_tokens(&cfg)
+        .context("every binding's token must be readable before registering the service")?;
 
     let manager =
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .context("failed to open the service manager — run from an administrator terminal")?;
-    grant_service_logon_right(&account)?;
+            .context("failed to open the service manager — run this once from an administrator terminal (Run as administrator)")?;
 
-    let mut launch_arguments = vec![OsString::from("daemon"), OsString::from("service-run")];
-    if let Some(c) = config {
-        launch_arguments.push("--config".into());
-        launch_arguments.push(c.into());
-    }
+    let launch_arguments = vec![
+        OsString::from("daemon"),
+        OsString::from("service-run"),
+        OsString::from("--config"),
+        config_path.clone().into_os_string(),
+        OsString::from("--wake-user"),
+        OsString::from(&user),
+    ];
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: "Brevduva Receiver Daemon".into(),
@@ -284,19 +296,106 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
         executable_path: exe,
         launch_arguments,
         dependencies: vec![],
-        account_name: Some(account.clone().into()),
-        account_password: Some(password.into()),
+        account_name: None, // LocalSystem — 암호 없음
+        account_password: None,
     };
     let service = manager
         .create_service(&info, ServiceAccess::START)
         .context("failed to create the service — if already registered, `brv daemon uninstall` and retry")?;
-    service.start::<&std::ffi::OsStr>(&[]).context(
-        "failed to start the service — on logon failure (1069), suspect the password you entered",
-    )?;
+    // 소유자가 승격 없이 재기동할 수 있게 — 설정 변경 명령의 자동 재기동이 이 권한에 기댄다
+    match grant_service_control(&user) {
+        Ok(()) => println!(
+            "service control granted to {user} — `brv daemon restart` works without elevation"
+        ),
+        Err(e) => println!(
+            "warning: could not grant service control to {user} — `brv daemon restart` will need an administrator terminal: {e}"
+        ),
+    }
+    // lucadm 실측(2026-09-03): 같은 설정을 쓰는 데몬 둘은 자리 다툼·메시지 가로채기를 일으킨다
+    if scheduled_task_exists() {
+        println!(
+            "warning: a scheduled task named {SERVICE_NAME} also runs a daemon — two daemons compete for the agent slot. Disable it: schtasks /Change /TN {SERVICE_NAME} /DISABLE"
+        );
+    }
+    service
+        .start::<&std::ffi::OsStr>(&[])
+        .context("failed to start the service — see daemon-service.log in the config directory")?;
     println!(
-        "registered and started: service {SERVICE_NAME} (starts at boot, logs: daemon-service.log in the config directory)"
+        "registered and started: service {SERVICE_NAME} (LocalSystem, starts at boot) — wakes run in {user}'s logged-on session: locked is fine, logged out = waits. Logs: daemon-service.log in the config directory"
     );
     Ok(())
+}
+
+/// 서비스 시작·정지·상태 조회 권한을 설치한 사용자에게 — SCM 기본 DACL은 관리자만 제어할
+/// 수 있어 `brv daemon restart`(설정 변경 후 자동 호출)가 일반 프롬프트에서 거부된다.
+/// SDDL 편집은 `sc.exe sdshow/sdset`로 — 보안 설명자 API의 FFI를 늘리지 않는다.
+#[cfg(windows)]
+fn grant_service_control(user: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let sid = user_sid().with_context(|| format!("SID of {user}"))?;
+    let out = std::process::Command::new("sc.exe")
+        .args(["sdshow", SERVICE_NAME])
+        .output()
+        .context("sc.exe sdshow")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "sc sdshow failed: {}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+    let sddl = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    // CC LC SW RP WP DT LO CR RC = 구성 조회·상태 조회·열거·시작·정지·일시정지·조사·사용자
+    // 제어·읽기 — services.msc의 "시작/중지" 권한 묶음 (삭제·구성 변경은 여전히 관리자)
+    let ace = format!("(A;;CCLCSWRPWPDTLOCRRC;;;{sid})");
+    if sddl.contains(&ace) {
+        return Ok(());
+    }
+    // DACL(D:) 끝, SACL(S:) 앞에 끼운다
+    let new = match sddl.find("S:") {
+        Some(i) => format!("{}{ace}{}", &sddl[..i], &sddl[i..]),
+        None => format!("{sddl}{ace}"),
+    };
+    let status = std::process::Command::new("sc.exe")
+        .args(["sdset", SERVICE_NAME, &new])
+        .status()
+        .context("sc.exe sdset")?;
+    anyhow::ensure!(status.success(), "sc sdset failed ({status})");
+    Ok(())
+}
+
+/// 현재 사용자의 SID 문자열 — 내장 `whoami /user` 출력에서 (LookupAccountName FFI 회피).
+#[cfg(windows)]
+fn user_sid() -> anyhow::Result<String> {
+    let out = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "DOMAIN\user","S-1-5-21-…"
+    let sid = text
+        .trim()
+        .rsplit(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .to_owned();
+    anyhow::ensure!(
+        sid.starts_with("S-1-"),
+        "cannot read the user SID from whoami: {text:?}"
+    );
+    Ok(sid)
+}
+
+/// 같은 이름의 작업 스케줄러 작업이 **활성** 상태인가 — 비활성(Disabled)은 경고하지 않는다.
+#[cfg(windows)]
+fn scheduled_task_exists() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", SERVICE_NAME, "/FO", "CSV", "/NH"])
+        .output()
+        .map(|o| {
+            // "\brv-daemon","N/A","Disabled" — 마지막 열이 상태
+            o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("\"Disabled\"")
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -376,9 +475,11 @@ pub fn restart() -> anyhow::Result<bool> {
 
 /// SCM이 서비스 프로세스로 이 바이너리를 띄울 때의 진입점 (`brv daemon service-run`).
 /// 콘솔이 없으므로 로그는 main에서 파일로 초기화돼 있다. 설정 경로 override도 main에서.
+/// `wake_user` = 설치자 (깨우기를 그 사용자 세션에 — 없으면 활성 세션 아무거나).
 #[cfg(windows)]
-pub fn service_run() -> anyhow::Result<()> {
+pub fn service_run(wake_user: Option<String>) -> anyhow::Result<()> {
     use anyhow::Context as _;
+    let _ = WAKE_USER.set(wake_user);
     windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         .context("SCM dispatcher failed — service-run is SCM-only (never run directly)")?;
     Ok(())
@@ -447,6 +548,10 @@ fn run_service() -> anyhow::Result<()> {
                     crate::config::load_token(&reload_cfg, b).ok()
                 })),
                 preflight: true,
+                // 시스템 계정은 claude 로그인·프로젝트를 못 연다 — 깨우기는 사용자 세션에서
+                wake_spawn: crate::daemon::WakeSpawn::UserSession {
+                    user: WAKE_USER.get().cloned().flatten(),
+                },
                 ..Default::default()
             },
         )
@@ -478,99 +583,6 @@ fn set_status(
         wait_hint,
         process_id: None,
     })
-}
-
-/// `SeServiceLogonRight` 부여 — services.msc GUI와 달리 CreateService API는 이 권한을
-/// 자동 부여하지 않아(문서화된 동작) 없으면 서비스 시작이 로그온 오류(1069)로 실패한다.
-/// windows-sys에 안전 래퍼가 없어 LSA FFI가 불가피 — crate 전역 deny(unsafe_code)의
-/// 유일한 예외 (lib.rs 주석 참조).
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn grant_service_logon_right(account: &str) -> anyhow::Result<()> {
-    use windows_sys::Win32::Security::Authentication::Identity::{
-        LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose,
-        LsaNtStatusToWinError, LsaOpenPolicy,
-    };
-    use windows_sys::Win32::Security::LookupAccountNameW;
-
-    // LsaOpenPolicy 접근 마스크 (winnt.h 문서값 — LsaAddAccountRights 요구 조합)
-    const POLICY_CREATE_ACCOUNT: u32 = 0x0010;
-    const POLICY_LOOKUP_NAMES: u32 = 0x0800;
-
-    let account_w: Vec<u16> = account.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut sid_len = 0u32;
-    let mut dom_len = 0u32;
-    let mut sid_use = 0i32;
-    // 1차 호출은 버퍼 크기 조회 (실패가 정상 — ERROR_INSUFFICIENT_BUFFER)
-    // SAFETY: 널 버퍼 + 길이 0은 문서화된 크기 조회 규약. 포인터는 전부 지역 변수
-    unsafe {
-        LookupAccountNameW(
-            std::ptr::null(),
-            account_w.as_ptr(),
-            std::ptr::null_mut(),
-            &mut sid_len,
-            std::ptr::null_mut(),
-            &mut dom_len,
-            &mut sid_use,
-        );
-    }
-    anyhow::ensure!(
-        sid_len > 0,
-        "failed to query SID size for account {account}"
-    );
-    let mut sid = vec![0u8; sid_len as usize];
-    let mut dom = vec![0u16; dom_len as usize];
-    // SAFETY: 조회된 크기만큼 할당한 버퍼를 전달 — 수명은 이 함수 내
-    let ok = unsafe {
-        LookupAccountNameW(
-            std::ptr::null(),
-            account_w.as_ptr(),
-            sid.as_mut_ptr().cast(),
-            &mut sid_len,
-            dom.as_mut_ptr(),
-            &mut dom_len,
-            &mut sid_use,
-        )
-    };
-    anyhow::ensure!(ok != 0, "failed to look up SID for account {account}");
-
-    // SAFETY: zeroed LSA_OBJECT_ATTRIBUTES + Length 설정은 문서화된 초기화 규약
-    let mut attrs: LSA_OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
-    attrs.Length = std::mem::size_of::<LSA_OBJECT_ATTRIBUTES>() as u32;
-    let mut policy: isize = 0; // LSA_HANDLE (windows-sys 0.61에서 isize)
-    // SAFETY: 로컬 시스템(SystemName=null) 정책 열기 — 성공 시 LsaClose로 반드시 닫는다
-    let status = unsafe {
-        LsaOpenPolicy(
-            std::ptr::null(),
-            &attrs,
-            POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES,
-            &mut policy,
-        )
-    };
-    anyhow::ensure!(
-        status == 0,
-        "LsaOpenPolicy failed (win32 error {})",
-        unsafe { LsaNtStatusToWinError(status) }
-    );
-
-    let mut right: Vec<u16> = "SeServiceLogonRight".encode_utf16().collect();
-    let lsa_right = LSA_UNICODE_STRING {
-        Length: (right.len() * 2) as u16,
-        MaximumLength: (right.len() * 2) as u16,
-        Buffer: right.as_mut_ptr(),
-    };
-    // SAFETY: sid·lsa_right 버퍼는 호출 동안 유효 (지역 Vec). 이미 부여된 계정에는 멱등
-    let status =
-        unsafe { LsaAddAccountRights(policy, sid.as_ptr().cast_mut().cast(), &lsa_right, 1) };
-    // SAFETY: 위에서 성공적으로 연 정책 핸들
-    unsafe { LsaClose(policy) };
-    anyhow::ensure!(
-        status == 0,
-        "failed to grant SeServiceLogonRight (win32 error {})",
-        unsafe { LsaNtStatusToWinError(status) }
-    );
-    println!("service logon right (SeServiceLogonRight) granted: {account}");
-    Ok(())
 }
 
 // ---------------------------------------------------------------- 그 외 OS

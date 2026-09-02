@@ -364,6 +364,11 @@ fn write_token_file(token_id: &str, token: &str) -> anyhow::Result<PathBuf> {
 fn keychain_is_reliable() -> bool {
     // cfg!(런타임 분기)인 이유: cfg 속성으로 갈랐다가는 맥 전용 본문이 이 윈도우 개발
     // 머신의 검사(clippy·test)를 영영 안 거친다 — 전 플랫폼 컴파일로 검증 사각을 없앤다
+    // 윈도우 (2026-09-03): 데몬이 LocalSystem 서비스로 돌아 사용자의 자격 증명 저장소를 못
+    // 본다 — 토큰은 설정 디렉터리의 파일로 (기존 저장소 항목은 첫 읽기 때 파일로 자가 이전)
+    if cfg!(windows) {
+        return false;
+    }
     if !cfg!(target_os = "macos") {
         return true;
     }

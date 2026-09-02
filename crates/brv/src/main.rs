@@ -200,7 +200,7 @@ enum HookCmd {
 /// `brv daemon`의 서비스 등록 서브커맨드 (페이즈 7) — 무인자는 기존 포그라운드 실행.
 #[derive(Subcommand)]
 enum DaemonCmd {
-    /// Register as an OS service (linux=systemd user unit, macOS=launchd, windows=SCM service)
+    /// Register as an OS service (linux=systemd user unit, macOS=launchd, windows=SCM service as LocalSystem — run once from an administrator terminal; wakes run in your logged-on session)
     Install {
         /// Absolute path to the config file this service uses (default: OS path) — for multiple profiles
         #[arg(long)]
@@ -223,6 +223,9 @@ enum DaemonCmd {
     ServiceRun {
         #[arg(long)]
         config: Option<String>,
+        /// Wake sessions run as this logged-on user (the installer)
+        #[arg(long)]
+        wake_user: Option<String>,
     },
 }
 
@@ -233,7 +236,7 @@ fn main() -> anyhow::Result<()> {
     // SCM launch args에서 (에디션 2024의 unsafe set_var 대신 프로세스 내 override).
     // 런타임 진입 전에 분기 — SCM dispatcher는 자기 스레드를 점유한다
     if let Cmd::Daemon {
-        action: Some(DaemonCmd::ServiceRun { config }),
+        action: Some(DaemonCmd::ServiceRun { config, wake_user }),
         ..
     } = &cli.cmd
     {
@@ -243,11 +246,11 @@ fn main() -> anyhow::Result<()> {
                 config::set_path_override(c.into());
             }
             init_service_file_tracing()?;
-            return brv::service::service_run();
+            return brv::service::service_run(wake_user.clone());
         }
         #[cfg(not(windows))]
         {
-            let _ = config;
+            let _ = (config, wake_user);
             anyhow::bail!("service-run is Windows SCM only");
         }
     }
@@ -654,7 +657,14 @@ async fn wake_test(binding_sel: Option<&str>) -> anyhow::Result<()> {
         capped.timeout_s
     );
     let started = std::time::Instant::now();
-    let child = brv::daemon::spawn_wake(&capped, &dir, &binding.full_label(), prompt).await?;
+    let child = brv::daemon::spawn_wake(
+        &capped,
+        &dir,
+        &binding.full_label(),
+        prompt,
+        &brv::daemon::WakeSpawn::Direct,
+    )
+    .await?;
     println!("spawn OK — waiting for the session to exit...");
     let log_hint = config::config_path()?
         .parent()

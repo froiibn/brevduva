@@ -68,6 +68,59 @@ pub struct DaemonOptions {
     pub preflight: bool,
     /// 관문 재점검 기본 간격 (기본 60s → 최대 15분 — 테스트가 줄인다).
     pub wake_retry_base: Duration,
+    /// 깨우기를 어느 계정으로 띄우나 — 윈도우 시스템 서비스는 로그온한 사용자 세션에 (2026-09-03).
+    pub wake_spawn: WakeSpawn,
+}
+
+/// 깨우기 프로세스를 띄우는 방식 (2026-09-03, 윈도우 시스템 서비스 결정 — service.rs).
+#[derive(Clone, Debug, Default)]
+pub enum WakeSpawn {
+    /// 데몬 자신의 계정으로 (리눅스·맥·윈도우 작업 스케줄러·`brv wake test`).
+    #[default]
+    Direct,
+    /// 로그온한 사용자의 세션 안에 그 사용자 명의로 (윈도우 LocalSystem 서비스 — winspawn.rs).
+    /// `user`가 있으면 그 사용자의 세션만(설치자), 없으면 활성 세션 아무거나.
+    UserSession { user: Option<String> },
+}
+
+/// 깨울 사용자 세션이 없다 (윈도우 시스템 서비스에서 로그아웃 상태). 관문은 이 경우 백오프를
+/// 키우지 않고 기본 간격으로 재점검한다 — 로그온 직후 15분을 기다리게 하지 않기 위해.
+#[derive(Debug)]
+pub struct NoUserSession {
+    pub detail: String,
+}
+
+impl std::fmt::Display for NoUserSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no logged-on user session to wake in — {}", self.detail)
+    }
+}
+
+impl std::error::Error for NoUserSession {}
+
+/// 깨운 프로세스 — 스폰 방식에 따라 다른 핸들 (wait·kill만 필요).
+pub enum WakeChild {
+    Direct(Box<tokio::process::Child>), // Box: 변형 크기 차이(clippy) — Child가 272바이트
+    #[cfg(windows)]
+    UserSession(crate::winspawn::Child),
+}
+
+impl WakeChild {
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            WakeChild::Direct(c) => c.wait().await,
+            #[cfg(windows)]
+            WakeChild::UserSession(c) => c.wait().await,
+        }
+    }
+
+    pub async fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            WakeChild::Direct(c) => c.kill().await,
+            #[cfg(windows)]
+            WakeChild::UserSession(c) => c.kill(),
+        }
+    }
 }
 
 impl Default for DaemonOptions {
@@ -78,6 +131,7 @@ impl Default for DaemonOptions {
             fatal_retry_base: Duration::from_secs(30),
             preflight: false,
             wake_retry_base: Duration::from_secs(60),
+            wake_spawn: WakeSpawn::Direct,
         }
     }
 }
@@ -305,6 +359,7 @@ pub async fn run_with_options(
                 fatal_retry_base: opts.fatal_retry_base,
                 gate: opts.preflight,
                 wake_retry_base: opts.wake_retry_base,
+                wake_spawn: opts.wake_spawn.clone(),
                 shared: Arc::clone(&shared),
                 state_file: state_file.clone(),
                 journal: journal.clone(),
@@ -327,6 +382,7 @@ struct BindingRuntime {
     /// 깨우기 관문 (DaemonOptions::preflight) + 재점검 간격.
     gate: bool,
     wake_retry_base: Duration,
+    wake_spawn: WakeSpawn,
     shared: SharedState,
     state_file: PathBuf,
     journal: PathBuf,
@@ -334,14 +390,14 @@ struct BindingRuntime {
 }
 
 /// 기동 시 깨우기 사전 점검 — `brv wake test`와 같은 경로·같은 프롬프트, 상한 120초.
-async fn preflight_wake(wake: &WakeConfig, b: &Binding) -> anyhow::Result<f32> {
+async fn preflight_wake(wake: &WakeConfig, b: &Binding, spawn: &WakeSpawn) -> anyhow::Result<f32> {
     let dir = b.wake_dir.as_deref().context("no wake_dir")?;
     let capped = WakeConfig {
         timeout_s: wake.timeout_s.min(120),
         ..wake.clone()
     };
     let started = Instant::now();
-    let child = spawn_wake(&capped, dir, &b.full_label(), WAKE_TEST_PROMPT).await?;
+    let child = spawn_wake(&capped, dir, &b.full_label(), WAKE_TEST_PROMPT, spawn).await?;
     wait_wake(&capped, child).await?;
     Ok(started.elapsed().as_secs_f32())
 }
@@ -417,7 +473,7 @@ async fn binding_loop(
                 if shutdown_requested(&shutdown) {
                     return Ok(());
                 }
-                match preflight_wake(&wake, &binding).await {
+                match preflight_wake(&wake, &binding, &rt.wake_spawn).await {
                     Ok(secs) => {
                         tracing::info!(binding = %binding.label(), secs, "wake pre-flight ok — joining the channel");
                         set_status(
@@ -430,8 +486,13 @@ async fn binding_loop(
                         break;
                     }
                     Err(e) => {
-                        attempt += 1;
-                        let wait = gate_backoff(rt.wake_retry_base, attempt);
+                        // 로그아웃 상태(윈도우 서비스)는 백오프를 키우지 않는다 — 로그온하면 곧 붙는다
+                        let wait = if e.downcast_ref::<NoUserSession>().is_some() {
+                            rt.wake_retry_base
+                        } else {
+                            attempt += 1;
+                            gate_backoff(rt.wake_retry_base, attempt)
+                        };
                         tracing::error!(
                             binding = %binding.label(),
                             error = %e,
@@ -558,7 +619,7 @@ async fn binding_loop(
             // 재시도되고, 반복 실패는 max_deliver 소진 → 포이즌 표시로 대시보드에 드러난다.
             // 완주가 아니라 스폰을 기준으로 하는 이유: 장시간 깨우기 동안 미확인분이 재전달되는
             // 중복 폭주를 피하기 위함 (깨어난 세션의 크래시는 저널 + 세션 로그가 잡는다).
-            match spawn_wake(&wake, dir, &binding.full_label(), &prompt).await {
+            match spawn_wake(&wake, dir, &binding.full_label(), &prompt, &rt.wake_spawn).await {
                 Ok(child) => {
                     for (_, token) in &batch {
                         client.confirm(*token).await;
@@ -817,7 +878,8 @@ pub async fn spawn_wake(
     dir: &str,
     binding_label: &str,
     prompt: &str,
-) -> anyhow::Result<tokio::process::Child> {
+    spawn: &WakeSpawn,
+) -> anyhow::Result<WakeChild> {
     let args: Vec<String> = wake
         .args
         .iter()
@@ -841,19 +903,51 @@ pub async fn spawn_wake(
         .append(true)
         .open(&log_path)
         .with_context(|| format!("cannot open wake log {log_path:?}"))?;
-    let child = tokio::process::Command::new(&command)
-        .args(&args)
-        .current_dir(dir)
-        // 깨운 세션(과 그 자식 brv mcp)이 데몬과 같은 프로필·바인딩을 보게 (위 문서 주석)
-        .env("BREVDUVA_CONFIG", &config_path)
-        .env("BREVDUVA_BINDING", binding_label)
-        .stdout(std::process::Stdio::from(
-            log.try_clone().context("clone log handle")?,
-        ))
-        .stderr(std::process::Stdio::from(log))
-        .spawn()
-        .with_context(|| format!("cannot spawn wake command {command:?}"))?;
-    Ok(child)
+    match spawn {
+        WakeSpawn::Direct => {
+            let child = tokio::process::Command::new(&command)
+                .args(&args)
+                .current_dir(dir)
+                // 깨운 세션(과 그 자식 brv mcp)이 데몬과 같은 프로필·바인딩을 보게 (위 문서 주석)
+                .env("BREVDUVA_CONFIG", &config_path)
+                .env("BREVDUVA_BINDING", binding_label)
+                .stdout(std::process::Stdio::from(
+                    log.try_clone().context("clone log handle")?,
+                ))
+                .stderr(std::process::Stdio::from(log))
+                .spawn()
+                .with_context(|| format!("cannot spawn wake command {command:?}"))?;
+            Ok(WakeChild::Direct(Box::new(child)))
+        }
+        // 윈도우 시스템 서비스 (2026-09-03): 로그온한 사용자 세션에 그 사용자 명의로 —
+        // 환경·로그인·프로젝트 접근이 전부 사용자의 것. 같은 두 변수는 여기서도 덧씌운다
+        WakeSpawn::UserSession { user } => {
+            #[cfg(windows)]
+            {
+                let config_str = config_path.to_string_lossy();
+                let child = crate::winspawn::spawn(
+                    &command,
+                    &args,
+                    dir,
+                    &[
+                        ("BREVDUVA_CONFIG", &config_str),
+                        ("BREVDUVA_BINDING", binding_label),
+                    ],
+                    &log,
+                    user.as_deref(),
+                )
+                .with_context(|| {
+                    format!("cannot spawn wake command {command:?} in the user session")
+                })?;
+                Ok(WakeChild::UserSession(child))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (user, log);
+                anyhow::bail!("user-session wake is Windows-only (service mode)")
+            }
+        }
+    }
 }
 
 /// 깨우기 실패의 형태 — `could_not_start`(몇 초 안의 실패 종료 = 인증·경로·환경)는 데몬이
@@ -874,7 +968,7 @@ impl std::error::Error for WakeFailed {}
 
 /// 깨우기 완주 대기 — 타임아웃 시 강제 종료 (스폰과 분리: 확정 시점은 스폰).
 /// pub인 이유는 spawn_wake와 동일 (`brv wake test`).
-pub async fn wait_wake(wake: &WakeConfig, mut child: tokio::process::Child) -> anyhow::Result<()> {
+pub async fn wait_wake(wake: &WakeConfig, mut child: WakeChild) -> anyhow::Result<()> {
     let started = Instant::now();
     match tokio::time::timeout(Duration::from_secs(wake.timeout_s), child.wait()).await {
         Ok(Ok(status)) if status.success() => {
@@ -1089,7 +1183,7 @@ mod tests {
             },
             timeout_s: 30,
         };
-        let child = spawn_wake(&wake, ".", "backend@myapp", "test")
+        let child = spawn_wake(&wake, ".", "backend@myapp", "test", &WakeSpawn::Direct)
             .await
             .expect("wake command spawns");
         wait_wake(&wake, child).await.expect("wake command runs");
