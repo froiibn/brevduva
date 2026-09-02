@@ -31,7 +31,16 @@ try {
 
     Expand-Archive "$tmp\$asset" -DestinationPath $tmp -Force
     New-Item -ItemType Directory -Force $dest | Out-Null
-    Copy-Item "$tmp\brv.exe" (Join-Path $dest "brv.exe") -Force
+    $target = Join-Path $dest "brv.exe"
+    # 실행 중인 데몬이 잠근 파일은 덮어쓸 수 없다 (2026-09-03) — 이름을 바꿔 비켜 두고
+    # (실행 중에도 허용) 새 파일을 놓는다. 비켜 둔 옛 파일은 다음 설치 때 지운다
+    if (Test-Path $target) {
+        $old = "$target.old"
+        if (Test-Path $old) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $old) { $old = "$target.old." + [guid]::NewGuid().ToString("n") }
+        Move-Item $target $old -Force
+    }
+    Copy-Item "$tmp\brv.exe" $target -Force
 }
 finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -45,6 +54,11 @@ if (($userPath -split ';') -notcontains $dest) {
     [Environment]::SetEnvironmentVariable("Path", "$userPath;$dest", "User")
     Write-Host "added $dest to your user PATH — new terminals pick it up"
 }
+
+# 갱신이면 돌고 있는 서비스 데몬을 새 바이너리로 재기동 (2026-09-03) — 서비스가 없으면 조용히 지나간다
+$eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+& $exe daemon restart 2>$null
+$ErrorActionPreference = $eap
 
 Write-Host ""
 Write-Host "next — connect this machine to your account:"

@@ -95,6 +95,10 @@ case ":$PATH:" in
     fi ;;
 esac
 
+# 갱신이면 돌고 있는 서비스 데몬을 새 바이너리로 재기동 (2026-09-03, 사용자 지적 "갱신마다
+# launchctl을 쳐야 하나") — 서비스가 없으면 조용히 지나간다 (brv daemon restart의 미등록 오류 숨김)
+"$dest/brv" daemon restart 2>/dev/null || true
+
 echo ""
 echo "next — connect this machine to your account:"
 echo "  1) https://brevduva.dev dashboard → Connect a machine → issue an enroll code (starts with brvenr_)"
