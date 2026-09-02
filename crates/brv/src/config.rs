@@ -388,22 +388,37 @@ fn restrict_dir_windows(dir: &Path) -> anyhow::Result<()> {
     if sid == "S-1-5-18" {
         return Ok(());
     }
-    let out = std::process::Command::new("icacls")
-        .arg(dir)
-        .args([
+    let icacls = |target: &Path, args: &[&str]| -> anyhow::Result<()> {
+        let out = std::process::Command::new("icacls")
+            .arg(target)
+            .args(args)
+            .output()
+            .context("icacls")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "icacls failed: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+        Ok(())
+    };
+    // ① 디렉터리 — 상속을 끊고 세 주체만. `(OI)(CI)`는 앞으로 만들 파일이 물려받게 한다
+    icacls(
+        dir,
+        &[
             "/inheritance:r",
             "/grant:r",
             "*S-1-5-18:(OI)(CI)F", // SYSTEM — LocalSystem 데몬 서비스가 읽는다
             "*S-1-5-32-544:(OI)(CI)F", // Administrators
-        ])
-        .arg(format!("*{sid}:(OI)(CI)F")) // 소유자
-        .output()
-        .context("icacls")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "icacls failed: {}",
-        String::from_utf8_lossy(&out.stdout).trim()
-    );
+            &format!("*{sid}:(OI)(CI)F"), // 소유자
+        ],
+    )?;
+    // ② 이미 있던 파일 — ①만으로는 **예전 권한을 explicit ACE로 굳힌 채 남는다**(상속이
+    //    끊기며 그대로 복사됨). 갱신 머신에서는 정작 지금 쓰는 토큰이 노출된 채라 의미가 없다.
+    //    ①에 `/T`를 붙이는 방법은 못 쓴다 — `(OI)(CI)`는 파일에 의미가 없어 무시되고, 실측
+    //    (2026-09-03) 결과 **파일의 ACE가 전부 사라져 아무도 못 읽는 상태**가 됐다.
+    //    그래서 자식만 상속 전용으로 초기화해 ①의 ACE를 물려받게 한다. 빈 디렉터리면
+    //    와일드카드가 아무것도 못 찾아 실패하는데, 그건 고칠 파일이 없다는 뜻이라 무시한다
+    let _ = icacls(&dir.join("*"), &["/reset", "/T", "/C", "/Q"]);
     Ok(())
 }
 
@@ -591,25 +606,36 @@ mod tests {
     fn config_dir_is_locked_to_the_owner_on_windows() {
         let dir = std::env::temp_dir().join(format!("brv-acl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
+        // 좁히기 **전에** 만들어 둔 파일 — 갱신 머신에 이미 있던 토큰 파일에 해당한다
+        let existing = dir.join("token-existing");
+        std::fs::write(&existing, "brv_x").expect("token file");
         restrict_dir_windows(&dir).expect("restrict");
-        let out = std::process::Command::new("icacls")
-            .arg(&dir)
-            .output()
-            .expect("icacls");
-        let acl = String::from_utf8_lossy(&out.stdout).into_owned();
+        let acl_of = |p: &Path| {
+            let out = std::process::Command::new("icacls")
+                .arg(p)
+                .output()
+                .expect("icacls");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let (dir_acl, file_acl) = (acl_of(&dir), acl_of(&existing));
         std::fs::remove_dir_all(&dir).ok();
         // 그룹 이름은 OS 언어에 따라 달라지므로 **주체 수**로 검사한다 — 딱 셋만 남아야 한다
         // (SYSTEM·Administrators·소유자). 넷째가 생기면 Users류가 되살아난 것
-        let granted = acl.lines().filter(|l| l.contains(":(OI)(CI)(F)")).count();
-        assert_eq!(granted, 3, "exactly three principals may reach it: {acl:?}");
+        let principals = |acl: &str| acl.lines().filter(|l| l.contains(":(")).count();
+        assert_eq!(principals(&dir_acl), 3, "directory: {dir_acl:?}");
+        assert_eq!(
+            principals(&file_acl),
+            3,
+            "a file that predates the fix must be narrowed too: {file_acl:?}"
+        );
         // 소유자 계정은 로컬라이즈되지 않는다 — 자기 자신이 남았는지는 이름으로 확인
         let me = std::process::Command::new("whoami")
             .output()
             .expect("whoami");
         let me = String::from_utf8_lossy(&me.stdout).trim().to_lowercase();
         assert!(
-            acl.to_lowercase().contains(&me),
-            "the owner must keep access: {acl:?}"
+            file_acl.to_lowercase().contains(&me),
+            "the owner must keep access: {file_acl:?}"
         );
     }
 
