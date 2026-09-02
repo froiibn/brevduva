@@ -699,7 +699,7 @@ pub const WAKE_TEST_PROMPT: &str = "This is `brv wake test` — a harness self-c
 /// 구분자를 `/`·`\` 모두로 자르는 이유: 윈도우 설정의 백슬래시 경로를 리눅스 CI가 검사한다
 /// (2026-09-03 CI 실측 — `Path::file_stem`은 호스트 OS 구분자만 안다).
 fn is_claude_runner(command: &str) -> bool {
-    let name = command.rsplit(['/', '\']).next().unwrap_or(command);
+    let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
     let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
     stem.eq_ignore_ascii_case("claude")
 }
