@@ -382,12 +382,6 @@ pub fn secure_config_dir() {
 #[cfg(windows)]
 fn restrict_dir_windows(dir: &Path) -> anyhow::Result<()> {
     let sid = user_sid()?;
-    // 서비스(LocalSystem)로 도는 중이면 손대지 않는다 — 이 문맥의 "현재 사용자"는 SYSTEM이라
-    // 그대로 좁히면 정작 사람이 자기 설정을 못 읽게 된다. 권한은 사용자 문맥 명령이 건다
-    // (`brv daemon install`·enroll·설정 저장) — 데몬은 SYSTEM이라 이미 접근권이 있다
-    if sid == "S-1-5-18" {
-        return Ok(());
-    }
     let icacls = |target: &Path, args: &[&str]| -> anyhow::Result<()> {
         let out = std::process::Command::new("icacls")
             .arg(target)
@@ -401,23 +395,32 @@ fn restrict_dir_windows(dir: &Path) -> anyhow::Result<()> {
         );
         Ok(())
     };
-    // ① 디렉터리 — 상속을 끊고 세 주체만. `(OI)(CI)`는 앞으로 만들 파일이 물려받게 한다
-    icacls(
-        dir,
-        &[
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F", // SYSTEM — LocalSystem 데몬 서비스가 읽는다
-            "*S-1-5-32-544:(OI)(CI)F", // Administrators
-            &format!("*{sid}:(OI)(CI)F"), // 소유자
-        ],
-    )?;
+    // ① 디렉터리 — 상속을 끊고 세 주체만. `(OI)(CI)`는 앞으로 만들 파일이 물려받게 한다.
+    //    사용자 문맥에서만 한다: 서비스(LocalSystem)의 "현재 사용자"는 SYSTEM이라 그대로
+    //    좁히면 정작 사람이 자기 설정을 못 읽는다. 규칙은 `brv daemon install`·enroll·설정
+    //    저장이 세우고, 서비스는 그 규칙을 따르기만 한다
+    if sid != "S-1-5-18" {
+        icacls(
+            dir,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F", // SYSTEM — LocalSystem 데몬 서비스가 읽는다
+                "*S-1-5-32-544:(OI)(CI)F", // Administrators
+                &format!("*{sid}:(OI)(CI)F"), // 소유자
+            ],
+        )?;
+    }
     // ② 이미 있던 파일 — ①만으로는 **예전 권한을 explicit ACE로 굳힌 채 남는다**(상속이
     //    끊기며 그대로 복사됨). 갱신 머신에서는 정작 지금 쓰는 토큰이 노출된 채라 의미가 없다.
     //    ①에 `/T`를 붙이는 방법은 못 쓴다 — `(OI)(CI)`는 파일에 의미가 없어 무시되고, 실측
     //    (2026-09-03) 결과 **파일의 ACE가 전부 사라져 아무도 못 읽는 상태**가 됐다.
-    //    그래서 자식만 상속 전용으로 초기화해 ①의 ACE를 물려받게 한다. 빈 디렉터리면
-    //    와일드카드가 아무것도 못 찾아 실패하는데, 그건 고칠 파일이 없다는 뜻이라 무시한다
+    //    그래서 자식만 상속 전용으로 초기화해 ①의 ACE를 물려받게 한다. 소유자 SID가 필요
+    //    없는 단계라 **두 문맥 모두** 수행한다 — 서비스가 만든 파일(토큰·상태·로그)은 소유자가
+    //    SYSTEM이라 사람이 고칠 수 없고, 사람이 만든 파일은 그 반대다. 서로의 사각을 메운다.
+    //    실측(2026-09-03): 관리자 터미널의 install이 만든 토큰 파일은 사용자 문맥에서
+    //    "Access is denied"로 남았고, 서비스가 다음 기동에 스스로 고쳤다.
+    //    빈 디렉터리면 와일드카드가 아무것도 못 찾아 실패하는데, 고칠 파일이 없다는 뜻이다
     let _ = icacls(&dir.join("*"), &["/reset", "/T", "/C", "/Q"]);
     Ok(())
 }
