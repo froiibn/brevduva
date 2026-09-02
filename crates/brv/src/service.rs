@@ -270,7 +270,9 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     let user = std::env::var("USERNAME").context("USERNAME env")?;
 
     // 토큰을 파일로 — 시스템 계정은 사용자의 자격 증명 저장소를 못 본다. 윈도우의 load_token은
-    // 파일 우선 + 저장소→파일 자가 이전이라, 여기서 한 번 돌려 서비스가 읽을 파일을 보장한다
+    // 파일 우선 + 저장소→파일 자가 이전이라, 여기서 한 번 돌려 서비스가 읽을 파일을 보장한다.
+    // 평문 파일이 되므로 디렉터리 권한을 먼저 좁힌다 (2026-09-03 — config::secure_config_dir)
+    crate::config::secure_config_dir();
     let cfg = crate::config::load()?;
     crate::config::load_tokens(&cfg)
         .context("every binding's token must be readable before registering the service")?;
@@ -332,7 +334,7 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn grant_service_control(user: &str) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    let sid = user_sid().with_context(|| format!("SID of {user}"))?;
+    let sid = crate::config::user_sid().with_context(|| format!("SID of {user}"))?;
     let out = std::process::Command::new("sc.exe")
         .args(["sdshow", SERVICE_NAME])
         .output()
@@ -360,29 +362,6 @@ fn grant_service_control(user: &str) -> anyhow::Result<()> {
         .context("sc.exe sdset")?;
     anyhow::ensure!(status.success(), "sc sdset failed ({status})");
     Ok(())
-}
-
-/// 현재 사용자의 SID 문자열 — 내장 `whoami /user` 출력에서 (LookupAccountName FFI 회피).
-#[cfg(windows)]
-fn user_sid() -> anyhow::Result<String> {
-    let out = std::process::Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // "DOMAIN\user","S-1-5-21-…"
-    let sid = text
-        .trim()
-        .rsplit(',')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches('"')
-        .to_owned();
-    anyhow::ensure!(
-        sid.starts_with("S-1-"),
-        "cannot read the user SID from whoami: {text:?}"
-    );
-    Ok(sid)
 }
 
 /// 같은 이름의 작업 스케줄러 작업이 **활성** 상태인가 — 비활성(Disabled)은 경고하지 않는다.

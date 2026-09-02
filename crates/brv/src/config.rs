@@ -14,6 +14,8 @@
 //! channel/agent + [wake]의 dir/policy)은 읽기 시 바인딩 1개로 해석한다 (하위 호환 —
 //! 기존 머신은 재설정 불요, 다음 저장 때 신형으로 이행).
 
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -318,6 +320,7 @@ pub fn parse(text: &str) -> anyhow::Result<BrvConfig> {
 pub fn store(cfg: &BrvConfig) -> anyhow::Result<PathBuf> {
     let path = config_path()?;
     std::fs::create_dir_all(path.parent().expect("config path has parent"))?;
+    secure_config_dir();
     std::fs::write(&path, toml::to_string_pretty(cfg)?)?;
     Ok(path)
 }
@@ -344,9 +347,96 @@ fn token_file(token_id: &str) -> anyhow::Result<PathBuf> {
         .join(format!("token-{}", token_id.replace('/', "-"))))
 }
 
+/// 설정 디렉터리를 소유자·SYSTEM·관리자만 접근하도록 좁힌다 (2026-09-03, 사용자 지시).
+///
+/// 유닉스는 토큰 파일을 0600으로 쓰므로 여기서 할 일이 없다. **윈도우는 종전에 아무 처리도
+/// 없어** 상위 폴더 권한을 그대로 물려받았다 — `C:\brevduva` 실측에서 `BUILTIN\Users` 읽기·
+/// `Authenticated Users` 수정이 상속돼 같은 PC의 다른 계정이 토큰을 읽고 덮어쓸 수 있었다.
+/// 2026-09-03 데몬이 LocalSystem 서비스가 되며 토큰이 자격 증명 관리자(계정별 암호화)에서
+/// 평문 파일로 내려왔으므로, 이 구멍은 곧 자격 증명 노출이다.
+///
+/// 토큰만이 아니라 저널(주고받은 메시지 본문)·설정이 같은 폴더에 있어 **디렉터리 단위**로
+/// 건다. 프로세스당 1회 — enroll·설정 저장마다 다시 걸 이유가 없다. 실패는 경고만:
+/// 권한 조정이 안 된다고 enroll 자체를 막으면 더 나쁘다.
+pub fn secure_config_dir() {
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let result = config_path()
+                .map(|p| p.parent().expect("config has parent").to_path_buf())
+                .and_then(|dir| restrict_dir_windows(&dir));
+            if let Err(e) = result {
+                eprintln!(
+                    "warning: could not restrict permissions on the config directory — other accounts on this PC may be able to read the token: {e}"
+                );
+            }
+        });
+    }
+}
+
+/// `icacls`로 디렉터리 DACL 재작성 — 보안 설명자 API의 FFI를 늘리지 않는다 (service.rs의
+/// `sc sdset`과 같은 판단). 상속을 끊고(`/inheritance:r`) 세 주체만 남긴다. `(OI)(CI)`는
+/// 하위 파일·폴더로 상속되므로 이후 만들어지는 토큰 파일이 좁힌 권한을 물려받는다.
+/// 소유자는 DACL 쓰기 권한을 늘 가지므로 관리자 승격이 필요 없다.
+#[cfg(windows)]
+fn restrict_dir_windows(dir: &Path) -> anyhow::Result<()> {
+    let sid = user_sid()?;
+    // 서비스(LocalSystem)로 도는 중이면 손대지 않는다 — 이 문맥의 "현재 사용자"는 SYSTEM이라
+    // 그대로 좁히면 정작 사람이 자기 설정을 못 읽게 된다. 권한은 사용자 문맥 명령이 건다
+    // (`brv daemon install`·enroll·설정 저장) — 데몬은 SYSTEM이라 이미 접근권이 있다
+    if sid == "S-1-5-18" {
+        return Ok(());
+    }
+    let out = std::process::Command::new("icacls")
+        .arg(dir)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F", // SYSTEM — LocalSystem 데몬 서비스가 읽는다
+            "*S-1-5-32-544:(OI)(CI)F", // Administrators
+        ])
+        .arg(format!("*{sid}:(OI)(CI)F")) // 소유자
+        .output()
+        .context("icacls")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "icacls failed: {}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+    Ok(())
+}
+
+/// 현재 사용자의 SID 문자열 — 내장 `whoami`로 (LookupAccountName FFI 회피).
+/// service.rs의 서비스 DACL 부여도 이걸 쓴다.
+#[cfg(windows)]
+pub(crate) fn user_sid() -> anyhow::Result<String> {
+    let out = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .context("whoami")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "DOMAIN\user","S-1-5-21-…" — 마지막 열이 SID
+    let sid = text
+        .trim()
+        .rsplit(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .to_owned();
+    anyhow::ensure!(
+        sid.starts_with("S-1-"),
+        "cannot read the user SID from whoami: {text:?}"
+    );
+    Ok(sid)
+}
+
 fn write_token_file(token_id: &str, token: &str) -> anyhow::Result<PathBuf> {
     let path = token_file(token_id)?;
     std::fs::create_dir_all(path.parent().expect("token path has parent"))?;
+    // 파일을 만들기 **전에** 좁힌다 — 새 파일이 좁혀진 권한을 상속받게 (윈도우)
+    secure_config_dir();
     std::fs::write(&path, token).with_context(|| format!("token file write failed at {path:?}"))?;
     #[cfg(unix)]
     {
@@ -429,12 +519,15 @@ pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> 
                 .map(|t| t.trim().to_owned())
         })
     };
-    let from_keyring = |ids: &[String]| {
-        ids.iter()
-            .find_map(|c| keyring_entry(&cfg.server, c).ok()?.get_password().ok())
+    // 어느 키로 찾았는지까지 돌려준다 — 자가 이전 후 그 항목을 지우기 위해 (2026-09-03)
+    let from_keyring = |ids: &[String]| -> Option<(String, String)> {
+        ids.iter().find_map(|c| {
+            let token = keyring_entry(&cfg.server, c).ok()?.get_password().ok()?;
+            Some((c.clone(), token))
+        })
     };
     if keychain_is_reliable() {
-        if let Some(t) = from_keyring(&ids) {
+        if let Some((_, t)) = from_keyring(&ids) {
             return Ok(t);
         }
         if let Some(t) = from_files(&ids) {
@@ -444,8 +537,18 @@ pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> 
         if let Some(t) = from_files(&ids) {
             return Ok(t);
         }
-        if let Some(t) = from_keyring(&ids) {
-            let _ = write_token_file(&id, &t); // 자가 이전 — 다음부터 프롬프트 없음
+        if let Some((_found_id, t)) = from_keyring(&ids) {
+            // 자가 이전 — 다음부터 저장소를 건드리지 않는다
+            if write_token_file(&id, &t).is_ok() {
+                // 윈도우 (2026-09-03): 이전이 끝나면 저장소의 사본은 **회수되지 않는 두 번째
+                // 비밀**이다 (대시보드의 연결 회수는 서버 토큰만 바꾼다) — 지운다.
+                // 맥은 지우기도 프롬프트를 띄우는데 프롬프트 회피가 파일 이전의 이유였으므로
+                // 손대지 않는다 (서명 배포로 키체인에 복귀할 때 그 항목이 그대로 쓰인다)
+                #[cfg(windows)]
+                if let Ok(entry) = keyring_entry(&cfg.server, &_found_id) {
+                    let _ = entry.delete_credential();
+                }
+            }
             return Ok(t);
         }
     }
@@ -479,6 +582,36 @@ pub fn load_tokens(cfg: &BrvConfig) -> anyhow::Result<std::collections::HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-03 (사용자 지시 "토큰 파일은 암호화 되는건가?"): 윈도우 설정 디렉터리는
+    /// 소유자·SYSTEM·관리자만 접근할 수 있어야 한다 — 종전에는 상위 폴더의 `Users` 읽기·
+    /// `Authenticated Users` 수정이 상속돼 같은 PC의 다른 계정이 평문 토큰을 읽을 수 있었다.
+    #[cfg(windows)]
+    #[test]
+    fn config_dir_is_locked_to_the_owner_on_windows() {
+        let dir = std::env::temp_dir().join(format!("brv-acl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        restrict_dir_windows(&dir).expect("restrict");
+        let out = std::process::Command::new("icacls")
+            .arg(&dir)
+            .output()
+            .expect("icacls");
+        let acl = String::from_utf8_lossy(&out.stdout).into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        // 그룹 이름은 OS 언어에 따라 달라지므로 **주체 수**로 검사한다 — 딱 셋만 남아야 한다
+        // (SYSTEM·Administrators·소유자). 넷째가 생기면 Users류가 되살아난 것
+        let granted = acl.lines().filter(|l| l.contains(":(OI)(CI)(F)")).count();
+        assert_eq!(granted, 3, "exactly three principals may reach it: {acl:?}");
+        // 소유자 계정은 로컬라이즈되지 않는다 — 자기 자신이 남았는지는 이름으로 확인
+        let me = std::process::Command::new("whoami")
+            .output()
+            .expect("whoami");
+        let me = String::from_utf8_lossy(&me.stdout).trim().to_lowercase();
+        assert!(
+            acl.to_lowercase().contains(&me),
+            "the owner must keep access: {acl:?}"
+        );
+    }
 
     #[test]
     fn wake_presets_widen_monotonically() {

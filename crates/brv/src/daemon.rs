@@ -304,6 +304,9 @@ pub async fn run_with_options(
     opts: DaemonOptions,
 ) -> anyhow::Result<()> {
     let shutdown = opts.shutdown;
+    // 설정 디렉터리 권한 보정 (2026-09-03) — 토큰이 평문 파일이라 사람 문맥에서 기동한
+    // 데몬이 매번 다시 좁힌다. 서비스(SYSTEM)로 도는 중에는 스스로 건너뛴다 (config 주석)
+    crate::config::secure_config_dir();
     let wake = cfg.wake.clone().context(
         "daemon requires a `[wake]` section in config.toml — define what wakes a session (command)",
     )?;
