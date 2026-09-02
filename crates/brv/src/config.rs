@@ -3,9 +3,15 @@
 
 //! brv 설정 — 파일(비밀 제외) + OS 키체인(토큰).
 //!
-//! 원칙(PLAN·PROTOCOL 5.1): 클라이언트에 비밀 없음 — 토큰은 OS 키체인에 보관하고
-//! 설정 파일에는 넣지 않는다. 키체인이 없는 환경(일부 headless 리눅스)은
-//! `BREVDUVA_TOKEN` 환경 변수(단일 바인딩 전용)나 토큰 파일로 대체할 수 있다.
+//! 원칙(PLAN·PROTOCOL 5.1): 클라이언트에 비밀 없음 — 토큰은 설정 파일 본문에 넣지 않는다.
+//! 보관처는 OS 키체인, 아니면 설정 디렉터리의 별도 토큰 파일이다. 키체인이 없는 환경(일부
+//! headless 리눅스)과 **윈도우**(2026-09-03 — 데몬이 LocalSystem 서비스라 사용자 자격 증명
+//! 저장소를 못 본다), 서명 없는 맥 빌드(프롬프트 폭풍)는 파일을 쓴다. `BREVDUVA_TOKEN`
+//! 환경 변수도 대체 경로다(단일 바인딩 전용).
+//!
+//! 파일 보관은 곧 **평문 보관**이라 접근 통제가 저장의 일부다 — `secure_config_dir()`가
+//! 설정 디렉터리를 소유자 전용으로 좁힌다(유닉스 0700, 윈도우 DACL). 토큰뿐 아니라
+//! 저널(주고받은 메시지 본문)이 같은 폴더에 살기 때문에 파일이 아니라 디렉터리 단위다.
 //!
 //! **다중 바인딩 (페이즈 27)**: 한 머신의 brv 프로세스 하나가 여러 (에이전트, 채널)
 //! 바인딩을 수신한다. 설정은 전역(server, `[wake]` 공통)과 `[[binding]]` 배열로 나뉜다 —
@@ -14,9 +20,7 @@
 //! channel/agent + [wake]의 dir/policy)은 읽기 시 바인딩 1개로 해석한다 (하위 호환 —
 //! 기존 머신은 재설정 불요, 다음 저장 때 신형으로 이행).
 
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -359,28 +363,36 @@ fn token_file(token_id: &str) -> anyhow::Result<PathBuf> {
 /// 건다. 프로세스당 1회 — enroll·설정 저장마다 다시 걸 이유가 없다. 실패는 경고만:
 /// 권한 조정이 안 된다고 enroll 자체를 막으면 더 나쁘다.
 pub fn secure_config_dir() {
-    #[cfg(windows)]
-    {
-        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        ONCE.get_or_init(|| {
-            let result = config_path()
-                .map(|p| p.parent().expect("config has parent").to_path_buf())
-                .and_then(|dir| restrict_dir_windows(&dir));
-            if let Err(e) = result {
-                eprintln!(
-                    "warning: could not restrict permissions on the config directory — other accounts on this PC may be able to read the token: {e}"
-                );
-            }
-        });
-    }
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let result = config_path()
+            .map(|p| p.parent().expect("config has parent").to_path_buf())
+            .and_then(|dir| restrict_dir(&dir));
+        if let Err(e) = result {
+            eprintln!(
+                "warning: could not restrict permissions on the config directory — other accounts on this machine may be able to read the token and the message journal: {e}"
+            );
+        }
+    });
 }
 
-/// `icacls`로 디렉터리 DACL 재작성 — 보안 설명자 API의 FFI를 늘리지 않는다 (service.rs의
-/// `sc sdset`과 같은 판단). 상속을 끊고(`/inheritance:r`) 세 주체만 남긴다. `(OI)(CI)`는
-/// 하위 파일·폴더로 상속되므로 이후 만들어지는 토큰 파일이 좁힌 권한을 물려받는다.
+/// 유닉스: 디렉터리 자체를 0700으로. 토큰 파일은 이미 0600이지만 **저널(주고받은 메시지
+/// 본문)과 wake 로그는 0664**여서 같은 머신의 다른 계정이 읽을 수 있었다 (2026-09-03 실측:
+/// 리눅스 서버의 `~/.config/brevduva`가 775, 저널이 664). 디렉터리에서 막으면 안쪽 파일의
+/// 모드와 무관하게 접근 자체가 끊긴다 — 파일마다 모드를 챙기는 것보다 빠뜨릴 구석이 없다.
+#[cfg(unix)]
+fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 700 {dir:?}"))
+}
+
+/// 윈도우: `icacls`로 디렉터리 DACL 재작성 — 보안 설명자 API의 FFI를 늘리지 않는다
+/// (service.rs의 `sc sdset`과 같은 판단). 상속을 끊고(`/inheritance:r`) 세 주체만 남긴다.
+/// `(OI)(CI)`는 하위 파일·폴더로 상속되므로 이후 만들어지는 토큰 파일이 좁힌 권한을 물려받는다.
 /// 소유자는 DACL 쓰기 권한을 늘 가지므로 관리자 승격이 필요 없다.
 #[cfg(windows)]
-fn restrict_dir_windows(dir: &Path) -> anyhow::Result<()> {
+fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
     let sid = user_sid()?;
     let icacls = |target: &Path, args: &[&str]| -> anyhow::Result<()> {
         let out = std::process::Command::new("icacls")
@@ -604,6 +616,24 @@ mod tests {
     /// 2026-09-03 (사용자 지시 "토큰 파일은 암호화 되는건가?"): 윈도우 설정 디렉터리는
     /// 소유자·SYSTEM·관리자만 접근할 수 있어야 한다 — 종전에는 상위 폴더의 `Users` 읽기·
     /// `Authenticated Users` 수정이 상속돼 같은 PC의 다른 계정이 평문 토큰을 읽을 수 있었다.
+    /// 2026-09-03 (같은 발단): 유닉스는 디렉터리 자체를 0700으로 — 토큰(0600)은 이미
+    /// 안전했지만 저널(0664, 메시지 본문)이 같은 머신의 다른 계정에게 열려 있었다.
+    #[cfg(unix)]
+    #[test]
+    fn config_dir_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("brv-mode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("loosen");
+        restrict_dir(&dir).expect("restrict");
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            mode, 0o700,
+            "group and others must not reach the config dir"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn config_dir_is_locked_to_the_owner_on_windows() {
@@ -612,7 +642,7 @@ mod tests {
         // 좁히기 **전에** 만들어 둔 파일 — 갱신 머신에 이미 있던 토큰 파일에 해당한다
         let existing = dir.join("token-existing");
         std::fs::write(&existing, "brv_x").expect("token file");
-        restrict_dir_windows(&dir).expect("restrict");
+        restrict_dir(&dir).expect("restrict");
         let acl_of = |p: &Path| {
             let out = std::process::Command::new("icacls")
                 .arg(p)
