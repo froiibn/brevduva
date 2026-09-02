@@ -98,6 +98,23 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 등록된 서비스 재기동 (2026-09-02, 맥북 실사고: 설정·토큰을 바꿔도 돌던 데몬은 모른다).
+/// Ok(false) = 서비스 미등록 (호출자가 "직접 재시작하라" 안내). 설정 변경 명령들이 호출한다.
+#[cfg(target_os = "linux")]
+pub fn restart() -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    let unit = dirs::config_dir()
+        .context("cannot resolve config dir")?
+        .join("systemd")
+        .join("user")
+        .join(format!("{SERVICE_NAME}.service"));
+    if !unit.exists() {
+        return Ok(false);
+    }
+    run_cmd("systemctl", &["--user", "restart", SERVICE_NAME])?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------- macOS: LaunchAgent
 
 #[cfg(target_os = "macos")]
@@ -191,6 +208,27 @@ pub fn uninstall() -> anyhow::Result<()> {
     }
     println!("unregistered: {LAUNCHD_LABEL}");
     Ok(())
+}
+
+/// 등록된 LaunchAgent 재기동 — `kickstart -k`는 돌고 있으면 죽이고 다시 띄운다 (linux restart 참조).
+#[cfg(target_os = "macos")]
+pub fn restart() -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    let plist = dirs::home_dir()
+        .context("cannot resolve home dir")?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+    if !plist.exists() {
+        return Ok(false);
+    }
+    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
+        .trim()
+        .to_owned();
+    run_cmd(
+        "launchctl",
+        &["kickstart", "-k", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
+    )?;
+    Ok(true)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -297,6 +335,45 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 등록된 SCM 서비스 재기동 (linux restart 참조). 미등록이면 Ok(false) — 작업 스케줄러 등
+/// 다른 상주 방식은 여기서 모른다 (호출자가 직접 재시작 안내).
+#[cfg(windows)]
+pub fn restart() -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("failed to open the service manager")?;
+    let Ok(service) = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    ) else {
+        return Ok(false);
+    };
+    if service
+        .query_status()
+        .map(|s| s.current_state != ServiceState::Stopped)
+        .unwrap_or(false)
+    {
+        let _ = service.stop();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if service
+                .query_status()
+                .map(|s| s.current_state == ServiceState::Stopped)
+                .unwrap_or(true)
+            {
+                break;
+            }
+        }
+    }
+    service
+        .start::<&std::ffi::OsStr>(&[])
+        .context("failed to start the service (administrator rights may be required)")?;
+    Ok(true)
+}
+
 /// SCM이 서비스 프로세스로 이 바이너리를 띄울 때의 진입점 (`brv daemon service-run`).
 /// 콘솔이 없으므로 로그는 main에서 파일로 초기화돼 있다. 설정 경로 override도 main에서.
 #[cfg(windows)]
@@ -360,7 +437,20 @@ fn run_service() -> anyhow::Result<()> {
         let cfg = crate::config::load()?;
         // 전 바인딩 토큰 일괄 로드 (페이즈 27) — 하나라도 없으면 기동 거부가 정직하다
         let tokens = crate::config::load_tokens(&cfg)?;
-        crate::daemon::run_with_shutdown(cfg, tokens, Some(stop_rx)).await
+        let reload_cfg = cfg.clone();
+        crate::daemon::run_with_options(
+            cfg,
+            tokens,
+            crate::daemon::DaemonOptions {
+                shutdown: Some(stop_rx),
+                token_reload: Some(std::sync::Arc::new(move |b: &crate::config::Binding| {
+                    crate::config::load_token(&reload_cfg, b).ok()
+                })),
+                preflight: true,
+                ..Default::default()
+            },
+        )
+        .await
     });
     set_status(
         &status_handle,
@@ -495,4 +585,9 @@ pub fn install(_config: Option<&str>) -> anyhow::Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn uninstall() -> anyhow::Result<()> {
     anyhow::bail!("service registration is not supported on this OS")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn restart() -> anyhow::Result<bool> {
+    Ok(false)
 }

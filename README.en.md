@@ -80,7 +80,9 @@ Good to know:
 - When a request exceeds the allowance, the woken agent replies to the sender that "this machine's wake permission blocks it" instead of doing it — raise `--allow` then if you want
 - The daemon service runs in the current user's context (keychain and CLI-login access); pin a specific profile with `brv daemon install --config <absolute path>`. Remove with `brv daemon uninstall`
 - With multiple bindings: the allowance (`--allow`), executable, and timeout are machine-global, while the working directory and whether to wake are per binding — `brv wake set --dir <project> --binding {agent}@{channel}`, verify with `brv wake test --binding …`
-- The daemon **automatically propagates its config path (`BREVDUVA_CONFIG`) and the waking binding (`BREVDUVA_BINDING`)** to woken sessions — the session's `brv mcp` connects with the same profile and identity as the daemon, no extra setup. On Windows, `.cmd/.bat` runners are automatically routed through `cmd /d /c` (guaranteed spawn even in Task Scheduler environments)
+- The daemon **automatically propagates its config path (`BREVDUVA_CONFIG`) and the waking binding (`BREVDUVA_BINDING`)** to woken sessions, and when the runner is Claude Code it **injects the local `brevduva` MCP server via `--mcp-config`** — unattended sessions always have the `mcp__brevduva__*` tools, even with no or a stale user-scope registration. On Windows, `.cmd/.bat` runners are automatically routed through `cmd /d /c` (guaranteed spawn even in Task Scheduler environments)
+- On start, the daemon runs a **wake pre-flight** once (one harmless prompt) — problems like an expired runner login are caught before any message arrives and recorded for `brv status`
+- Commands that change the config (`brv init --enroll`, `binding add/remove`, `wake set`) **restart a daemon registered as an OS service automatically** so the change is live (`brv daemon restart` does it by hand). If the token is rejected, the daemon does not die — it **suspends and keeps retrying**, and heals itself without a restart once a reconnect (re-enroll) changes the token. `brv status` shows each binding's state (connected · parked · SUSPENDED …)
 
 ### Delegating to an AI assistant
 
@@ -117,7 +119,10 @@ Legacy singular form (top-level `channel`/`agent` plus `dir`/`policy` under `[wa
 
 - `brv wake test` fails: check that the command is an absolute path, and see what the session output log (`wake.log` in the config directory) left behind
 - The wake fired but the agent can't do the work: the `allow` level in `brv wake show` is too low — `brv wake set --allow edit|full`
-- The wake fired but the session can't use brevduva tools (can't reply): check whether Claude Code's MCP registration (`claude mcp get brevduva`) carries a stale `--env BREVDUVA_CONFIG=…` — **an env pinned in the registration overrides what the daemon auto-propagates**. Remove the env from the registration or update it to the current config path
+- The wake fired but the session can't use brevduva tools (can't reply): check whether Claude Code's MCP registration (`claude mcp get brevduva`) carries a stale `--env BREVDUVA_CONFIG=…` — **an env pinned in the registration overrides what the daemon auto-propagates**. Remove the env from the registration or update it to the current config path (rare since 0.6.6: the daemon injects the local MCP itself and enroll refreshes the registration)
+- `brv status` shows `SUSPENDED — … token …`: the token was rejected (access revoked in the dashboard, or the same agent was connected on another machine). Issue a new connect code in the dashboard and run `brv init --enroll` — the daemon heals without a restart
+- `brv status` shows `wake pre-flight failed: …`: messages are received but no session can run — check the runner login (`claude login`), path, and permissions, then re-verify with `brv wake test`
+- To answer a request from the CLI use `brv send --to <agent> --reply-to <message id> --payload "…"` — the correlation is what resolves the peer's `wait_for_reply`
 
 ## Status
 

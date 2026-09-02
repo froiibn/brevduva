@@ -89,6 +89,9 @@ enum Cmd {
         /// Request ack collection on a broadcast (chapter 11)
         #[arg(long)]
         expects_ack: bool,
+        /// Send as a reply to this message id (kind=reply + correlation — resolves the sender's wait_for_reply)
+        #[arg(long)]
+        reply_to: Option<String>,
         /// Sending binding — required when multiple bindings exist
         #[arg(long)]
         binding: Option<String>,
@@ -208,6 +211,8 @@ enum DaemonCmd {
     },
     /// Unregister the OS service
     Uninstall,
+    /// Restart the registered OS service (config/token changes apply on restart)
+    Restart,
     /// (windows only) service entry point invoked by SCM — never run directly
     #[command(hide = true)]
     ServiceRun {
@@ -315,8 +320,9 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             to,
             payload,
             expects_ack,
+            reply_to,
             binding,
-        } => send(to, payload, expects_ack, binding.as_deref()).await,
+        } => send(to, payload, expects_ack, reply_to, binding.as_deref()).await,
         Cmd::Listen { binding } => listen(binding.as_deref()).await,
         Cmd::Mcp { binding } => mcp(binding.as_deref()).await,
         Cmd::Daemon { config, action } => match action {
@@ -327,10 +333,24 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
                 }
                 let cfg = config::load()?;
                 let tokens = config::load_tokens(&cfg)?;
-                brv::daemon::run(cfg, tokens).await
+                // 토큰 거부 시 저장소 재읽기 + 기동 시 깨우기 사전 점검 (2026-09-02)
+                let reload_cfg = cfg.clone();
+                brv::daemon::run_with_options(
+                    cfg,
+                    tokens,
+                    brv::daemon::DaemonOptions {
+                        token_reload: Some(std::sync::Arc::new(move |b: &Binding| {
+                            config::load_token(&reload_cfg, b).ok()
+                        })),
+                        preflight: true,
+                        ..Default::default()
+                    },
+                )
+                .await
             }
             Some(DaemonCmd::Install { config }) => brv::service::install(config.as_deref()),
             Some(DaemonCmd::Uninstall) => brv::service::uninstall(),
+            Some(DaemonCmd::Restart) => restart_daemon(true),
             // main()이 런타임 진입 전에 처리한다
             Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run branches in main"),
         },
@@ -534,6 +554,7 @@ fn wake_set(
     let path = config::store(&cfg)?;
     println!("wake configured — saved to {path:?} (survives reboots, daemon restarts, re-init)");
     wake_show()?;
+    restart_daemon(false)?;
     println!("\nnext: `brv wake test` to verify it actually spawns, then `brv daemon install`");
     Ok(())
 }
@@ -593,8 +614,7 @@ async fn wake_test(binding_sel: Option<&str>) -> anyhow::Result<()> {
         timeout_s: wake.timeout_s.min(120),
         ..wake
     };
-    let prompt = "This is `brv wake test` — a harness self-check, not a real task. \
-                  Print exactly `wake ok` and finish immediately. Do not call any tools.";
+    let prompt = brv::daemon::WAKE_TEST_PROMPT;
     println!(
         "spawning wake session: {} (binding {}, dir {}, cap {}s)...",
         capped.command,
@@ -749,6 +769,9 @@ async fn enroll_init(
     } else {
         register_mcp(&cfg);
     }
+    // 돌고 있는 데몬에 새 토큰·바인딩을 즉시 반영 (2026-09-02 맥북 실사고 — 재enroll 후 재기동
+    // 없이는 데몬이 옛 토큰으로 죽어 있었다). 서비스 미등록이면 조용히 지나간다
+    restart_daemon(false)?;
     // 온보딩 가이드 체인 (2026-09-02 사용자 확정): 마법사 대신 각 단계의 완료
     // 메시지가 다음 단계를 안내한다 — 설치기는 enroll을, enroll은 무인 모드를.
     println!();
@@ -1002,7 +1025,25 @@ async fn binding_add(agent: String, channel: String, description: String) -> any
         "binding {} — {path:?}",
         if replaced { "updated" } else { "added" }
     );
-    println!("the daemon picks this up after a restart: brv daemon (or restart the OS service)");
+    restart_daemon(false)?;
+    Ok(())
+}
+
+/// 설정을 바꾼 명령들이 부른다 (2026-09-02): 서비스가 등록돼 있으면 재기동해 변경을 즉시 반영,
+/// 아니면 직접 재시작하라고 안내. explicit(`brv daemon restart`)면 미등록을 오류로 돌려준다.
+fn restart_daemon(explicit: bool) -> anyhow::Result<()> {
+    match brv::service::restart() {
+        Ok(true) => println!("daemon restarted (OS service) — changes are live"),
+        Ok(false) if explicit => anyhow::bail!(
+            "daemon is not registered as an OS service — restart the process you started yourself, or register one with `brv daemon install`"
+        ),
+        // 서비스는 없지만 데몬이 돌았던 흔적(상태 파일)이 있으면 — 직접 띄운 데몬·작업 스케줄러 등
+        Ok(false) if brv::daemon::read_state().is_some() => println!(
+            "daemon is not an OS service here — if one is running, restart it yourself so the change applies"
+        ),
+        Ok(false) => {}
+        Err(e) => println!("daemon restart failed — restart it yourself: {e}"),
+    }
     Ok(())
 }
 
@@ -1021,6 +1062,7 @@ fn binding_remove(selector: &str) -> anyhow::Result<()> {
             "  (the agent's token stays in the keychain — to revoke it, rotate the token in the dashboard)"
         );
     }
+    restart_daemon(false)?;
     Ok(())
 }
 
@@ -1033,6 +1075,29 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
     );
     for b in &cfg.bindings {
         println!("  {}", b.label());
+    }
+    // 데몬 상태 파일 (2026-09-02) — "idle인지 죽었는지"를 프레즌스가 아니라 데몬 자신이 답한다
+    match brv::daemon::read_state() {
+        Some(daemon) => {
+            println!(
+                "daemon: pid {} (state updated {}s ago)",
+                daemon.pid,
+                daemon.age_secs()
+            );
+            for (label, st) in &daemon.bindings {
+                println!(
+                    "  {:34} {} — for {}s{}",
+                    label,
+                    st.describe(),
+                    st.age_secs(),
+                    st.wake_check
+                        .as_ref()
+                        .map(|w| format!("; wake pre-flight {w}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        None => println!("daemon: no state file (not running here, or older than 0.6.6)"),
     }
     let health = reqwest::Client::new()
         .get(format!("{}/healthz", cfg.server.trim_end_matches('/')))
@@ -1073,6 +1138,7 @@ async fn send(
     to: String,
     payload: String,
     expects_ack: bool,
+    reply_to: Option<String>,
     binding_sel: Option<&str>,
 ) -> anyhow::Result<()> {
     let (_, client) = connect_from_config(binding_sel)?;
@@ -1086,6 +1152,12 @@ async fn send(
     );
     if expects_ack {
         spec.expects = Some(brevduva_protocol::Expects::Ack);
+    }
+    // --reply-to (2026-09-02, 실사용 보고): CLI 회신이 kind=reply + correlation을 실어야
+    // 발신자의 wait_for_reply가 해소된다 — 본문에 "re: <id>"를 손으로 적는 우회를 없앤다
+    if let Some(id) = reply_to {
+        spec.kind = brevduva_protocol::Kind::Reply;
+        spec.correlation_id = Some(id);
     }
     match tokio::time::timeout(Duration::from_secs(10), client.publish(spec)).await {
         Ok(Ok(id)) => println!("sent {id}"),

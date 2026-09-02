@@ -31,6 +31,43 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// 유휴 파킹 기본값 — ack_wait(기본 30s)×포이즌 임계(5)로 격리되기 한참 전에 자리를 내려놓는다.
 pub const DEFAULT_IDLE_PARK: Duration = Duration::from_secs(60);
 
+/// 데몬 모드의 토큰 재읽기 (2026-09-02, 맥북 실사고): JOIN이 토큰 거부로 실패하면 죽지 않고
+/// 정지한 채 이 콜백으로 저장소의 토큰을 다시 읽어 재시도한다 — 같은 머신에서 재enroll
+/// (토큰 회전)하면 재기동 없이 자가 복구. None(대화형 어댑터)이면 종전대로 즉시 종료.
+#[derive(Clone)]
+pub struct TokenReload(pub std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for TokenReload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenReload(..)")
+    }
+}
+
+/// 클라이언트 접속 상태 — 데몬이 상태 파일(`brv status`)로 노출한다 (2026-09-02, 맥북 실사고:
+/// "죽은 채 살아 있음"을 밖에서 볼 수단이 로그 tail뿐이었다).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ClientState {
+    Connecting,
+    Connected,
+    Reconnecting {
+        attempt: u32,
+    },
+    /// 다른 세션이 자리를 가져가 대기 중 (2.2).
+    Standby,
+    /// 유휴 파킹 — 메시지는 서버 큐에 (2026-09-01).
+    Parked,
+    /// JOIN이 비재시도 오류로 거부돼 정지 — 토큰 재읽기·백오프 재시도 중 (데몬 모드).
+    Suspended {
+        reason: String,
+        retry_in_s: u64,
+    },
+    /// 종료 — 대화형 모드의 치명 오류, 또는 핸들 전부 드롭.
+    Stopped {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     /// 서버 베이스 URL (http/https) — ws(s)://…/v1/ws 로 유도.
@@ -51,6 +88,10 @@ pub struct ClientOptions {
     /// 데몬 wake 실패 등 처리 실패 신호)이 있으면 파킹하지 않는다: 그 재전달·포이즌 가시화는
     /// 페이즈 20의 의도된 실패 표면이다. None = 파킹 없음 (listen 등 상시 대기자 경로).
     pub idle_park: Option<Duration>,
+    /// 토큰 거부(치명 JOIN 실패) 시 종료 대신 정지·재시도 — 데몬 모드 (위 `TokenReload`).
+    pub token_reload: Option<TokenReload>,
+    /// 정지 재시도 기본 간격 — 기본 30s, 단계적으로 최대 30배(15분)까지 (`fatal_backoff`).
+    pub fatal_retry_base: Duration,
 }
 
 impl ClientOptions {
@@ -69,6 +110,8 @@ impl ClientOptions {
             takeover_standby: false,
             standby_probe: Duration::from_secs(30),
             idle_park: None,
+            token_reload: None,
+            fatal_retry_base: Duration::from_secs(30),
         }
     }
 }
@@ -155,23 +198,37 @@ pub struct Client {
     server: String,
     channel: String,
     token: String,
+    state_rx: tokio::sync::watch::Receiver<ClientState>,
 }
 
 impl Client {
     pub fn connect(opts: ClientOptions) -> Self {
         let (tx, rx) = mpsc::channel(64);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(ClientState::Connecting);
         let (server, channel, token) = (
             opts.server.clone(),
             opts.channel.clone(),
             opts.token.clone(),
         );
-        tokio::spawn(actor(opts, rx));
+        tokio::spawn(actor(opts, rx, state_tx));
         Self {
             cmds: tx,
             server,
             channel,
             token,
+            state_rx,
         }
+    }
+
+    /// 접속 상태 관찰 — 데몬 상태 파일용 (변경 알림은 `changed()`).
+    pub fn state(&self) -> tokio::sync::watch::Receiver<ClientState> {
+        self.state_rx.clone()
+    }
+
+    /// 액터 생존 여부. 죽은 클라이언트의 recv는 시간 초과와 같은 None을 돌려주므로 호출자
+    /// (데몬 루프)가 이걸로 구분한다 — 2026-09-02 맥북 실사고: 구분 못 해 죽은 채 무한 재대기.
+    pub fn is_alive(&self) -> bool {
+        !self.cmds.is_closed()
     }
 
     /// 발행 — 단절 중이면 재연결 후 같은 client_key로 재시도된다 (13.3).
@@ -343,6 +400,14 @@ struct Actor {
     /// 재접속 시 비운다 — 미확인분은 ack_wait 재전달이 다시 가져온다 (유실 없음).
     unacked: HashMap<u64, String>,
     last_pong: Instant,
+    /// 접속 상태 발행 (2026-09-02) — `Client::state()`가 구독.
+    state_tx: tokio::sync::watch::Sender<ClientState>,
+}
+
+impl Actor {
+    fn set_state(&self, s: ClientState) {
+        self.state_tx.send_replace(s);
+    }
 }
 
 const CONSUMED_CAP: usize = 2048;
@@ -683,7 +748,11 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis((nanos % cap_ms.max(1)) as u64)
 }
 
-async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
+async fn actor(
+    opts: ClientOptions,
+    mut cmds: mpsc::Receiver<Cmd>,
+    state_tx: tokio::sync::watch::Sender<ClientState>,
+) {
     let mut state = Actor {
         opts,
         seq: 0,
@@ -696,13 +765,20 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
         waiters: Vec::new(),
         unacked: HashMap::new(),
         last_pong: Instant::now(),
+        state_tx,
     };
     let mut attempt: u32 = 0;
+    let mut fatal_attempt: u32 = 0;
     let mut resume_cmd: Option<Cmd> = None;
+    let dropped = ClientState::Stopped {
+        reason: "all handles dropped".to_owned(),
+    };
     loop {
         match connect_and_join(&mut state).await {
             Ok((ws, backlog)) => {
                 attempt = 0;
+                fatal_attempt = 0;
+                state.set_state(ClientState::Connected);
                 match run_connection(&mut state, ws, backlog, resume_cmd.take(), &mut cmds).await {
                     ConnEnd::Reconnect => state.on_disconnect(),
                     ConnEnd::TakenOver => {
@@ -710,6 +786,7 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
                         if state.opts.takeover_standby {
                             // 새 세션과 자리 다툼 금지 (2.2) — 자리가 빌 때까지 대기
                             tracing::info!("session taken over — entering standby");
+                            state.set_state(ClientState::Standby);
                             standby_until_free(&state.opts).await;
                             tracing::info!("agent slot free — resuming");
                         }
@@ -723,39 +800,93 @@ async fn actor(opts: ClientOptions, mut cmds: mpsc::Receiver<Cmd>) {
                         state.inbox.clear();
                         state.queued_ids.clear();
                         tracing::info!("idle — parking connection (messages queue server-side)");
+                        state.set_state(ClientState::Parked);
                         match cmds.recv().await {
                             Some(cmd) => resume_cmd = Some(cmd), // 재접속 직후 처리
-                            None => return,                      // 핸들 전부 드롭 — 종료
+                            None => {
+                                state.set_state(dropped); // 핸들 전부 드롭 — 종료
+                                return;
+                            }
                         }
                         tracing::info!("command arrived — resuming from park");
                         continue; // 백오프 없이 즉시 재접속
                     }
-                    ConnEnd::Closed => return,
+                    ConnEnd::Closed => {
+                        state.set_state(dropped);
+                        return;
+                    }
                 }
             }
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(reason) = msg.strip_prefix("FATAL: ") {
-                    // JOIN이 비재시도 오류로 거부됨 (무효 토큰·grant 없음 등) — 재시도 무의미
-                    tracing::error!(%reason, "fatal join failure — client stopping");
-                    for entry in state.outbox.drain(..) {
-                        if let Some(resp) = entry.resp {
-                            let _ = resp.send(Err(ErrBody {
-                                code: ErrorCode::AuthInvalidToken,
-                                message: reason.to_owned(),
-                                retryable: false,
-                                retry_after_ms: None,
-                            }));
+                    // JOIN이 비재시도 오류로 거부됨 (무효 토큰·grant 없음 등)
+                    let Some(reload) = state.opts.token_reload.clone() else {
+                        // 대화형 어댑터: 재시도 무의미 — 호출자에게 오류로 정직하게, 종료
+                        tracing::error!(%reason, "fatal join failure — client stopping");
+                        for entry in state.outbox.drain(..) {
+                            if let Some(resp) = entry.resp {
+                                let _ = resp.send(Err(ErrBody {
+                                    code: ErrorCode::AuthInvalidToken,
+                                    message: reason.to_owned(),
+                                    retryable: false,
+                                    retry_after_ms: None,
+                                }));
+                            }
                         }
+                        state.set_state(ClientState::Stopped {
+                            reason: reason.to_owned(),
+                        });
+                        return;
+                    };
+                    // 데몬 모드 (2026-09-02, 맥북 실사고 "살아 있는 채 영구 정지"의 근본 수정):
+                    // 죽지 않고 정지 상태로 물러나 긴 백오프로 재시도하며 매번 저장소의 토큰을
+                    // 다시 읽는다 — 같은 머신에서 재enroll(토큰 회전)하면 재기동 없이 복구된다.
+                    // 종료 대신 정지인 이유: 재기동 감독이 없는 상주(작업 스케줄러 등)에서도
+                    // 동작해야 하고, 무효 토큰으로 감독자가 재기동을 반복하는 소음도 피한다
+                    fatal_attempt += 1;
+                    let wait = fatal_backoff(state.opts.fatal_retry_base, fatal_attempt);
+                    tracing::error!(
+                        %reason,
+                        retry_in_s = wait.as_secs(),
+                        "join rejected — suspended; will re-read the token and retry"
+                    );
+                    state.set_state(ClientState::Suspended {
+                        reason: reason.to_owned(),
+                        retry_in_s: wait.as_secs(),
+                    });
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        cmd = cmds.recv() => match cmd {
+                            Some(cmd) => resume_cmd = Some(cmd), // 재접속 직후 처리
+                            None => {
+                                state.set_state(dropped);
+                                return;
+                            }
+                        },
                     }
-                    return;
+                    if let Some(fresh) = (reload.0)()
+                        && fresh != state.opts.token
+                    {
+                        tracing::info!("token on disk changed — retrying with the new token");
+                        state.opts.token = fresh;
+                        fatal_attempt = 0;
+                    }
+                    continue;
                 }
                 tracing::warn!(error = %e, attempt, "connect failed");
+                state.set_state(ClientState::Reconnecting { attempt });
             }
         }
         attempt += 1;
         tokio::time::sleep(backoff(attempt)).await;
     }
+}
+
+/// 정지 재시도 간격 — base × (1, 2, 4, 10, 20, 30) 상한 30배 (기본 30s → 15분 상한).
+fn fatal_backoff(base: Duration, attempt: u32) -> Duration {
+    const STEPS: [u32; 6] = [1, 2, 4, 10, 20, 30];
+    base * STEPS[(attempt.saturating_sub(1) as usize).min(STEPS.len() - 1)]
 }
 
 // 치명(JOIN 비재시도 거부)은 connect_and_join의 "FATAL: " 오류 경로가 담당한다
@@ -1087,6 +1218,16 @@ async fn run_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-02: 정지 재시도 간격은 단조 증가 후 상한 — 무효 토큰으로 서버를 두드리지 않으면서
+    /// 재enroll 후 15분 안에는 반드시 다시 시도한다
+    #[test]
+    fn fatal_backoff_grows_then_caps() {
+        let base = Duration::from_secs(30);
+        let seq: Vec<u64> = (1..=8).map(|n| fatal_backoff(base, n).as_secs()).collect();
+        assert_eq!(seq, vec![30, 60, 120, 300, 600, 900, 900, 900]);
+        assert_eq!(fatal_backoff(base, 0).as_secs(), 30);
+    }
 
     #[test]
     fn ws_url_derivation() {

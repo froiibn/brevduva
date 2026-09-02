@@ -19,23 +19,25 @@
 //! **깨우기 스폰 성공 후**에만 보낸다 (페이즈 20) — 스폰 실패 시 메시지는 큐에 남아
 //! ack_wait 후 재전달·재시도되고, 반복 실패는 포이즌 표시로 대시보드에 드러난다.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use brevduva_protocol::Envelope;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 use tokio::time::Instant;
 
-use crate::client::{Client, ClientOptions, RecvFilter};
+use crate::client::{Client, ClientOptions, ClientState, RecvFilter, TokenReload};
 use crate::config::{Binding, BrvConfig, WakeConfig};
 
 /// 디바운스 창 — 연쇄 도착(브로드캐스트 후 ack 등)을 한 번의 깨우기로 묶는다.
 const DEBOUNCE: Duration = Duration::from_secs(2);
 const BATCH_CAP: usize = 20;
+/// 이 시간 안에 실패 종료한 깨우기는 "시작도 못 함"으로 분류 (wait_wake 참조).
+const QUICK_FAIL_SECS: u64 = 15;
 
 /// 저널 라인 — 엔벨로프를 바인딩 맥락으로 래핑 (페이즈 27). 어느 채널·에이전트의
 /// 수신분인지 라인 단독으로 식별된다 (구형은 엔벨로프 단독 — 읽는 코드가 없어 무마이그레이션).
@@ -46,20 +48,153 @@ struct JournalLine<'a> {
     envelope: &'a Envelope,
 }
 
+/// 바인딩별 토큰 재읽기 — 데몬 코어는 저장소(키체인/파일)를 모르므로 호출자가 준다.
+pub type BindingTokenReload = Arc<dyn Fn(&Binding) -> Option<String> + Send + Sync>;
+
+/// 데몬 실행 옵션 (2026-09-02, 맥북 실사고 대응).
+pub struct DaemonOptions {
+    /// OS 서비스 모드(페이즈 7): true가 되면 각 바인딩 루프가 유휴 대기 지점에서 정상 종료.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// 토큰 거부 시 종료 대신 정지·재읽기·재시도 (`client::TokenReload`). None = 종전 경로
+    /// (바인딩 실패 → 프로세스 종료 → OS 서비스 재기동).
+    pub token_reload: Option<BindingTokenReload>,
+    /// 정지 재시도 기본 간격 (기본 30s — 테스트가 줄인다).
+    pub fatal_retry_base: Duration,
+    /// 기동 시 깨우기 사전 점검 — wake_policy=always 바인딩마다 무해한 깨우기 1회로 러너·인증을
+    /// 확인해 상태 파일에 남긴다 (메시지가 오기 **전에** "깨울 수 없는 상태"를 알기 위해).
+    pub preflight: bool,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            shutdown: None,
+            token_reload: None,
+            fatal_retry_base: Duration::from_secs(30),
+            preflight: false,
+        }
+    }
+}
+
+/// 바인딩 하나의 데몬 측 상태 — 상태 파일(`daemon-state.json`)의 항목.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingStatus {
+    pub state: ClientState,
+    pub since_unix: u64,
+    /// 기동 시 깨우기 사전 점검 결과 — "ok (4.2s)" / "failed: …" / None(미실시).
+    pub wake_check: Option<String>,
+}
+
+impl BindingStatus {
+    pub fn age_secs(&self) -> u64 {
+        now_unix().saturating_sub(self.since_unix)
+    }
+
+    /// 한 줄 설명 (`brv status`용).
+    pub fn describe(&self) -> String {
+        match &self.state {
+            ClientState::Connecting => "connecting".to_owned(),
+            ClientState::Connected => "connected".to_owned(),
+            ClientState::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
+            ClientState::Standby => "standby (another session holds the slot)".to_owned(),
+            ClientState::Parked => "parked (idle — messages queue server-side)".to_owned(),
+            ClientState::Suspended { reason, retry_in_s } => {
+                format!(
+                    "SUSPENDED — {reason} (retrying in {retry_in_s}s; re-enroll to fix a token)"
+                )
+            }
+            ClientState::Stopped { reason } => format!("STOPPED — {reason}"),
+        }
+    }
+}
+
+/// 상태 파일 전체 — 데몬이 상태 변화마다 통째로 다시 쓴다 (2026-09-02).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonState {
+    pub pid: u32,
+    pub updated_unix: u64,
+    pub bindings: BTreeMap<String, BindingStatus>,
+}
+
+impl DaemonState {
+    pub fn age_secs(&self) -> u64 {
+        now_unix().saturating_sub(self.updated_unix)
+    }
+}
+
+type SharedState = Arc<tokio::sync::Mutex<BTreeMap<String, BindingStatus>>>;
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 상태 파일 경로 — 설정 디렉터리의 `daemon-state.json`.
+pub fn state_path() -> anyhow::Result<PathBuf> {
+    Ok(crate::config::config_path()?
+        .parent()
+        .expect("config has parent")
+        .join("daemon-state.json"))
+}
+
+/// `brv status`용 — 파일이 없거나 못 읽으면 None (구버전 데몬·미기동).
+pub fn read_state() -> Option<DaemonState> {
+    let bytes = std::fs::read(state_path().ok()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn write_state(path: &Path, bindings: &BTreeMap<String, BindingStatus>) {
+    let doc = DaemonState {
+        pid: std::process::id(),
+        updated_unix: now_unix(),
+        bindings: bindings.clone(),
+    };
+    let Ok(json) = serde_json::to_vec_pretty(&doc) else {
+        return;
+    };
+    // 임시 파일 후 rename — 읽는 쪽(`brv status`)이 반쯤 쓰인 파일을 보지 않게
+    let tmp = path.with_extension("json.tmp");
+    if tokio::fs::write(&tmp, json).await.is_ok()
+        && let Err(e) = tokio::fs::rename(&tmp, path).await
+    {
+        tracing::warn!(error = %e, "state file rename failed");
+    }
+}
+
 /// tokens: agent → 토큰 (`config::load_tokens`) — 저장소 접근을 호출자에 두어
 /// 데몬 코어가 키체인과 분리된다 (통합 테스트가 토큰을 직접 주입).
 pub async fn run(cfg: BrvConfig, tokens: HashMap<String, String>) -> anyhow::Result<()> {
-    run_with_shutdown(cfg, tokens, None).await
+    run_with_options(cfg, tokens, DaemonOptions::default()).await
 }
 
-/// OS 서비스 모드(페이즈 7)용 진입점 — `shutdown`이 true가 되면 각 바인딩 루프가 유휴
-/// 대기 지점에서 정상 종료한다. 깨우기(wake)가 진행 중이면 완료 후 종료 — 세션을 중간에
-/// 죽이지 않는다 (SCM STOP은 wait hint로 버틴다).
+/// OS 서비스 모드(페이즈 7)용 진입점 — 옵션 구조체 도입(2026-09-02) 전의 호환 표면.
 pub async fn run_with_shutdown(
     cfg: BrvConfig,
     tokens: HashMap<String, String>,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> anyhow::Result<()> {
+    run_with_options(
+        cfg,
+        tokens,
+        DaemonOptions {
+            shutdown,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// 데몬 본체 — `shutdown`이 true가 되면 각 바인딩 루프가 유휴 대기 지점에서 정상 종료한다.
+/// 깨우기(wake)가 진행 중이면 완료 후 종료 — 세션을 중간에 죽이지 않는다 (SCM STOP은
+/// wait hint로 버틴다).
+pub async fn run_with_options(
+    cfg: BrvConfig,
+    tokens: HashMap<String, String>,
+    opts: DaemonOptions,
+) -> anyhow::Result<()> {
+    let shutdown = opts.shutdown;
     let wake = cfg.wake.clone().context(
         "daemon requires a `[wake]` section in config.toml — define what wakes a session (command)",
     )?;
@@ -93,18 +228,59 @@ pub async fn run_with_shutdown(
         "brv daemon up"
     );
 
+    // 상태 파일 (2026-09-02): 바인딩별 접속 상태·사전 점검 결과 — `brv status`가 읽는다
+    let state_file = state_path()?;
+    let shared: SharedState = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
     let mut set = tokio::task::JoinSet::new();
     for b in cfg.bindings.clone() {
         let token = tokens[&b.token_id()].clone();
+        let reload = opts.token_reload.clone().map(|f| {
+            let b = b.clone();
+            TokenReload(Arc::new(move || f(&b)))
+        });
         set.spawn(binding_loop(
             cfg.server.clone(),
             wake.clone(),
             b,
             token,
-            journal.clone(),
-            Arc::clone(&journal_lock),
             shutdown.clone(),
+            BindingRuntime {
+                reload,
+                fatal_retry_base: opts.fatal_retry_base,
+                shared: Arc::clone(&shared),
+                state_file: state_file.clone(),
+                journal: journal.clone(),
+                journal_lock: Arc::clone(&journal_lock),
+            },
         ));
+    }
+    if opts.preflight {
+        for b in cfg.bindings.iter().filter(|b| b.wake_policy == "always") {
+            let (wake, b) = (effective_wake(&wake, b), b.clone());
+            let (shared, state_file) = (Arc::clone(&shared), state_file.clone());
+            tokio::spawn(async move {
+                let verdict = match preflight_wake(&wake, &b).await {
+                    Ok(secs) => {
+                        tracing::info!(binding = %b.label(), secs, "wake pre-flight ok");
+                        format!("ok ({secs:.1}s)")
+                    }
+                    Err(e) => {
+                        tracing::error!(binding = %b.label(), error = %e, "wake pre-flight FAILED — messages will be received but sessions cannot run until this is fixed");
+                        format!("failed: {e}")
+                    }
+                };
+                let mut map = shared.lock().await;
+                map.entry(b.full_label())
+                    .or_insert_with(|| BindingStatus {
+                        state: ClientState::Connecting,
+                        since_unix: now_unix(),
+                        wake_check: None,
+                    })
+                    .wake_check = Some(verdict);
+                write_state(&state_file, &map).await;
+            });
+        }
     }
     // 한 바인딩 루프의 실패는 프로세스 실패 — OS 서비스의 자동 재시작이 전체를 복구한다
     // (바인딩별 부분 생존은 반쪽 수신 상태를 감춰서 더 위험)
@@ -112,6 +288,29 @@ pub async fn run_with_shutdown(
         joined.context("binding loop panicked")??;
     }
     Ok(())
+}
+
+/// 바인딩 루프의 런타임 부속 (2026-09-02) — 토큰 재읽기·상태 파일.
+struct BindingRuntime {
+    reload: Option<TokenReload>,
+    fatal_retry_base: Duration,
+    shared: SharedState,
+    state_file: PathBuf,
+    journal: PathBuf,
+    journal_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// 기동 시 깨우기 사전 점검 — `brv wake test`와 같은 경로·같은 프롬프트, 상한 120초.
+async fn preflight_wake(wake: &WakeConfig, b: &Binding) -> anyhow::Result<f32> {
+    let dir = b.wake_dir.as_deref().context("no wake_dir")?;
+    let capped = WakeConfig {
+        timeout_s: wake.timeout_s.min(120),
+        ..wake.clone()
+    };
+    let started = Instant::now();
+    let child = spawn_wake(&capped, dir, &b.full_label(), WAKE_TEST_PROMPT).await?;
+    wait_wake(&capped, child).await?;
+    Ok(started.elapsed().as_secs_f32())
 }
 
 /// 바인딩의 실효 깨우기 설정 — 바인딩별 러너 오버라이드(wake_command/wake_args)가 있으면
@@ -137,14 +336,16 @@ async fn binding_loop(
     wake: WakeConfig,
     binding: Binding,
     token: String,
-    journal: PathBuf,
-    journal_lock: Arc<tokio::sync::Mutex<()>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    rt: BindingRuntime,
 ) -> anyhow::Result<()> {
     let wake = effective_wake(&wake, &binding);
     let mut opts = ClientOptions::new(&server, &binding.channel, &binding.agent, &token);
     opts.description = binding.description.clone();
     opts.takeover_standby = true; // 데몬의 핵심 매너 — 대화형 세션에 자리를 양보
+    // 토큰 거부 시 정지·재읽기·재시도 (2026-09-02, 맥북 실사고) — 상세는 client::TokenReload
+    opts.token_reload = rt.reload;
+    opts.fatal_retry_base = rt.fatal_retry_base;
     // 유휴 파킹 (2026-09-01): 평시에는 recv_manual 대기자가 상주해 발동하지 않는다.
     // 발동하는 유일한 구간은 wait_wake(깨운 세션 완주 대기, 최대 timeout_s) 중 —
     // 깨어난 세션이 자리를 안 잡은 채 새 메시지가 오면 버퍼 방치로 격리 예산을 태우는
@@ -152,6 +353,33 @@ async fn binding_loop(
     // 스폰 실패의 확인 유보분(unacked)은 파킹을 막으므로 페이즈 20 가시화는 불변
     opts.idle_park = Some(crate::client::DEFAULT_IDLE_PARK);
     let client = Client::connect(opts);
+    // 상태 관찰자 — 접속 상태가 바뀔 때마다 상태 파일 갱신 (프로세스와 함께 끝난다)
+    {
+        let mut rx = client.state();
+        let label = binding.full_label();
+        let (shared, state_file) = (Arc::clone(&rt.shared), rt.state_file.clone());
+        tokio::spawn(async move {
+            loop {
+                let s = rx.borrow_and_update().clone();
+                {
+                    let mut map = shared.lock().await;
+                    let entry = map.entry(label.clone()).or_insert_with(|| BindingStatus {
+                        state: s.clone(),
+                        since_unix: now_unix(),
+                        wake_check: None,
+                    });
+                    if entry.state != s {
+                        entry.state = s;
+                        entry.since_unix = now_unix();
+                    }
+                    write_state(&state_file, &map).await;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     loop {
         if shutdown.as_ref().is_some_and(|s| *s.borrow()) {
@@ -176,6 +404,14 @@ async fn binding_loop(
                 .await
         };
         let Some(first) = first else {
+            // 시간 초과와 죽은 클라이언트를 구분 (2026-09-02 맥북 실사고): 종전엔 둘 다 None이라
+            // 죽은 채 무한 재대기했다 — 죽었으면 오류로 올려 프로세스 종료(감독자 재기동)
+            // 경로를 살린다. 데몬 모드의 토큰 거부는 정지·재시도로 살아 있으므로 여기 안 온다
+            anyhow::ensure!(
+                client.is_alive(),
+                "client for binding {} stopped (fatal join failure) — exiting so the supervisor restarts",
+                binding.label()
+            );
             continue;
         };
         let mut batch = vec![first];
@@ -191,7 +427,7 @@ async fn binding_loop(
             }
         }
         let envelopes: Vec<Envelope> = batch.iter().map(|(env, _)| env.clone()).collect();
-        journal_append(&journal, &journal_lock, &binding, &envelopes).await;
+        journal_append(&rt.journal, &rt.journal_lock, &binding, &envelopes).await;
 
         if binding.wake_policy != "always" {
             // 깨우기 없는 정책 = 저널이 최종 목적지 — 여기서 소비 확정
@@ -339,6 +575,56 @@ fn script_wrap(windows: bool, command: &str, args: &[String]) -> (String, Vec<St
     }
 }
 
+/// `brv wake test`·데몬 기동 사전 점검이 쓰는 무해한 프롬프트 — 러너·인증·환경만 확인한다.
+pub const WAKE_TEST_PROMPT: &str = "This is `brv wake test` — a harness self-check, not a real task. \
+    Print exactly `wake ok` and finish immediately. Do not call any tools.";
+
+/// 러너가 Claude Code CLI인지 — 파일 이름이 `claude`로 시작 (`claude`, `claude.exe`, `claude.cmd`).
+fn is_claude_runner(command: &str) -> bool {
+    Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
+}
+
+/// 깨운 세션에 로컬 `brevduva` MCP 서버를 직접 꽂는다 (2026-09-02, 맥북·윈도우 실사고의 근본
+/// 수정): 사용자 스코프 등록이 없거나 낡으면 모델이 claude.ai 커넥터 도구(`mcp__claude_ai_…`)로
+/// 우회하는데, 그 이름은 `--allowedTools mcp__brevduva__*` 밖이라 무인 세션이 답신을 못 한다.
+/// `--mcp-config <파일>`은 등록 상태와 무관하게 이 세션에만 서버를 추가한다 — 이름은 항상
+/// `brevduva`, 바인딩·설정 경로는 데몬과 동일. 파일로 넘기는 이유: 인라인 JSON은 윈도우
+/// `cmd /c` 래핑에서 따옴표가 깨진다. 이미 `--mcp-config`가 있으면(사용자 지정) 손대지 않는다.
+fn inject_local_mcp(
+    command: &str,
+    mut args: Vec<String>,
+    binding_label: &str,
+    config_path: &Path,
+    config_dir: &Path,
+) -> anyhow::Result<Vec<String>> {
+    if !is_claude_runner(command) || args.iter().any(|a| a == "--mcp-config") {
+        return Ok(args);
+    }
+    let exe = std::env::current_exe().context("current exe")?;
+    let file_tag: String = binding_label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = config_dir.join(format!("wake-mcp-{file_tag}.json"));
+    let doc = serde_json::json!({
+        "mcpServers": {
+            "brevduva": {
+                "command": exe,
+                "args": ["mcp", "--binding", binding_label],
+                "env": { "BREVDUVA_CONFIG": config_path }
+            }
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc)?)
+        .with_context(|| format!("cannot write {path:?}"))?;
+    args.push("--mcp-config".to_owned());
+    args.push(path.to_string_lossy().into_owned());
+    Ok(args)
+}
+
 /// 깨우기 프로세스 시작 — 스폰 성공까지가 소비 확정의 기준 (페이즈 20).
 /// dir은 바인딩의 wake_dir (페이즈 27 — 전역 [wake]에서 바인딩으로 이동).
 /// binding_label은 깨운 세션에 `BREVDUVA_BINDING`으로 전파 — 세션의 `brv mcp`가
@@ -357,17 +643,18 @@ pub async fn spawn_wake(
         .iter()
         .map(|a| a.replace("{prompt}", prompt))
         .collect();
-    let (command, args) = script_wrap(cfg!(windows), &wake.command, &args);
     let config_path = crate::config::config_path()?;
-    tracing::info!(command = %command, dir = %dir, binding = %binding_label, "waking session");
     // 깨운 세션의 출력은 wake.log로 — 실패 원인 추적용 (버리면 디버깅 불가, 실측 교훈)
-    let log_dir = crate::config::config_path()?
+    let log_dir = config_path
         .parent()
         .expect("config has parent")
         .to_path_buf();
     // 신규 머신에는 설정 디렉터리가 아직 없다 (CI에서 실측) — 로그 열기 전에 보장
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("cannot create log dir {log_dir:?}"))?;
+    let args = inject_local_mcp(&wake.command, args, binding_label, &config_path, &log_dir)?;
+    let (command, args) = script_wrap(cfg!(windows), &wake.command, &args);
+    tracing::info!(command = %command, dir = %dir, binding = %binding_label, "waking session");
     let log_path = log_dir.join("wake.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -392,10 +679,23 @@ pub async fn spawn_wake(
 /// 깨우기 완주 대기 — 타임아웃 시 강제 종료 (스폰과 분리: 확정 시점은 스폰).
 /// pub인 이유는 spawn_wake와 동일 (`brv wake test`).
 pub async fn wait_wake(wake: &WakeConfig, mut child: tokio::process::Child) -> anyhow::Result<()> {
+    let started = Instant::now();
     match tokio::time::timeout(Duration::from_secs(wake.timeout_s), child.wait()).await {
-        Ok(Ok(status)) => {
+        Ok(Ok(status)) if status.success() => {
             tracing::info!(%status, "wake session finished");
             Ok(())
+        }
+        // 실패 종료 (2026-09-02 맥북 실사고 — CLI 로그인 만료로 2초 만에 exit 1): 몇 초 안의
+        // 실패는 "일을 시작도 못 함"(인증·경로·환경)으로 분류해 원인 방향을 로그에 남긴다
+        Ok(Ok(status)) => {
+            let secs = started.elapsed().as_secs();
+            if secs < QUICK_FAIL_SECS {
+                anyhow::bail!(
+                    "wake session exited with {status} after {secs}s — it most likely could not start at all \
+                     (CLI login expired? runner path? permissions?) — see wake.log"
+                )
+            }
+            anyhow::bail!("wake session exited with {status} after {secs}s — see wake.log")
         }
         Ok(Err(e)) => Err(e).context("wake process wait"),
         Err(_) => {
@@ -412,6 +712,42 @@ pub async fn wait_wake(wake: &WakeConfig, mut child: tokio::process::Child) -> a
 mod tests {
     use super::*;
     use brevduva_protocol::{Address, ClientKey, Ident, Kind};
+
+    /// 2026-09-02: 러너가 claude면 로컬 brevduva MCP를 --mcp-config로 꽂고, 사용자 지정
+    /// --mcp-config가 있거나 다른 러너(codex)면 손대지 않는다. 파일에는 바인딩·설정 경로가 실린다
+    #[test]
+    fn local_mcp_injection_targets_claude_only() {
+        let dir = std::env::temp_dir().join(format!("brv-mcp-inject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let args = vec!["-p".to_owned(), "hi".to_owned()];
+
+        let out =
+            inject_local_mcp("/usr/bin/claude", args.clone(), "org/a@ch", &cfg, &dir).unwrap();
+        assert_eq!(&out[..2], &args[..]);
+        assert_eq!(out[2], "--mcp-config");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out[3]).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"]["brevduva"]["args"][2], "org/a@ch");
+        assert_eq!(
+            doc["mcpServers"]["brevduva"]["env"]["BREVDUVA_CONFIG"],
+            cfg.to_string_lossy().as_ref()
+        );
+
+        // 윈도우 래퍼 이름도 claude로 인식, codex는 제외
+        assert!(is_claude_runner(r"C:\Users\me\.local\bin\claude.exe"));
+        assert!(is_claude_runner("claude.cmd"));
+        assert!(!is_claude_runner("/usr/local/bin/codex"));
+        let codex =
+            inject_local_mcp("/usr/local/bin/codex", args.clone(), "a@ch", &cfg, &dir).unwrap();
+        assert_eq!(codex, args);
+
+        // 사용자가 이미 --mcp-config를 줬으면 존중
+        let custom = vec!["--mcp-config".to_owned(), "mine.json".to_owned()];
+        let kept = inject_local_mcp("claude", custom.clone(), "a@ch", &cfg, &dir).unwrap();
+        assert_eq!(kept, custom);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn binding() -> Binding {
         Binding {
