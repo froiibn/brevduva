@@ -799,7 +799,10 @@ async fn actor(
                             // 새 세션과 자리 다툼 금지 (2.2) — 자리가 빌 때까지 대기
                             tracing::info!("session taken over — entering standby");
                             state.set_state(ClientState::Standby);
-                            standby_until_free(&state.opts).await;
+                            if !standby_until_free(&state.opts, &cmds).await {
+                                state.set_state(dropped); // 핸들 전부 드롭 — 재JOIN 없이 종료
+                                return;
+                            }
                             tracing::info!("agent slot free — resuming");
                         }
                         // 대화형(기본): 즉시 재접속 = 최신 연결이 자리를 가진다
@@ -1015,10 +1018,24 @@ pub async fn discover_channels(
 
 /// standby: long-poll PRESENCE 프로브(세션·큐 무접촉)로 자리가 빌 때까지 대기.
 /// 오류(서버 불가 등)는 "자리 비어 있음"으로 간주 — 재접속 경로의 백오프가 뒷일을 맡는다.
-async fn standby_until_free(opts: &ClientOptions) {
+/// standby 대기 — true = 자리가 비었다(재JOIN), false = 핸들이 전부 드롭됐다(종료).
+async fn standby_until_free(opts: &ClientOptions, cmds: &mpsc::Receiver<Cmd>) -> bool {
     let http = reqwest::Client::new();
     loop {
-        tokio::time::sleep(opts.standby_probe).await;
+        // 핸들 전부 드롭(데몬 pause·바인딩 이탈)이면 프로브를 기다리지 않고 물러난다 (2026-09-03
+        // lucadm 실측): 종전엔 자리가 빌 때까지 기다렸다 재JOIN한 뒤에야 닫힘을 알아채 — 정지
+        // 중 유령 JOIN(메시지 수신·JOIN 한도 소모). 1초 조각 수면으로 닫힘을 살핀다
+        let deadline = Instant::now() + opts.standby_probe;
+        loop {
+            if cmds.is_closed() {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            tokio::time::sleep(left.min(Duration::from_secs(1))).await;
+        }
         let occupied = async {
             let resp: ServerFrame = http
                 .post(format!(
@@ -1049,7 +1066,7 @@ async fn standby_until_free(opts: &ClientOptions) {
         }
         .await;
         if !occupied.unwrap_or(false) {
-            return;
+            return true;
         }
     }
 }
@@ -1230,6 +1247,20 @@ async fn run_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-03 (lucadm 실측): 핸들이 전부 드롭된 액터는 standby 프로브 주기를 기다리지 않고
+    /// 즉시 물러난다 — 데몬 pause가 자리를 비운 뒤 유령 재JOIN이 없어야 한다
+    #[tokio::test]
+    async fn standby_wait_ends_when_handles_drop() {
+        let mut opts = ClientOptions::new("http://127.0.0.1:9", "ch", "agent", "brv_x");
+        opts.standby_probe = Duration::from_secs(600);
+        let (tx, rx) = mpsc::channel::<Cmd>(1);
+        drop(tx);
+        let freed = timeout(Duration::from_secs(5), standby_until_free(&opts, &rx))
+            .await
+            .expect("must not wait for the probe interval");
+        assert!(!freed, "dropped handles mean stop, not rejoin");
+    }
 
     /// 2026-09-02: 정지 재시도 간격은 단조 증가 후 상한 — 무효 토큰으로 서버를 두드리지 않으면서
     /// 재enroll 후 15분 안에는 반드시 다시 시도한다
