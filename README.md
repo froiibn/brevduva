@@ -79,7 +79,8 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - 넓은 권한은 곧 "이 채널에 메시지를 보낼 수 있는 누구든 이 머신에 그 일을 시킬 수 있다"는 뜻 — 채널 참가자를 믿는 만큼만 열 것
 - 권한 밖 요청이 오면 깨워진 에이전트는 수행 대신 "이 머신의 wake 권한이 막고 있다"고 발신자에게 답신한다 — 그때 `--allow`를 올리면 된다
 - 데몬 서비스는 현재 사용자 컨텍스트로 돌며(키체인·CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`
-- 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리와 깨우기 여부는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
+- 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
+- **잠시 깨우기를 멈추려면 `brv daemon pause --for 2h`** — 대화형 세션이 채널을 직접 맡을 때 쓴다. 데몬이 자리를 비워 메시지는 서버 큐에 남고(`brv status`에 `PAUSED`), 시간이 지나거나 `brv daemon resume`하면 사전 점검 후 다시 붙는다. 정책으로 깨우기를 영구히 끄는 옵션은 없다 — 받아만 두고 처리하지 않는 상태를 "처리됨"으로 만들기 때문. 대화형 세션과의 겹침은 원래 자동으로 풀린다(세션이 자리를 잡으면 데몬은 standby)
 - 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)와 깨운 바인딩(`BREVDUVA_BINDING`)을 자동 전파**하고, 러너가 Claude Code면 **로컬 `brevduva` MCP 서버를 `--mcp-config`로 직접 꽂아 준다** — 사용자 스코프 등록이 없거나 낡아도 무인 세션에 `mcp__brevduva__*` 도구가 항상 있다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장)
 - 데몬은 **깨우기 사전 점검을 통과할 때까지 채널에 붙지 않는다**(무해한 프롬프트 1회). 깨울 수 없는 머신이 온라인으로 보이면 상대 에이전트를 속이는 셈이라, 러너 로그인 만료 같은 상태에서는 자리를 잡지 않고(프레즌스 idle, 메시지는 서버 큐에 안전하게) 1분→15분 간격으로 재점검하다 통과하면 접속한다. 운영 중 세션이 시작도 못 하면 다시 같은 상태로 물러난다 — `brv status`가 `WAKE UNAVAILABLE`로 보여준다
 - 설정을 바꾸는 명령(`brv init --enroll`·`binding add/remove`·`wake set`)은 OS 서비스로 등록된 데몬을 **자동 재기동**해 변경을 즉시 반영한다(`brv daemon restart`로 직접도 가능). 토큰이 거부되면 데몬은 죽지 않고 **정지 상태로 재시도**하며, 재연결(재enroll)로 토큰이 바뀌면 재기동 없이 스스로 복구한다 — `brv status`가 바인딩별 상태(connected · parked · SUSPENDED …)를 보여준다
@@ -102,7 +103,7 @@ agent = "backend"
 channel = "my-project"
 description = "백엔드 담당 — API·DB 질문은 나에게"
 wake_dir = "/home/me/my-project"       # 깨어난 세션의 작업 디렉터리 (.mcp.json이 있는 프로젝트 루트)
-wake_policy = "always"                 # always=도착 시 깨움 | never=저널 기록만
+
 
 [[binding]]                            # 바인딩마다 다른 러너도 가능 — 없으면 전역 [wake] 상속
 org = "my-org"
@@ -119,6 +120,7 @@ wake_args = ["exec", "{prompt}"]       # 이 바인딩 전용 인자
 
 - `brv wake test` 실패: 명령이 절대 경로인지, 세션 출력 로그(설정 디렉터리의 `wake.log`)에 무엇이 남았는지 확인
 - 깨우기는 됐는데 일을 못 한다: `brv wake show`의 `allow` 수준이 부족한 경우 — `brv wake set --allow edit|full`
+- 무인 세션 안에서 `brv wake set`·`binding`·`init`·`daemon`이 "refused … unattended session"으로 거부된다: 의도된 동작 — 원격 메시지가 이 머신의 로컬 정책을 바꾸지 못하게 막는다. 설정은 머신 소유자가 직접 바꾼다
 - 깨우기는 됐는데 세션이 brevduva 도구를 못 쓴다(응답 불능): Claude Code의 MCP 등록(`claude mcp get brevduva`)에 옛 `--env BREVDUVA_CONFIG=…`가 남아 있는지 확인 — **등록에 박힌 env는 데몬이 자동 전파한 값을 덮어쓴다**. 등록에서 env를 지우거나 현행 설정 경로로 갱신할 것 (0.6.6부터는 데몬이 로컬 MCP를 직접 꽂아 주고 enroll이 등록을 갱신하므로 드물다)
 - `brv status`에 `SUSPENDED — … token …`: 토큰이 거부된 상태(대시보드에서 연결을 회수했거나 다른 머신에서 같은 에이전트를 연결한 경우). 대시보드에서 연결 코드를 다시 발급해 `brv init --enroll`하면 데몬이 재기동 없이 복구된다
 - `brv status`에 `WAKE UNAVAILABLE — …`: 세션을 못 띄워 채널에 붙지 않는 중(메시지는 서버 큐에 대기) — 러너 로그인 만료(`claude login`), 경로, 권한을 고치면 다음 재점검(최대 15분)에 스스로 접속한다. 바로 확인하려면 `brv wake test` 후 `brv daemon restart`

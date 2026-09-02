@@ -19,7 +19,7 @@ use crate::config::Binding;
 #[derive(Debug)]
 pub struct EnrolledAgent {
     pub token: String,
-    /// 설정에 추가할 바인딩들. wake_dir·wake_policy는 기본값 — 기존 바인딩 교체 시
+    /// 설정에 추가할 바인딩들. wake_dir은 기본값(None) — 기존 바인딩 교체 시
     /// main의 upsert가 보존한다.
     pub bindings: Vec<Binding>,
     /// 이 에이전트에 grant된 전체 채널 (안내 출력용 — 구형 코드에서는 bindings보다 많을 수 있다).
@@ -141,7 +141,6 @@ fn binding_for(org: &str, agent: &str, channel: &str, description: &str) -> Bind
         channel: channel.to_owned(),
         description: description.to_owned(),
         wake_dir: None,
-        wake_policy: "always".to_owned(),
         wake_command: None,
         wake_args: None,
     }

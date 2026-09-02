@@ -36,10 +36,6 @@ pub struct Binding {
     /// 없으면 이 바인딩은 wake 불가 — 데몬 기동 시 검증한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_dir: Option<String>,
-    /// `always` | `never` — 이 바인딩의 깨우기 여부 (never = 저널 기록만).
-    /// 업무시간 정책은 2026-08-29 기각 — 에이전트에 사람 리듬 투영은 모순.
-    #[serde(default = "default_policy")]
-    pub wake_policy: String,
     /// 이 바인딩 전용 깨우기 실행 파일 — 없으면 전역 `[wake].command` 상속.
     /// 러너 혼용용 (2026-09-01): 한 머신에서 claude 바인딩과 codex 바인딩을 함께 굴린다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,9 +98,6 @@ pub struct WakeConfig {
     pub timeout_s: u64,
 }
 
-fn default_policy() -> String {
-    "always".to_owned()
-}
 fn default_wake_args() -> Vec<String> {
     // 기본 = 가장 좁은 respond 프리셋 (페이즈 21에서 프리셋으로 일원화)
     wake_preset_args("respond").expect("respond preset exists")
@@ -207,7 +200,7 @@ impl BrvConfig {
     }
 
     /// 바인딩 추가/교체 — 같은 (org, agent, channel)이 있으면 소개문만 갱신하고 운영 설정
-    /// (wake_dir·wake_policy·wake_command·wake_args)은 보존한다 (재init·재enroll이
+    /// (wake_dir·wake_command·wake_args)은 보존한다 (재init·재enroll이
     /// 깨우기를 지우면 안 됨). org가 한쪽만 있으면 같은 것으로 보고 채운다 —
     /// 구형(단일 조직) 바인딩이 재enroll로 org를 획득하는 경로. 반환: true = 기존 교체.
     pub fn upsert_binding(&mut self, incoming: Binding) -> bool {
@@ -273,9 +266,10 @@ struct RawWake {
     #[serde(default = "default_wake_timeout")]
     timeout_s: u64,
     // ---- 구형 필드 — 신형에서는 바인딩 소관 ----
+    // (구형 `policy`와 바인딩의 `wake_policy`는 2026-09-03 제거 — "never=저널만"은 처리 없이
+    // 소비 확정하는 함정이라 폐기. 파일에 남은 키는 serde가 무시하고, 잠시 깨우기를 멈추는
+    // 용도는 `brv daemon pause`가 맡는다)
     dir: Option<String>,
-    #[serde(default = "default_policy")]
-    policy: String,
 }
 
 impl RawConfig {
@@ -292,11 +286,6 @@ impl RawConfig {
                 channel,
                 description: self.description,
                 wake_dir: self.wake.as_ref().and_then(|w| w.dir.clone()),
-                wake_policy: self
-                    .wake
-                    .as_ref()
-                    .map(|w| w.policy.clone())
-                    .unwrap_or_else(default_policy),
                 wake_command: None,
                 wake_args: None,
             });
@@ -522,7 +511,6 @@ mod tests {
             channel: channel.into(),
             description: String::new(),
             wake_dir: None,
-            wake_policy: default_policy(),
             wake_command: None,
             wake_args: None,
         }
@@ -545,7 +533,6 @@ mod tests {
                     ..binding("backend", "saju-engine")
                 },
                 Binding {
-                    wake_policy: "never".into(),
                     wake_command: Some("/usr/bin/codex".into()),
                     wake_args: Some(vec!["exec".into(), "{prompt}".into()]),
                     ..binding("docs", "myapp")
@@ -562,7 +549,7 @@ mod tests {
         assert_eq!(back.bindings[0].full_label(), "acme/backend@saju-engine");
         assert_eq!(back.bindings[0].token_id(), "acme/backend");
         assert_eq!(back.bindings[0].wake_dir.as_deref(), Some("/home/user/app"));
-        assert_eq!(back.bindings[1].wake_policy, "never");
+
         assert_eq!(
             back.bindings[1].wake_command.as_deref(),
             Some("/usr/bin/codex")
@@ -581,7 +568,7 @@ mod tests {
             agent = "backend"
             description = "백엔드"
             [wake]
-            policy = "never"
+            policy = "never"  # 2026-09-03 제거된 구형 키 — 무시되어야 한다 (파싱 실패 금지)
             command = "claude"
             dir = "C:\\test-backend"
             "#,
@@ -592,7 +579,6 @@ mod tests {
         assert_eq!((b.agent.as_str(), b.channel.as_str()), ("backend", "myapp"));
         assert_eq!(b.description, "백엔드");
         assert_eq!(b.wake_dir.as_deref(), Some("C:\\test-backend"));
-        assert_eq!(b.wake_policy, "never");
         let wake = cfg.wake.as_ref().unwrap();
         assert_eq!(wake.command, "claude");
         assert_eq!(wake.timeout_s, 600);
@@ -659,13 +645,12 @@ mod tests {
 
     #[test]
     fn upsert_preserves_operational_settings() {
-        // 재enroll(같은 agent@channel)이 wake_dir·policy·러너 오버라이드를 지우면 안 된다
+        // 재enroll(같은 agent@channel)이 wake_dir·러너 오버라이드를 지우면 안 된다
         let mut cfg = BrvConfig {
             server: "http://127.0.0.1:8080".into(),
             wake: None,
             bindings: vec![Binding {
                 wake_dir: Some("/app".into()),
-                wake_policy: "never".into(),
                 wake_command: Some("/usr/bin/codex".into()),
                 description: "old".into(),
                 ..binding("backend", "myapp")
@@ -683,7 +668,6 @@ mod tests {
         assert_eq!(b.org.as_deref(), Some("personal"));
         assert_eq!(b.description, "new");
         assert_eq!(b.wake_dir.as_deref(), Some("/app"));
-        assert_eq!(b.wake_policy, "never");
         assert_eq!(b.wake_command.as_deref(), Some("/usr/bin/codex"));
         // 같은 이름이라도 다른 org면 별개 바인딩으로 추가
         assert!(!cfg.upsert_binding(Binding {

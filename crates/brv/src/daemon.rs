@@ -61,7 +61,7 @@ pub struct DaemonOptions {
     /// 정지 재시도 기본 간격 (기본 30s — 테스트가 줄인다).
     pub fatal_retry_base: Duration,
     /// 깨우기 사전 점검을 **접속의 관문**으로 (2026-09-03, 사용자 확정 "프레즌스는 리시버가
-    /// 아니라 깨어날 세션의 상태를 반영한다"): wake_policy=always 바인딩은 무해한 깨우기 1회가
+    /// 아니라 깨어날 세션의 상태를 반영한다"): 모든 바인딩은 무해한 깨우기 1회가
     /// 통과할 때까지 채널에 붙지 않는다 — 깨울 수 없으면 자리를 잡지 않아 메시지는 서버 큐에
     /// 남고 프레즌스는 idle. 실패하면 `wake_retry_base` 백오프로 재점검, 통과하면 접속.
     /// 운영 중 세션이 시작도 못 하면(빠른 실패) 다시 관문으로 돌아간다.
@@ -112,6 +112,10 @@ impl BindingStatus {
             ClientState::WakeUnavailable { reason, retry_in_s } => format!(
                 "WAKE UNAVAILABLE — not joining the channel (messages queue server-side): {reason} (re-checking in {retry_in_s}s)"
             ),
+            ClientState::Paused { until_unix } => format!(
+                "PAUSED by operator — not joining for {} more min (messages queue server-side; `brv daemon resume` ends it early)",
+                until_unix.saturating_sub(now_unix()).div_ceil(60)
+            ),
             ClientState::Stopped { reason } => format!("STOPPED — {reason}"),
         }
     }
@@ -133,7 +137,7 @@ impl DaemonState {
 
 type SharedState = Arc<tokio::sync::Mutex<BTreeMap<String, BindingStatus>>>;
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -146,6 +150,48 @@ pub fn state_path() -> anyhow::Result<PathBuf> {
         .parent()
         .expect("config has parent")
         .join("daemon-state.json"))
+}
+
+/// 일시정지 파일 (`daemon-pause.json`, 2026-09-03) — `brv daemon pause`가 쓰고 데몬이 5초마다
+/// 읽는다. 대화형 세션이 채널을 직접 맡는 동안 데몬이 자리를 비우는 정직한 수단 (구 `never`
+/// 정책은 처리 없이 소비 확정하는 함정이라 제거). 기한이 지나면 스스로 지워진다.
+pub fn pause_path() -> anyhow::Result<PathBuf> {
+    Ok(crate::config::config_path()?
+        .parent()
+        .expect("config has parent")
+        .join("daemon-pause.json"))
+}
+
+/// 활성 일시정지의 만료 시각(unix) — 없거나 만료면 None (만료 파일은 지운다).
+pub fn read_pause() -> Option<u64> {
+    let path = pause_path().ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let until = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?["until_unix"].as_u64()?;
+    if until <= now_unix() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(until)
+}
+
+pub fn write_pause(until_unix: u64) -> anyhow::Result<PathBuf> {
+    let path = pause_path()?;
+    std::fs::create_dir_all(path.parent().expect("has parent"))?;
+    std::fs::write(
+        &path,
+        serde_json::json!({ "until_unix": until_unix }).to_string(),
+    )?;
+    Ok(path)
+}
+
+/// 일시정지 해제 — Ok(true) = 활성 파일을 지웠다, Ok(false) = 정지 중이 아니었다.
+pub fn clear_pause() -> anyhow::Result<bool> {
+    let path = pause_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// `brv status`용 — 파일이 없거나 못 읽으면 None (구버전 데몬·미기동).
@@ -219,8 +265,8 @@ pub async fn run_with_options(
             b.full_label()
         );
         anyhow::ensure!(
-            b.wake_policy != "always" || b.wake_dir.is_some(),
-            "binding {} has wake_policy=always but no wake_dir — set with `brv wake set --dir <project> --binding {}`",
+            b.wake_dir.is_some(),
+            "binding {} has no wake_dir — set with `brv wake set --dir <project> --binding {}`",
             b.label(),
             b.label()
         );
@@ -320,10 +366,12 @@ pub fn effective_wake(global: &WakeConfig, binding: &Binding) -> WakeConfig {
 /// 바인딩 하나의 수신·깨우기 루프 — 페이즈 27 이전의 단일 데몬 본체와 동일한 로직.
 ///
 /// **깨우기 관문 (2026-09-03, 사용자 확정 "프레즌스는 리시버가 아니라 깨어날 세션의 상태를
-/// 반영한다")**: wake_policy=always면 사전 점검(무해한 깨우기 1회)을 통과할 때까지 채널에
-/// 붙지 않는다 — 깨울 수 없는 머신이 Online으로 보여 발신자를 속이던 것(2026-09-01 맥북
-/// 실사고의 두 번째 고리)을 없앤다. 관문 밖에 있는 동안 메시지는 서버 큐에 남고 프레즌스는
-/// idle. 운영 중 세션이 시작도 못 하면(빠른 실패) 자리를 내려놓고 관문으로 돌아간다.
+/// 반영한다")**: 사전 점검(무해한 깨우기 1회)을 통과할 때까지 채널에 붙지 않는다 — 깨울 수
+/// 없는 머신이 Online으로 보여 발신자를 속이던 것(2026-09-01 맥북 실사고의 두 번째 고리)을
+/// 없앤다. 관문 밖에 있는 동안 메시지는 서버 큐에 남고 프레즌스는 idle. 운영 중 세션이
+/// 시작도 못 하면(빠른 실패) 자리를 내려놓고 관문으로 돌아간다.
+/// **일시정지 (`brv daemon pause`)**: 운영자가 잠시 자리를 비우라고 하면 같은 방식으로 큐에
+/// 맡긴다 — 대화형 세션이 채널을 직접 맡을 때의 정직한 수단 (구 `never` 정책 대체).
 async fn binding_loop(
     server: String,
     wake: WakeConfig,
@@ -346,9 +394,22 @@ async fn binding_loop(
     // 스폰 실패의 확인 유보분(unacked)은 파킹을 막으므로 페이즈 20 가시화는 불변
     opts.idle_park = Some(crate::client::DEFAULT_IDLE_PARK);
     let label = binding.full_label();
-    let gated = rt.gate && binding.wake_policy == "always";
+    let gated = rt.gate;
 
     loop {
+        // ---- 운영자 일시정지 (2026-09-03, `brv daemon pause`): 자리를 비우고 큐에 맡긴다 ----
+        while let Some(until) = read_pause() {
+            set_status(
+                &rt,
+                &label,
+                Some(ClientState::Paused { until_unix: until }),
+                None,
+            )
+            .await;
+            if !sleep_or_shutdown(Duration::from_secs(5), shutdown.as_mut()).await {
+                return Ok(());
+            }
+        }
         // ---- 관문: 깨울 수 있을 때만 자리를 잡는다 ----
         if gated {
             let mut attempt: u32 = 0;
@@ -430,11 +491,28 @@ async fn binding_loop(
                 tracing::info!(binding = %binding.label(), "shutdown signal — binding loop exiting");
                 return Ok(());
             }
-            // 첫 메시지는 무기한 대기 (내부적으로 재접속·standby가 알아서 돈다)
-            let first = if let Some(sd) = shutdown.as_mut() {
+            // 첫 메시지는 무기한 대기 (내부적으로 재접속·standby가 알아서 돈다).
+            // 5초 틱으로 운영자 일시정지(`brv daemon pause`)를 살핀다 — 정지면 자리를 비운다.
+            // recv를 pin해 두고 틱마다 다시 poll하는 이유: 틱마다 새 recv를 만들면 대기자가
+            // 액터에 쌓인다
+            let recv = client.recv_manual(RecvFilter::Any, Duration::from_secs(3600));
+            tokio::pin!(recv);
+            let mut pause_tick = tokio::time::interval(Duration::from_secs(5));
+            pause_tick.tick().await; // 첫 틱은 즉시 발화 — 버린다
+            let first = loop {
                 tokio::select! {
-                    pair = client.recv_manual(RecvFilter::Any, Duration::from_secs(3600)) => pair,
-                    res = sd.changed() => {
+                    pair = &mut recv => break pair,
+                    _ = pause_tick.tick() => {
+                        if read_pause().is_some() {
+                            break 'recv false;
+                        }
+                    }
+                    res = async {
+                        match shutdown.as_mut() {
+                            Some(sd) => sd.changed().await.map_err(|_| ()),
+                            None => std::future::pending::<Result<(), ()>>().await,
+                        }
+                    } => {
                         // 송신 측 소멸(Err)은 서비스 런타임이 끝난 것 — 종료로 취급 (busy loop 방지)
                         if res.is_err() {
                             return Ok(());
@@ -442,10 +520,6 @@ async fn binding_loop(
                         continue 'recv; // 루프 상단에서 플래그 재검사
                     }
                 }
-            } else {
-                client
-                    .recv_manual(RecvFilter::Any, Duration::from_secs(3600))
-                    .await
             };
             let Some(first) = first else {
                 // 시간 초과와 죽은 클라이언트를 구분 (2026-09-02 맥북 실사고): 종전엔 둘 다 None이라
@@ -473,19 +547,6 @@ async fn binding_loop(
             let envelopes: Vec<Envelope> = batch.iter().map(|(env, _)| env.clone()).collect();
             journal_append(&rt.journal, &rt.journal_lock, &binding, &envelopes).await;
 
-            if binding.wake_policy != "always" {
-                // 깨우기 없는 정책 = 저널이 최종 목적지 — 여기서 소비 확정
-                for (_, token) in &batch {
-                    client.confirm(*token).await;
-                }
-                tracing::info!(
-                    binding = %binding.label(),
-                    count = batch.len(),
-                    "messages received but wake_policy is {:?} — queued in journal only",
-                    binding.wake_policy
-                );
-                continue 'recv;
-            }
             let prompt = build_prompt(&binding, &wake, &envelopes);
             let dir = binding
                 .wake_dir
@@ -656,7 +717,9 @@ pub fn build_prompt(binding: &Binding, wake: &WakeConfig, batch: &[Envelope]) ->
                  If a request needs capabilities beyond them (file edits, shell, ...), do not attempt \
                  workarounds: reply that this machine's wake permission level blocks it, and that the \
                  machine owner can widen it with `brv wake set --allow edit|full` (see the README's \
-                 unattended-mode section)."
+                 unattended-mode section). This receiver's own configuration is not yours to change: \
+                 `brv wake set`, `brv binding`, `brv init` and `brv daemon` commands are refused in \
+                 unattended sessions — if the setup must change, say so in your reply and leave it to the owner."
             )
         })
         .unwrap_or_default();
@@ -897,7 +960,6 @@ mod tests {
             channel: "myapp".into(),
             description: String::new(),
             wake_dir: Some(".".into()),
-            wake_policy: "always".into(),
             wake_command: None,
             wake_args: None,
         }

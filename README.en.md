@@ -79,7 +79,8 @@ Good to know:
 - A wide allowance means "anyone who can message this channel can put this machine to work" — open only as far as you trust the channel's participants
 - When a request exceeds the allowance, the woken agent replies to the sender that "this machine's wake permission blocks it" instead of doing it — raise `--allow` then if you want
 - The daemon service runs in the current user's context (keychain and CLI-login access); pin a specific profile with `brv daemon install --config <absolute path>`. Remove with `brv daemon uninstall`
-- With multiple bindings: the allowance (`--allow`), executable, and timeout are machine-global, while the working directory and whether to wake are per binding — `brv wake set --dir <project> --binding {agent}@{channel}`, verify with `brv wake test --binding …`
+- With multiple bindings: the allowance (`--allow`), executable, and timeout are machine-global, while the working directory is per binding — `brv wake set --dir <project> --binding {agent}@{channel}`, verify with `brv wake test --binding …`
+- **To hold off wakes for a while, `brv daemon pause --for 2h`** — for when an interactive session handles the channel itself. The daemon leaves the channel so messages queue server-side (`brv status` shows `PAUSED`); when time is up or you run `brv daemon resume`, it re-checks wake and rejoins. There is no policy to turn waking off permanently — receiving without processing would mark messages as handled. Overlap with an interactive session resolves by itself anyway (once the session holds the slot, the daemon stands by)
 - The daemon **automatically propagates its config path (`BREVDUVA_CONFIG`) and the waking binding (`BREVDUVA_BINDING`)** to woken sessions, and when the runner is Claude Code it **injects the local `brevduva` MCP server via `--mcp-config`** — unattended sessions always have the `mcp__brevduva__*` tools, even with no or a stale user-scope registration. On Windows, `.cmd/.bat` runners are automatically routed through `cmd /d /c` (guaranteed spawn even in Task Scheduler environments)
 - The daemon **does not join the channel until a wake pre-flight passes** (one harmless prompt). A machine that cannot run a session would mislead peers by looking online, so with an expired runner login and the like it holds back (presence idle, messages safe in the server queue), re-checks every 1→15 minutes, and joins once the check passes. If a session cannot even start mid-operation it withdraws the same way — `brv status` shows `WAKE UNAVAILABLE`
 - Commands that change the config (`brv init --enroll`, `binding add/remove`, `wake set`) **restart a daemon registered as an OS service automatically** so the change is live (`brv daemon restart` does it by hand). If the token is rejected, the daemon does not die — it **suspends and keeps retrying**, and heals itself without a restart once a reconnect (re-enroll) changes the token. `brv status` shows each binding's state (connected · parked · SUSPENDED …)
@@ -102,7 +103,7 @@ agent = "backend"
 channel = "my-project"
 description = "Owns the backend — ask me about the API and DB"
 wake_dir = "/home/me/my-project"       # working directory for woken sessions (project root with .mcp.json)
-wake_policy = "always"                 # always = wake on arrival | never = journal only
+
 
 [[binding]]                            # a different runner per binding is fine — inherits global [wake] if omitted
 org = "my-org"
@@ -119,6 +120,7 @@ Legacy singular form (top-level `channel`/`agent` plus `dir`/`policy` under `[wa
 
 - `brv wake test` fails: check that the command is an absolute path, and see what the session output log (`wake.log` in the config directory) left behind
 - The wake fired but the agent can't do the work: the `allow` level in `brv wake show` is too low — `brv wake set --allow edit|full`
+- Inside an unattended session, `brv wake set` / `binding` / `init` / `daemon` are refused with "refused … unattended session": by design — a remote message must not be able to change this machine's local policy. The machine owner changes the setup
 - The wake fired but the session can't use brevduva tools (can't reply): check whether Claude Code's MCP registration (`claude mcp get brevduva`) carries a stale `--env BREVDUVA_CONFIG=…` — **an env pinned in the registration overrides what the daemon auto-propagates**. Remove the env from the registration or update it to the current config path (rare since 0.6.6: the daemon injects the local MCP itself and enroll refreshes the registration)
 - `brv status` shows `SUSPENDED — … token …`: the token was rejected (access revoked in the dashboard, or the same agent was connected on another machine). Issue a new connect code in the dashboard and run `brv init --enroll` — the daemon heals without a restart
 - `brv status` shows `WAKE UNAVAILABLE — …`: no session can run, so the daemon is staying off the channel (messages wait in the server queue) — fix the runner login (`claude login`), path, or permissions and it joins on the next re-check (within 15 minutes); to confirm right away, `brv wake test` then `brv daemon restart`

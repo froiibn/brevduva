@@ -174,10 +174,7 @@ enum WakeCmd {
         /// Max run time for a woken session in seconds — always global (machine policy)
         #[arg(long)]
         timeout: Option<u64>,
-        /// always (wake on arrival)|never (journal only) — **per binding**
-        #[arg(long)]
-        policy: Option<String>,
-        /// Target binding for per-binding values (--dir/--policy, and --command/--allow as overrides)
+        /// Target binding for per-binding values (--dir, and --command/--allow as overrides)
         #[arg(long)]
         binding: Option<String>,
     },
@@ -213,6 +210,14 @@ enum DaemonCmd {
     Uninstall,
     /// Restart the registered OS service (config/token changes apply on restart)
     Restart,
+    /// Pause the daemon for a while — it leaves the channel and messages queue server-side (for when an interactive session handles the channel itself)
+    Pause {
+        /// How long, e.g. 30m, 2h (default 1h)
+        #[arg(long = "for", default_value = "1h")]
+        duration: String,
+    },
+    /// End a pause early — the daemon re-checks wake and rejoins
+    Resume,
     /// (windows only) service entry point invoked by SCM — never run directly
     #[command(hide = true)]
     ServiceRun {
@@ -279,7 +284,43 @@ fn init_service_file_tracing() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 무인 세션(데몬이 깨운 세션 — `BREVDUVA_BINDING`을 물려받는다) 안에서 이 머신의 로컬 정책을
+/// 바꾸는 명령 (2026-09-03, 실사고: 에이전트가 `brv wake set --policy never`로 자기 깨우기를
+/// 껐다). 원격 메시지가 로컬 정책을 바꾸는 경로를 막는다 — 페이즈 21 원칙의 구멍 봉합.
+/// 보안 경계가 아니라 난간이다: full 권한 세션은 파일을 직접 고칠 수 있으므로 진짜 경계는
+/// 허용 수준(respond/edit)이다.
+fn changes_local_policy(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Init { .. }
+            | Cmd::Binding {
+                action: BindingCmd::Add { .. } | BindingCmd::Remove { .. },
+            }
+            | Cmd::Wake {
+                action: WakeCmd::Set { .. },
+            }
+            | Cmd::Daemon {
+                action: Some(
+                    DaemonCmd::Install { .. }
+                        | DaemonCmd::Uninstall
+                        | DaemonCmd::Restart
+                        | DaemonCmd::Pause { .. }
+                        | DaemonCmd::Resume
+                ),
+                ..
+            }
+            | Cmd::Hook {
+                action: HookCmd::Install,
+            }
+    )
+}
+
 async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
+    if std::env::var_os("BREVDUVA_BINDING").is_some() && changes_local_policy(&cmd) {
+        anyhow::bail!(
+            "refused: this command changes the receiver's local policy and is not allowed from an unattended (daemon-woken) session — tell the sender the machine owner must run it"
+        );
+    }
     match cmd {
         Cmd::Init {
             server,
@@ -351,6 +392,8 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             Some(DaemonCmd::Install { config }) => brv::service::install(config.as_deref()),
             Some(DaemonCmd::Uninstall) => brv::service::uninstall(),
             Some(DaemonCmd::Restart) => restart_daemon(true),
+            Some(DaemonCmd::Pause { duration }) => pause_daemon(&duration),
+            Some(DaemonCmd::Resume) => resume_daemon(),
             // main()이 런타임 진입 전에 처리한다
             Some(DaemonCmd::ServiceRun { .. }) => unreachable!("service-run branches in main"),
         },
@@ -360,9 +403,8 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
                 command,
                 dir,
                 timeout,
-                policy,
                 binding,
-            } => wake_set(allow, command, dir, timeout, policy, binding.as_deref()),
+            } => wake_set(allow, command, dir, timeout, binding.as_deref()),
             WakeCmd::Show => wake_show(),
             WakeCmd::Test { binding } => wake_test(binding.as_deref()).await,
         },
@@ -459,7 +501,7 @@ fn resolve_command(c: String) -> anyhow::Result<String> {
         .into_owned())
 }
 
-/// `brv wake set` — 전역([wake]: 실행기·권한·타임아웃)과 바인딩별(dir·policy, 그리고
+/// `brv wake set` — 전역([wake]: 실행기·권한·타임아웃)과 바인딩별(dir, 그리고
 /// --binding과 결합된 --command/--allow = 러너 오버라이드)을 한 명령으로.
 /// 지정한 값만 갱신하고 나머지는 유지(멱등). 설정 파일이 단일 진실이라 재부팅·데몬
 /// 재시작·재init(보존은 upsert가 담당)에도 계속 유지된다.
@@ -468,18 +510,11 @@ fn wake_set(
     command: Option<String>,
     dir: Option<String>,
     timeout: Option<u64>,
-    policy: Option<String>,
     binding_sel: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut cfg = config::load()?; // 연결 설정(init) 위에 얹는다 — 미init이면 여기서 안내됨
     // --binding이 있으면 --command/--allow는 그 바인딩의 오버라이드 (2026-09-01 러너 혼용)
     let binding_scoped = binding_sel.is_some();
-    if let Some(p) = &policy {
-        anyhow::ensure!(
-            p == "always" || p == "never",
-            "unknown --policy {p:?} — one of: always, never"
-        );
-    }
     if let Some(level) = &allow {
         anyhow::ensure!(
             config::wake_preset_args(level).is_some(),
@@ -518,8 +553,8 @@ fn wake_set(
         timeout_s,
     });
 
-    // ---- 바인딩부 (페이즈 27): dir·policy + 스코프된 command/allow ----
-    let needs_binding = binding_scoped || dir.is_some() || policy.is_some();
+    // ---- 바인딩부 (페이즈 27): dir + 스코프된 command/allow ----
+    let needs_binding = binding_scoped || dir.is_some();
     // 신규 단일 바인딩에서 wake_dir 미설정이면 현재 디렉터리를 기본으로 —
     // "프로젝트 루트에서 설정한다"는 페이즈 21의 자연 동작 유지
     let default_dir = cfg.bindings.len() == 1 && cfg.bindings[0].wake_dir.is_none();
@@ -537,9 +572,6 @@ fn wake_set(
             .expect("select returned an existing binding");
         if let Some(d) = dir {
             target.wake_dir = Some(d);
-        }
-        if let Some(p) = policy {
-            target.wake_policy = p;
         }
         if binding_scoped {
             if let Some(c) = command {
@@ -583,9 +615,8 @@ fn wake_show() -> anyhow::Result<()> {
             "runner (global)".to_owned()
         };
         println!(
-            "  {:34} policy {:6} dir {} — {runner}",
+            "  {:34} dir {} — {runner}",
             b.full_label(),
-            b.wake_policy,
             b.wake_dir.as_deref().unwrap_or("(unset — wake blocked)")
         );
     }
@@ -924,7 +955,6 @@ async fn init(
         channel,
         description,
         wake_dir: None,
-        wake_policy: "always".to_owned(),
         wake_command: None,
         wake_args: None,
     };
@@ -960,10 +990,9 @@ fn binding_list() -> anyhow::Result<()> {
             "token MISSING — enroll needed"
         };
         println!(
-            "  {:34} {token:28} wake {:6} {}",
+            "  {:34} {token:28} dir {}",
             b.full_label(),
-            b.wake_policy,
-            b.wake_dir.as_deref().unwrap_or("(dir unset)")
+            b.wake_dir.as_deref().unwrap_or("(unset)")
         );
         if !b.description.is_empty() {
             println!("    {}", b.description);
@@ -992,7 +1021,6 @@ async fn binding_add(agent: String, channel: String, description: String) -> any
             channel: String::new(),
             description: String::new(),
             wake_dir: None,
-            wake_policy: "always".to_owned(),
             wake_command: None,
             wake_args: None,
         });
@@ -1015,7 +1043,6 @@ async fn binding_add(agent: String, channel: String, description: String) -> any
             channel,
             description,
             wake_dir: None,
-            wake_policy: "always".to_owned(),
             wake_command: None,
             wake_args: None,
         },
@@ -1027,6 +1054,45 @@ async fn binding_add(agent: String, channel: String, description: String) -> any
     );
     restart_daemon(false)?;
     Ok(())
+}
+
+/// `brv daemon pause --for <기간>` (2026-09-03) — 대화형 세션이 채널을 직접 맡는 동안 데몬이
+/// 자리를 비운다 (메시지는 서버 큐에). 파일 신호라 데몬 재기동 없이 5초 안에 반영된다.
+fn pause_daemon(spec: &str) -> anyhow::Result<()> {
+    let secs = parse_duration_secs(spec)?;
+    brv::daemon::write_pause(brv::daemon::now_unix() + secs)?;
+    println!(
+        "daemon paused for {spec} — it leaves the channel within a few seconds; messages queue server-side. End early: brv daemon resume"
+    );
+    Ok(())
+}
+
+fn resume_daemon() -> anyhow::Result<()> {
+    if brv::daemon::clear_pause()? {
+        println!("daemon resumed — it re-checks wake and rejoins the channel within a few seconds");
+    } else {
+        println!("daemon was not paused");
+    }
+    Ok(())
+}
+
+/// "30s" / "45m" / "2h" — 단위 없는 숫자는 분.
+fn parse_duration_secs(spec: &str) -> anyhow::Result<u64> {
+    let spec = spec.trim();
+    let (num, unit) = spec
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or((spec, "m"), |i| spec.split_at(i));
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("invalid duration {spec:?} — use e.g. 30m, 2h"))?;
+    let secs = match unit.trim() {
+        "s" => n,
+        "m" | "min" => n * 60,
+        "h" => n * 3600,
+        _ => anyhow::bail!("invalid duration unit in {spec:?} — use s, m, or h"),
+    };
+    anyhow::ensure!(secs > 0, "duration must be positive");
+    Ok(secs)
 }
 
 /// 설정을 바꾼 명령들이 부른다 (2026-09-02): 서비스가 등록돼 있으면 재기동해 변경을 즉시 반영,
@@ -1098,6 +1164,12 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
             }
         }
         None => println!("daemon: no state file (not running here, or older than 0.6.6)"),
+    }
+    if let Some(until) = brv::daemon::read_pause() {
+        println!(
+            "daemon: PAUSED by operator — {} min left (brv daemon resume ends it early)",
+            until.saturating_sub(brv::daemon::now_unix()).div_ceil(60)
+        );
     }
     let health = reqwest::Client::new()
         .get(format!("{}/healthz", cfg.server.trim_end_matches('/')))

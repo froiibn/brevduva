@@ -69,6 +69,11 @@ pub enum ClientState {
         reason: String,
         retry_in_s: u64,
     },
+    /// 운영자 일시정지 (`brv daemon pause`, 2026-09-03) — 데몬이 자리를 내려놓아 메시지는
+    /// 서버 큐에 남는다. 대화형 세션이 채널을 직접 맡을 때 쓰는 정직한 수단 (구 `never` 대체).
+    Paused {
+        until_unix: u64,
+    },
     /// 종료 — 대화형 모드의 치명 오류, 또는 핸들 전부 드롭.
     Stopped {
         reason: String,
