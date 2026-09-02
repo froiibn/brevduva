@@ -695,12 +695,13 @@ fn script_wrap(windows: bool, command: &str, args: &[String]) -> (String, Vec<St
 pub const WAKE_TEST_PROMPT: &str = "This is `brv wake test` — a harness self-check, not a real task. \
     Print exactly `wake ok` and finish immediately. Do not call any tools.";
 
-/// 러너가 Claude Code CLI인지 — 파일 이름이 `claude`로 시작 (`claude`, `claude.exe`, `claude.cmd`).
+/// 러너가 Claude Code CLI인지 — 파일 이름이 `claude` (`claude`, `claude.exe`, `claude.cmd`).
+/// 구분자를 `/`·`\` 모두로 자르는 이유: 윈도우 설정의 백슬래시 경로를 리눅스 CI가 검사한다
+/// (2026-09-03 CI 실측 — `Path::file_stem`은 호스트 OS 구분자만 안다).
 fn is_claude_runner(command: &str) -> bool {
-    Path::new(command)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
+    let name = command.rsplit(['/', '\']).next().unwrap_or(command);
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    stem.eq_ignore_ascii_case("claude")
 }
 
 /// 깨운 세션에 로컬 `brevduva` MCP 서버를 직접 꽂는다 (2026-09-02, 맥북·윈도우 실사고의 근본
