@@ -60,9 +60,14 @@ pub struct DaemonOptions {
     pub token_reload: Option<BindingTokenReload>,
     /// 정지 재시도 기본 간격 (기본 30s — 테스트가 줄인다).
     pub fatal_retry_base: Duration,
-    /// 기동 시 깨우기 사전 점검 — wake_policy=always 바인딩마다 무해한 깨우기 1회로 러너·인증을
-    /// 확인해 상태 파일에 남긴다 (메시지가 오기 **전에** "깨울 수 없는 상태"를 알기 위해).
+    /// 깨우기 사전 점검을 **접속의 관문**으로 (2026-09-03, 사용자 확정 "프레즌스는 리시버가
+    /// 아니라 깨어날 세션의 상태를 반영한다"): wake_policy=always 바인딩은 무해한 깨우기 1회가
+    /// 통과할 때까지 채널에 붙지 않는다 — 깨울 수 없으면 자리를 잡지 않아 메시지는 서버 큐에
+    /// 남고 프레즌스는 idle. 실패하면 `wake_retry_base` 백오프로 재점검, 통과하면 접속.
+    /// 운영 중 세션이 시작도 못 하면(빠른 실패) 다시 관문으로 돌아간다.
     pub preflight: bool,
+    /// 관문 재점검 기본 간격 (기본 60s → 최대 15분 — 테스트가 줄인다).
+    pub wake_retry_base: Duration,
 }
 
 impl Default for DaemonOptions {
@@ -72,6 +77,7 @@ impl Default for DaemonOptions {
             token_reload: None,
             fatal_retry_base: Duration::from_secs(30),
             preflight: false,
+            wake_retry_base: Duration::from_secs(60),
         }
     }
 }
@@ -103,6 +109,9 @@ impl BindingStatus {
                     "SUSPENDED — {reason} (retrying in {retry_in_s}s; re-enroll to fix a token)"
                 )
             }
+            ClientState::WakeUnavailable { reason, retry_in_s } => format!(
+                "WAKE UNAVAILABLE — not joining the channel (messages queue server-side): {reason} (re-checking in {retry_in_s}s)"
+            ),
             ClientState::Stopped { reason } => format!("STOPPED — {reason}"),
         }
     }
@@ -248,39 +257,14 @@ pub async fn run_with_options(
             BindingRuntime {
                 reload,
                 fatal_retry_base: opts.fatal_retry_base,
+                gate: opts.preflight,
+                wake_retry_base: opts.wake_retry_base,
                 shared: Arc::clone(&shared),
                 state_file: state_file.clone(),
                 journal: journal.clone(),
                 journal_lock: Arc::clone(&journal_lock),
             },
         ));
-    }
-    if opts.preflight {
-        for b in cfg.bindings.iter().filter(|b| b.wake_policy == "always") {
-            let (wake, b) = (effective_wake(&wake, b), b.clone());
-            let (shared, state_file) = (Arc::clone(&shared), state_file.clone());
-            tokio::spawn(async move {
-                let verdict = match preflight_wake(&wake, &b).await {
-                    Ok(secs) => {
-                        tracing::info!(binding = %b.label(), secs, "wake pre-flight ok");
-                        format!("ok ({secs:.1}s)")
-                    }
-                    Err(e) => {
-                        tracing::error!(binding = %b.label(), error = %e, "wake pre-flight FAILED — messages will be received but sessions cannot run until this is fixed");
-                        format!("failed: {e}")
-                    }
-                };
-                let mut map = shared.lock().await;
-                map.entry(b.full_label())
-                    .or_insert_with(|| BindingStatus {
-                        state: ClientState::Connecting,
-                        since_unix: now_unix(),
-                        wake_check: None,
-                    })
-                    .wake_check = Some(verdict);
-                write_state(&state_file, &map).await;
-            });
-        }
     }
     // 한 바인딩 루프의 실패는 프로세스 실패 — OS 서비스의 자동 재시작이 전체를 복구한다
     // (바인딩별 부분 생존은 반쪽 수신 상태를 감춰서 더 위험)
@@ -294,6 +278,9 @@ pub async fn run_with_options(
 struct BindingRuntime {
     reload: Option<TokenReload>,
     fatal_retry_base: Duration,
+    /// 깨우기 관문 (DaemonOptions::preflight) + 재점검 간격.
+    gate: bool,
+    wake_retry_base: Duration,
     shared: SharedState,
     state_file: PathBuf,
     journal: PathBuf,
@@ -331,6 +318,12 @@ pub fn effective_wake(global: &WakeConfig, binding: &Binding) -> WakeConfig {
 }
 
 /// 바인딩 하나의 수신·깨우기 루프 — 페이즈 27 이전의 단일 데몬 본체와 동일한 로직.
+///
+/// **깨우기 관문 (2026-09-03, 사용자 확정 "프레즌스는 리시버가 아니라 깨어날 세션의 상태를
+/// 반영한다")**: wake_policy=always면 사전 점검(무해한 깨우기 1회)을 통과할 때까지 채널에
+/// 붙지 않는다 — 깨울 수 없는 머신이 Online으로 보여 발신자를 속이던 것(2026-09-01 맥북
+/// 실사고의 두 번째 고리)을 없앤다. 관문 밖에 있는 동안 메시지는 서버 큐에 남고 프레즌스는
+/// idle. 운영 중 세션이 시작도 못 하면(빠른 실패) 자리를 내려놓고 관문으로 돌아간다.
 async fn binding_loop(
     server: String,
     wake: WakeConfig,
@@ -344,7 +337,7 @@ async fn binding_loop(
     opts.description = binding.description.clone();
     opts.takeover_standby = true; // 데몬의 핵심 매너 — 대화형 세션에 자리를 양보
     // 토큰 거부 시 정지·재읽기·재시도 (2026-09-02, 맥북 실사고) — 상세는 client::TokenReload
-    opts.token_reload = rt.reload;
+    opts.token_reload = rt.reload.clone();
     opts.fatal_retry_base = rt.fatal_retry_base;
     // 유휴 파킹 (2026-09-01): 평시에는 recv_manual 대기자가 상주해 발동하지 않는다.
     // 발동하는 유일한 구간은 wait_wake(깨운 세션 완주 대기, 최대 timeout_s) 중 —
@@ -352,127 +345,250 @@ async fn binding_loop(
     // 대신 파킹해 큐에 남긴다 (wake 종료 후 다음 recv_manual이 자리를 되찾아 처리).
     // 스폰 실패의 확인 유보분(unacked)은 파킹을 막으므로 페이즈 20 가시화는 불변
     opts.idle_park = Some(crate::client::DEFAULT_IDLE_PARK);
-    let client = Client::connect(opts);
-    // 상태 관찰자 — 접속 상태가 바뀔 때마다 상태 파일 갱신 (프로세스와 함께 끝난다)
-    {
-        let mut rx = client.state();
-        let label = binding.full_label();
-        let (shared, state_file) = (Arc::clone(&rt.shared), rt.state_file.clone());
-        tokio::spawn(async move {
-            loop {
-                let s = rx.borrow_and_update().clone();
-                {
-                    let mut map = shared.lock().await;
-                    let entry = map.entry(label.clone()).or_insert_with(|| BindingStatus {
-                        state: s.clone(),
-                        since_unix: now_unix(),
-                        wake_check: None,
-                    });
-                    if entry.state != s {
-                        entry.state = s;
-                        entry.since_unix = now_unix();
-                    }
-                    write_state(&state_file, &map).await;
-                }
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let label = binding.full_label();
+    let gated = rt.gate && binding.wake_policy == "always";
 
     loop {
-        if shutdown.as_ref().is_some_and(|s| *s.borrow()) {
-            tracing::info!(binding = %binding.label(), "shutdown signal — binding loop exiting");
-            return Ok(());
-        }
-        // 첫 메시지는 무기한 대기 (내부적으로 재접속·standby가 알아서 돈다)
-        let first = if let Some(sd) = shutdown.as_mut() {
-            tokio::select! {
-                pair = client.recv_manual(RecvFilter::Any, Duration::from_secs(3600)) => pair,
-                res = sd.changed() => {
-                    // 송신 측 소멸(Err)은 서비스 런타임이 끝난 것 — 종료로 취급 (busy loop 방지)
-                    if res.is_err() {
-                        return Ok(());
+        // ---- 관문: 깨울 수 있을 때만 자리를 잡는다 ----
+        if gated {
+            let mut attempt: u32 = 0;
+            loop {
+                if shutdown_requested(&shutdown) {
+                    return Ok(());
+                }
+                match preflight_wake(&wake, &binding).await {
+                    Ok(secs) => {
+                        tracing::info!(binding = %binding.label(), secs, "wake pre-flight ok — joining the channel");
+                        set_status(
+                            &rt,
+                            &label,
+                            Some(ClientState::Connecting),
+                            Some(format!("ok ({secs:.1}s)")),
+                        )
+                        .await;
+                        break;
                     }
-                    continue; // 루프 상단에서 플래그 재검사
+                    Err(e) => {
+                        attempt += 1;
+                        let wait = gate_backoff(rt.wake_retry_base, attempt);
+                        tracing::error!(
+                            binding = %binding.label(),
+                            error = %e,
+                            retry_in_s = wait.as_secs(),
+                            "wake pre-flight FAILED — not joining the channel (messages stay queued server-side); will re-check"
+                        );
+                        set_status(
+                            &rt,
+                            &label,
+                            Some(ClientState::WakeUnavailable {
+                                reason: e.to_string(),
+                                retry_in_s: wait.as_secs(),
+                            }),
+                            Some(format!("failed: {e}")),
+                        )
+                        .await;
+                        if !sleep_or_shutdown(wait, shutdown.as_mut()).await {
+                            return Ok(());
+                        }
+                    }
                 }
             }
-        } else {
-            client
-                .recv_manual(RecvFilter::Any, Duration::from_secs(3600))
-                .await
-        };
-        let Some(first) = first else {
-            // 시간 초과와 죽은 클라이언트를 구분 (2026-09-02 맥북 실사고): 종전엔 둘 다 None이라
-            // 죽은 채 무한 재대기했다 — 죽었으면 오류로 올려 프로세스 종료(감독자 재기동)
-            // 경로를 살린다. 데몬 모드의 토큰 거부는 정지·재시도로 살아 있으므로 여기 안 온다
-            anyhow::ensure!(
-                client.is_alive(),
-                "client for binding {} stopped (fatal join failure) — exiting so the supervisor restarts",
-                binding.label()
-            );
-            continue;
-        };
-        let mut batch = vec![first];
-        let deadline = Instant::now() + DEBOUNCE;
-        while batch.len() < BATCH_CAP {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match client.recv_manual(RecvFilter::Any, remaining).await {
-                Some(pair) => batch.push(pair),
-                None => break,
-            }
         }
-        let envelopes: Vec<Envelope> = batch.iter().map(|(env, _)| env.clone()).collect();
-        journal_append(&rt.journal, &rt.journal_lock, &binding, &envelopes).await;
 
-        if binding.wake_policy != "always" {
-            // 깨우기 없는 정책 = 저널이 최종 목적지 — 여기서 소비 확정
-            for (_, token) in &batch {
-                client.confirm(*token).await;
+        let client = Client::connect(opts.clone());
+        // 상태 관찰자 — 접속 상태가 바뀔 때마다 상태 파일 갱신 (관문 복귀 시 중단)
+        let watcher = {
+            let mut rx = client.state();
+            let label = label.clone();
+            let (shared, state_file) = (Arc::clone(&rt.shared), rt.state_file.clone());
+            tokio::spawn(async move {
+                loop {
+                    let s = rx.borrow_and_update().clone();
+                    {
+                        let mut map = shared.lock().await;
+                        let entry = map.entry(label.clone()).or_insert_with(|| BindingStatus {
+                            state: s.clone(),
+                            since_unix: now_unix(),
+                            wake_check: None,
+                        });
+                        if entry.state != s {
+                            entry.state = s;
+                            entry.since_unix = now_unix();
+                        }
+                        write_state(&state_file, &map).await;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        // ---- 수신·깨우기 루프 — true로 빠져나오면 관문 재점검 ----
+        let regate = 'recv: loop {
+            if shutdown_requested(&shutdown) {
+                tracing::info!(binding = %binding.label(), "shutdown signal — binding loop exiting");
+                return Ok(());
             }
-            tracing::info!(
-                binding = %binding.label(),
-                count = batch.len(),
-                "messages received but wake_policy is {:?} — queued in journal only",
-                binding.wake_policy
-            );
-            continue;
-        }
-        let prompt = build_prompt(&binding, &wake, &envelopes);
-        let dir = binding
-            .wake_dir
-            .as_deref()
-            .expect("validated at startup: always requires wake_dir");
-        // 소비 확정은 **스폰 성공 시점** (페이즈 20, 2026-08-29 실사고의 근본 수정):
-        // 예전엔 수신 즉시 확인해서, 깨우기 실패(claude 경로 등) 시 메시지가 큐에서 이탈해
-        // 저널에만 남았다. 이제 스폰 실패면 확인하지 않는다 — ack_wait 후 재전달로 자동
-        // 재시도되고, 반복 실패는 max_deliver 소진 → 포이즌 표시로 대시보드에 드러난다.
-        // 완주가 아니라 스폰을 기준으로 하는 이유: 장시간 깨우기 동안 미확인분이 재전달되는
-        // 중복 폭주를 피하기 위함 (깨어난 세션의 크래시는 저널 + 세션 로그가 잡는다).
-        match spawn_wake(&wake, dir, &binding.full_label(), &prompt).await {
-            Ok(child) => {
+            // 첫 메시지는 무기한 대기 (내부적으로 재접속·standby가 알아서 돈다)
+            let first = if let Some(sd) = shutdown.as_mut() {
+                tokio::select! {
+                    pair = client.recv_manual(RecvFilter::Any, Duration::from_secs(3600)) => pair,
+                    res = sd.changed() => {
+                        // 송신 측 소멸(Err)은 서비스 런타임이 끝난 것 — 종료로 취급 (busy loop 방지)
+                        if res.is_err() {
+                            return Ok(());
+                        }
+                        continue 'recv; // 루프 상단에서 플래그 재검사
+                    }
+                }
+            } else {
+                client
+                    .recv_manual(RecvFilter::Any, Duration::from_secs(3600))
+                    .await
+            };
+            let Some(first) = first else {
+                // 시간 초과와 죽은 클라이언트를 구분 (2026-09-02 맥북 실사고): 종전엔 둘 다 None이라
+                // 죽은 채 무한 재대기했다 — 죽었으면 오류로 올려 프로세스 종료(감독자 재기동)
+                // 경로를 살린다. 데몬 모드의 토큰 거부는 정지·재시도로 살아 있으므로 여기 안 온다
+                anyhow::ensure!(
+                    client.is_alive(),
+                    "client for binding {} stopped (fatal join failure) — exiting so the supervisor restarts",
+                    binding.label()
+                );
+                continue 'recv;
+            };
+            let mut batch = vec![first];
+            let deadline = Instant::now() + DEBOUNCE;
+            while batch.len() < BATCH_CAP {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match client.recv_manual(RecvFilter::Any, remaining).await {
+                    Some(pair) => batch.push(pair),
+                    None => break,
+                }
+            }
+            let envelopes: Vec<Envelope> = batch.iter().map(|(env, _)| env.clone()).collect();
+            journal_append(&rt.journal, &rt.journal_lock, &binding, &envelopes).await;
+
+            if binding.wake_policy != "always" {
+                // 깨우기 없는 정책 = 저널이 최종 목적지 — 여기서 소비 확정
                 for (_, token) in &batch {
                     client.confirm(*token).await;
                 }
-                if let Err(e) = wait_wake(&wake, child).await {
-                    tracing::error!(binding = %binding.label(), error = %e, "wake session failed after spawn — see wake.log");
+                tracing::info!(
+                    binding = %binding.label(),
+                    count = batch.len(),
+                    "messages received but wake_policy is {:?} — queued in journal only",
+                    binding.wake_policy
+                );
+                continue 'recv;
+            }
+            let prompt = build_prompt(&binding, &wake, &envelopes);
+            let dir = binding
+                .wake_dir
+                .as_deref()
+                .expect("validated at startup: always requires wake_dir");
+            // 소비 확정은 **스폰 성공 시점** (페이즈 20, 2026-08-29 실사고의 근본 수정):
+            // 예전엔 수신 즉시 확인해서, 깨우기 실패(claude 경로 등) 시 메시지가 큐에서 이탈해
+            // 저널에만 남았다. 이제 스폰 실패면 확인하지 않는다 — ack_wait 후 재전달로 자동
+            // 재시도되고, 반복 실패는 max_deliver 소진 → 포이즌 표시로 대시보드에 드러난다.
+            // 완주가 아니라 스폰을 기준으로 하는 이유: 장시간 깨우기 동안 미확인분이 재전달되는
+            // 중복 폭주를 피하기 위함 (깨어난 세션의 크래시는 저널 + 세션 로그가 잡는다).
+            match spawn_wake(&wake, dir, &binding.full_label(), &prompt).await {
+                Ok(child) => {
+                    for (_, token) in &batch {
+                        client.confirm(*token).await;
+                    }
+                    if let Err(e) = wait_wake(&wake, child).await {
+                        tracing::error!(binding = %binding.label(), error = %e, "wake session failed after spawn — see wake.log");
+                        // 시작도 못 한 세션 = 깨울 수 없는 상태 (인증·환경) — 자리를 내려놓고
+                        // 관문으로 돌아간다 (2026-09-03). 다음 메시지는 서버 큐에 남는다
+                        if gated
+                            && e.downcast_ref::<WakeFailed>()
+                                .is_some_and(|w| w.could_not_start)
+                        {
+                            break 'recv true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        binding = %binding.label(),
+                        error = %e,
+                        "wake spawn failed — left unconfirmed; the queue will redeliver and retry"
+                    );
+                    // 실행 파일 자체가 없는 경우도 관문으로 — 재전달이 죽은 세션에 쌓이지 않게
+                    if gated {
+                        break 'recv true;
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!(
-                    binding = %binding.label(),
-                    error = %e,
-                    "wake spawn failed — left unconfirmed; the queue will redeliver and retry"
-                );
-            }
+            // 깨어난 세션이 활동하는 동안 이 바인딩의 클라이언트는 standby — 종료 후 자동 복귀.
+            // 다른 바인딩 루프는 독립 태스크라 그동안에도 수신·깨우기를 계속한다 (병렬 wake)
+        };
+        watcher.abort();
+        drop(client);
+        if regate {
+            tracing::warn!(binding = %binding.label(), "left the channel until wake works again — re-checking");
         }
-        // 깨어난 세션이 활동하는 동안 이 바인딩의 클라이언트는 standby — 종료 후 자동 복귀.
-        // 다른 바인딩 루프는 독립 태스크라 그동안에도 수신·깨우기를 계속한다 (병렬 wake)
     }
+}
+
+fn shutdown_requested(shutdown: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    shutdown.as_ref().is_some_and(|s| *s.borrow())
+}
+
+/// 관문 대기 — 종료 신호가 오면 false (호출자가 반환).
+async fn sleep_or_shutdown(
+    wait: Duration,
+    shutdown: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    match shutdown {
+        Some(sd) => tokio::select! {
+            _ = tokio::time::sleep(wait) => true,
+            res = sd.changed() => res.is_ok() && !*sd.borrow(),
+        },
+        None => {
+            tokio::time::sleep(wait).await;
+            true
+        }
+    }
+}
+
+/// 관문 재점검 간격 — base × (1, 2, 5, 10, 15) 상한 (기본 60s → 15분).
+fn gate_backoff(base: Duration, attempt: u32) -> Duration {
+    const STEPS: [u32; 5] = [1, 2, 5, 10, 15];
+    base * STEPS[(attempt.saturating_sub(1) as usize).min(STEPS.len() - 1)]
+}
+
+/// 상태 파일의 바인딩 항목 갱신 — state는 바뀔 때만 since를 옮기고, wake_check는 주면 덮는다.
+async fn set_status(
+    rt: &BindingRuntime,
+    label: &str,
+    state: Option<ClientState>,
+    wake_check: Option<String>,
+) {
+    let mut map = rt.shared.lock().await;
+    let entry = map
+        .entry(label.to_owned())
+        .or_insert_with(|| BindingStatus {
+            state: ClientState::Connecting,
+            since_unix: now_unix(),
+            wake_check: None,
+        });
+    if let Some(s) = state
+        && entry.state != s
+    {
+        entry.state = s;
+        entry.since_unix = now_unix();
+    }
+    if wake_check.is_some() {
+        entry.wake_check = wake_check;
+    }
+    write_state(&rt.state_file, &map).await;
 }
 
 async fn journal_append(
@@ -676,6 +792,22 @@ pub async fn spawn_wake(
     Ok(child)
 }
 
+/// 깨우기 실패의 형태 — `could_not_start`(몇 초 안의 실패 종료 = 인증·경로·환경)는 데몬이
+/// 접속 관문으로 되돌아가는 신호다 (2026-09-03). 스폰 실패(실행 파일 없음)는 별도 anyhow 오류.
+#[derive(Debug)]
+pub struct WakeFailed {
+    pub could_not_start: bool,
+    pub message: String,
+}
+
+impl std::fmt::Display for WakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WakeFailed {}
+
 /// 깨우기 완주 대기 — 타임아웃 시 강제 종료 (스폰과 분리: 확정 시점은 스폰).
 /// pub인 이유는 spawn_wake와 동일 (`brv wake test`).
 pub async fn wait_wake(wake: &WakeConfig, mut child: tokio::process::Child) -> anyhow::Result<()> {
@@ -690,12 +822,20 @@ pub async fn wait_wake(wake: &WakeConfig, mut child: tokio::process::Child) -> a
         Ok(Ok(status)) => {
             let secs = started.elapsed().as_secs();
             if secs < QUICK_FAIL_SECS {
-                anyhow::bail!(
-                    "wake session exited with {status} after {secs}s — it most likely could not start at all \
-                     (CLI login expired? runner path? permissions?) — see wake.log"
-                )
+                return Err(WakeFailed {
+                    could_not_start: true,
+                    message: format!(
+                        "wake session exited with {status} after {secs}s — it most likely could not start at all \
+                         (CLI login expired? runner path? permissions?) — see wake.log"
+                    ),
+                }
+                .into());
             }
-            anyhow::bail!("wake session exited with {status} after {secs}s — see wake.log")
+            Err(WakeFailed {
+                could_not_start: false,
+                message: format!("wake session exited with {status} after {secs}s — see wake.log"),
+            }
+            .into())
         }
         Ok(Err(e)) => Err(e).context("wake process wait"),
         Err(_) => {
@@ -794,6 +934,15 @@ mod tests {
         assert!(prompt.contains("agent \"backend\""));
         assert!(prompt.contains("channel \"myapp\""));
         assert!(prompt.contains("wait_for_message"));
+    }
+
+    /// 2026-09-03: 관문 재점검 간격은 1분→15분 상한 — 깨울 수 없는 동안 자리를 안 잡되,
+    /// 로그인만 다시 하면 15분 안에는 반드시 돌아온다
+    #[test]
+    fn gate_backoff_grows_then_caps() {
+        let base = Duration::from_secs(60);
+        let seq: Vec<u64> = (1..=7).map(|n| gate_backoff(base, n).as_secs()).collect();
+        assert_eq!(seq, vec![60, 120, 300, 600, 900, 900, 900]);
     }
 
     #[test]

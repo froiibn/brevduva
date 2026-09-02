@@ -62,6 +62,13 @@ pub enum ClientState {
         reason: String,
         retry_in_s: u64,
     },
+    /// 데몬이 접속을 **보류** 중 — 깨우기 사전 점검 실패 (2026-09-03: "깨울 수 없으면 자리를
+    /// 잡지 않는다"). 클라이언트가 아니라 데몬이 기록하는 상태: 메시지는 서버 큐에 남고
+    /// 프레즌스는 idle로 정직하다. 재점검 통과 시 접속.
+    WakeUnavailable {
+        reason: String,
+        retry_in_s: u64,
+    },
     /// 종료 — 대화형 모드의 치명 오류, 또는 핸들 전부 드롭.
     Stopped {
         reason: String,
