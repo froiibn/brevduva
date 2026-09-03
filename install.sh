@@ -10,6 +10,21 @@
 # (BRV_NO_MODIFY_PATH=1 로 거부 가능 — 그때는 안내만 출력). 그 외에는 건드리지 않는다.
 set -eu
 
+# 인자 (2026-09-04, 온보딩 재설계 3): 대시보드가 만든 한 줄이 설치와 연결을 함께 한다 —
+#   curl … | sh -s -- --server URL --enroll CODE [--unattended|--attended-only] [--runner ID]
+# 같은 값을 env(BRV_SERVER·BRV_ENROLL)로도 받는다. 연결 뒤 무인 수신 질문은 brv init이 한다.
+server="${BRV_SERVER:-https://api.brevduva.dev}"
+enroll="${BRV_ENROLL:-}"
+init_extra=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --server) server="$2"; shift 2 ;;
+    --enroll) enroll="$2"; shift 2 ;;
+    --runner) init_extra="$init_extra --runner $2"; shift 2 ;;
+    --unattended | --attended-only) init_extra="$init_extra $1"; shift ;;
+    *) echo "unknown option: $1 (accepted: --server URL --enroll CODE --runner ID --unattended --attended-only)" >&2; exit 2 ;;
+  esac
+done
 REPO="froiibn/brevduva"
 BASE="https://github.com/$REPO/releases/latest/download"
 
@@ -98,8 +113,21 @@ esac
 # 갱신이면 돌고 있는 서비스 데몬을 새 바이너리로 재기동 (2026-09-03, 사용자 지적 "갱신마다
 # launchctl을 쳐야 하나") — 서비스가 없으면 조용히 지나간다 (brv daemon restart의 미등록 오류 숨김)
 "$dest/brv" daemon restart 2>/dev/null || true
-
-echo ""
-echo "next — connect this machine to your account:"
-echo "  1) https://brevduva.dev dashboard → Connect a machine → issue an enroll code (starts with brvenr_)"
-echo "  2) brv init --server https://api.brevduva.dev --enroll <code>"
+if [ -n "$enroll" ]; then
+  echo ""
+  echo "connecting this machine (brv init) …"
+  # `curl … | sh`에서는 stdin이 스크립트 파이프다 — brv init의 질문(무인 수신 여부·러너 선택)이
+  # 터미널을 읽을 수 있게 /dev/tty를 준다. 터미널이 없으면 묻지 않고 플래그만 따른다
+  if [ -r /dev/tty ]; then
+    # shellcheck disable=SC2086
+    "$dest/brv" init --server "$server" --enroll "$enroll" $init_extra < /dev/tty
+  else
+    # shellcheck disable=SC2086
+    "$dest/brv" init --server "$server" --enroll "$enroll" $init_extra
+  fi
+else
+  echo ""
+  echo "next — connect this machine to your account:"
+  echo "  1) https://brevduva.dev dashboard → Connect agents → Connect → copy the one-line command"
+  echo "  2) paste it here (it runs: brv init --server $server --enroll <code>)"
+fi

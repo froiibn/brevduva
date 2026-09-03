@@ -8,6 +8,11 @@
 # 그 경로가 사용자 PATH에 없으면 추가한다. 그 외에는 아무것도 건드리지 않는다.
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# 연결까지 한 줄로 (2026-09-04, 온보딩 재설계 3): `irm … | iex`는 인자를 못 받으므로 env로 —
+#   $env:BRV_SERVER='https://…'; $env:BRV_ENROLL='brvenr_…'; irm https://brevduva.dev/install.ps1 | iex
+# BRV_INIT_ARGS에 "--unattended" / "--attended-only" / "--runner codex"를 더 줄 수 있다.
+if ($env:BRV_SERVER) { $server = $env:BRV_SERVER } else { $server = "https://api.brevduva.dev" }
+$enroll = $env:BRV_ENROLL
 
 $repo = "froiibn/brevduva"
 $base = "https://github.com/$repo/releases/latest/download"
@@ -59,8 +64,16 @@ if (($userPath -split ';') -notcontains $dest) {
 $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
 & $exe daemon restart 2>$null
 $ErrorActionPreference = $eap
-
-Write-Host ""
-Write-Host "next — connect this machine to your account:"
-Write-Host "  1) https://brevduva.dev dashboard → Connect a machine → issue an enroll code (starts with brvenr_)"
-Write-Host "  2) brv init --server https://api.brevduva.dev --enroll <code>"
+if ($enroll) {
+    Write-Host ""
+    Write-Host "connecting this machine (brv init) ..."
+    $initArgs = @("init", "--server", $server, "--enroll", $enroll)
+    if ($env:BRV_INIT_ARGS) { $initArgs += ($env:BRV_INIT_ARGS -split '\s+' | Where-Object { $_ }) }
+    # 콘솔에서 실행되므로 brv init의 질문(무인 수신 여부·러너 선택)이 그대로 동작한다
+    & $exe @initArgs
+} else {
+    Write-Host ""
+    Write-Host "next — connect this machine to your account:"
+    Write-Host "  1) https://brevduva.dev dashboard → Connect agents → Connect → copy the one-line command"
+    Write-Host "  2) paste it here (it runs: brv init --server $server --enroll <code>)"
+}
