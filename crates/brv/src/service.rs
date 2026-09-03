@@ -117,46 +117,6 @@ fn config_from_command_line(line: &str) -> Option<String> {
         .and_then(|i| tokens.get(i + 1).cloned())
 }
 
-#[cfg(test)]
-mod registration_tests {
-    use super::*;
-
-    /// 2026-09-04: 세 OS의 등록 파일/SCM 문자열에서 프로필 경로를 읽는다 — 공백·따옴표 포함.
-    #[test]
-    fn registered_profile_is_read_from_each_registration_form() {
-        assert_eq!(
-            config_from_unit(
-                "[Service]\nEnvironment=\"PATH=/a b\"\nEnvironment=BREVDUVA_CONFIG=/home/u/.config/brevduva/config.toml\nExecStart=/x daemon\n"
-            ),
-            Some("/home/u/.config/brevduva/config.toml".to_owned())
-        );
-        assert_eq!(config_from_unit("[Service]\nExecStart=/x daemon\n"), None);
-        assert_eq!(
-            config_from_plist(
-                "<dict>\n<key>PATH</key><string>/usr/bin</string>\n<key>BREVDUVA_CONFIG</key><string>/Users/u/proj/config.toml</string>\n</dict>"
-            ),
-            Some("/Users/u/proj/config.toml".to_owned())
-        );
-        assert_eq!(config_from_plist("<dict></dict>"), None);
-        assert_eq!(
-            config_from_command_line(
-                r#""C:\brevduva\brv.exe" daemon service-run --config "C:\my profile\config.toml" --wake-user Jaeyoung"#
-            ),
-            Some(r"C:\my profile\config.toml".to_owned())
-        );
-        assert_eq!(
-            config_from_command_line(
-                r"C:\brevduva\brv.exe daemon service-run --config C:\brevduva\config.toml --wake-user Jaeyoung"
-            ),
-            Some(r"C:\brevduva\config.toml".to_owned())
-        );
-        assert_eq!(
-            config_from_command_line(r"C:\brevduva\brv.exe daemon"),
-            None
-        );
-    }
-}
-
 /// 서비스 정의에 심을 설정 경로 검증 — 서비스는 다른 cwd에서 뜨므로 절대 경로만 허용.
 fn require_absolute(config: Option<&str>) -> anyhow::Result<Option<&str>> {
     if let Some(c) = config {
@@ -744,4 +704,44 @@ pub fn uninstall() -> anyhow::Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn restart() -> anyhow::Result<bool> {
     Ok(false)
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    /// 2026-09-04: 세 OS의 등록 파일/SCM 문자열에서 프로필 경로를 읽는다 — 공백·따옴표 포함.
+    #[test]
+    fn registered_profile_is_read_from_each_registration_form() {
+        assert_eq!(
+            config_from_unit(
+                "[Service]\nEnvironment=\"PATH=/a b\"\nEnvironment=BREVDUVA_CONFIG=/home/u/.config/brevduva/config.toml\nExecStart=/x daemon\n"
+            ),
+            Some("/home/u/.config/brevduva/config.toml".to_owned())
+        );
+        assert_eq!(config_from_unit("[Service]\nExecStart=/x daemon\n"), None);
+        assert_eq!(
+            config_from_plist(
+                "<dict>\n<key>PATH</key><string>/usr/bin</string>\n<key>BREVDUVA_CONFIG</key><string>/Users/u/proj/config.toml</string>\n</dict>"
+            ),
+            Some("/Users/u/proj/config.toml".to_owned())
+        );
+        assert_eq!(config_from_plist("<dict></dict>"), None);
+        assert_eq!(
+            config_from_command_line(
+                r#""C:\brevduva\brv.exe" daemon service-run --config "C:\my profile\config.toml" --wake-user Jaeyoung"#
+            ),
+            Some(r"C:\my profile\config.toml".to_owned())
+        );
+        assert_eq!(
+            config_from_command_line(
+                r"C:\brevduva\brv.exe daemon service-run --config C:\brevduva\config.toml --wake-user Jaeyoung"
+            ),
+            Some(r"C:\brevduva\config.toml".to_owned())
+        );
+        assert_eq!(
+            config_from_command_line(r"C:\brevduva\brv.exe daemon"),
+            None
+        );
+    }
 }
