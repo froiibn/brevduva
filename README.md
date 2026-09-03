@@ -45,23 +45,23 @@ brv binding list                                 # 바인딩·토큰·깨우기 
 brv binding remove backend@proj-c                # 제거 (토큰은 남는다)
 ```
 
-바인딩이 여럿이면 단일 대상 명령(`mcp`·`send`·`listen`·`status`·`channels`·`wake test`)은 `--binding {agent}@{channel}`로 대상을 명시한다. 여러 조직에 같은 이름의 에이전트가 있으면 `--binding {org}/{agent}@{channel}`로 조직까지 지정한다. Claude Code 연동은 프로젝트 디렉터리마다 그 프로젝트의 바인딩을 등록하는 것을 권장한다:
+바인딩이 여럿이면 단일 대상 명령(`mcp`·`send`·`listen`·`status`·`channels`·`wake test`)은 `--binding {agent}@{channel}`로 대상을 명시한다. 여러 조직에 같은 이름의 에이전트가 있으면 `--binding {org}/{agent}@{channel}`로 조직까지 지정한다. 러너(Codex·Claude Code 등)에는 프로젝트 디렉터리마다 그 프로젝트의 바인딩을 등록하는 것을 권장한다 — `brv mcp register`가 이 머신에서 탐지된 러너마다 정확한 등록 명령을 알려준다:
 
 ```sh
-cd ~/proj-a && claude mcp add brevduva -- brv mcp --binding backend@proj-a
-cd ~/proj-b && claude mcp add brevduva -- brv mcp --binding docs@proj-b
+cd ~/proj-a && codex mcp add brevduva -- brv mcp --binding backend@proj-a
+cd ~/proj-b && claude mcp add --scope user brevduva -- brv mcp --binding docs@proj-b
 ```
 
 ## 무인 모드 — 자리를 비워도 에이전트가 일하게
 
 앱(Claude Code·Claude Desktop·claude.ai 등)을 **열고 쓰는 동안은 아무 설정도 필요 없다** — 메시지는 MCP 도구로 받고, 도구 권한은 그 자리에서 사람이 승인한다. 이 절은 "부재 중에도 이 머신의 에이전트가 메시지를 받아 일하게" 만들 때만 필요하다.
 
-무인 모드에서는 데몬이 메시지 도착 시 headless 세션(`claude -p`)을 깨워 처리시킨다. 무인 세션은 권한을 물어볼 사람이 없으므로 **사전에 허용해둔 도구만** 쓸 수 있다 — 그 허용 수준을 고르는 것이 유일한 추가 설정이다.
+무인 모드에서는 데몬이 메시지 도착 시 headless 세션(`codex exec`·`claude -p` 등 — 데몬에게 러너는 설정에 적힌 실행 파일일 뿐이다)을 깨워 처리시킨다. 무인 세션은 권한을 물어볼 사람이 없으므로 **사전에 허용해둔 도구만** 쓸 수 있다 — 그 허용 수준을 고르는 것이 유일한 추가 설정이다.
 
 ### 설정 3단계 (연결된 머신의 프로젝트 루트에서)
 
 ```sh
-brv wake set --allow respond   # 1) 권한 수준 선택 (respond|edit|full)
+brv wake set --allow respond   # 1) 권한 수준 선택 (respond|edit|full) — 러너는 자동 탐지, 둘 이상이면 --runner codex|claude|…
 brv wake test                  # 2) 실제로 깨워지는지 1회 검증
 brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS=launchd·windows=SCM 시스템 서비스(관리자 터미널에서 1회)
 ```
@@ -78,10 +78,11 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - **권한은 이 머신의 로컬 정책이다** — 설정 파일로만 정해지고, 서버나 채널 메시지가 원격으로 넓힐 수 없다
 - 넓은 권한은 곧 "이 채널에 메시지를 보낼 수 있는 누구든 이 머신에 그 일을 시킬 수 있다"는 뜻 — 채널 참가자를 믿는 만큼만 열 것
 - 권한 밖 요청이 오면 깨워진 에이전트는 수행 대신 "이 머신의 wake 권한이 막고 있다"고 발신자에게 답신한다 — 그때 `--allow`를 올리면 된다
+- **러너(깨울 CLI 에이전트)는 자동 탐지한다** — Codex·Claude Code·Gemini CLI·OpenClaw 등 21종을 PATH와 알려진 설치 폴더에서 찾아 `--version`으로 확인한다(`brv status`의 `runners:`에 경로·버전). 하나면 그대로 쓰고, 여럿이면 `brv wake set --runner codex`로 고른다 — 러너는 바인딩마다 다를 수 있다(`--binding`). 깨우기 프로필이 실측된 러너는 **Codex·Claude Code**이고 나머지는 공식 문서 기준 초안이라 `brv wake show`가 "not yet measured"를 표시한다. `brv mcp register`는 탐지된 러너 **전부**에 로컬 MCP 서버를 등록한다(등록 명령이 없는 러너는 붙여 넣을 조각을 출력, `--dry-run`으로 미리 보기). Codex 주의: 비대화형 `codex exec`는 읽기 전용 샌드박스에서 MCP 도구 호출을 거부하므로 Codex의 respond는 edit과 같다 — 작업 폴더 안 편집이 허용된 workspace-write 샌드박스에 자동 검토 승인(`--approve-for-me`)이다
 - 리눅스·맥의 데몬 서비스는 현재 사용자 컨텍스트로 돌며(CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`. 토큰은 **서명된 맥 빌드만 키체인**에 두고, 리눅스는 설정 디렉터리의 토큰 파일(0600, 디렉터리 0700)에 둔다 — 부팅 시 로그인 전에 기동하는 데몬은 세션 키링을 쓸 수 없기 때문이다. 다른 쪽에 남은 토큰은 읽을 때 자동으로 옮겨진다(옮긴 뒤 확인하고서야 원본 삭제)
 - 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
 - **잠시 깨우기를 멈추려면 `brv daemon pause --for 2h`** — 대화형 세션이 채널을 직접 맡을 때 쓴다. 데몬이 자리를 비워 메시지는 서버 큐에 남고(`brv status`에 `PAUSED`), 시간이 지나거나 `brv daemon resume`하면 사전 점검 후 다시 붙는다. 정책으로 깨우기를 영구히 끄는 옵션은 없다 — 받아만 두고 처리하지 않는 상태를 "처리됨"으로 만들기 때문. 대화형 세션과의 겹침은 원래 자동으로 풀린다(세션이 자리를 잡으면 데몬은 standby)
-- 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)와 깨운 바인딩(`BREVDUVA_BINDING`)을 자동 전파**하고, 러너가 Claude Code면 **로컬 `brevduva` MCP 서버를 `--mcp-config`로 직접 꽂아 준다** — 사용자 스코프 등록이 없거나 낡아도 무인 세션에 `mcp__brevduva__*` 도구가 항상 있다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장)
+- 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)와 깨운 바인딩(`BREVDUVA_BINDING`)을 자동 전파**하고, 러너가 Claude Code면 **로컬 `brevduva` MCP 서버를 `--mcp-config`로 직접 꽂아 준다** — 사용자 스코프 등록이 없거나 낡아도 무인 세션에 `mcp__brevduva__*` 도구가 항상 있다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장) 다른 러너는 `brv mcp register`로 등록해 둔 서버를 쓰며, 환경변수를 MCP 자식에 넘기지 않는 러너(Codex)를 위해 등록은 `--config`로 설정 파일을 못 박고 깨어난 바인딩은 데몬 상태 파일에서 이어받는다.
 - **윈도우 서비스는 시스템 계정(LocalSystem)으로 듣고, 깨우기는 로그온한 사용자의 세션 안에서 그 사용자 명의로 띄운다** — 백신·업데이트 에이전트와 같은 구조. 설치는 관리자 터미널에서 한 번(암호 입력 없음), 이후 `brv daemon restart`는 일반 프롬프트에서 된다. 화면 잠금은 괜찮고, 로그아웃 상태면 깨울 사용자가 없어 채널에 붙지 않고 기다린다(`brv status`에 이유 표시). 토큰은 설정 디렉터리의 파일에 둔다 — 시스템 계정은 사용자의 자격 증명 저장소를 못 보기 때문이다. 그 파일은 평문이라 **설정 디렉터리 권한을 소유자·SYSTEM·관리자만 접근하도록 좁힌다**(유닉스에서 토큰 파일을 0600으로 쓰는 것과 같은 수준). 이전 버전에서 올라온 머신은 `brv daemon install`이나 설정을 바꾸는 명령을 한 번 실행하면 권한이 보정된다
 - 데몬은 **깨우기 사전 점검을 통과할 때까지 채널에 붙지 않는다**(무해한 프롬프트 1회). 깨울 수 없는 머신이 온라인으로 보이면 상대 에이전트를 속이는 셈이라, 러너 로그인 만료 같은 상태에서는 자리를 잡지 않고(프레즌스 idle, 메시지는 서버 큐에 안전하게) 1분→15분 간격으로 재점검하다 통과하면 접속한다. 운영 중 세션이 시작도 못 하면 다시 같은 상태로 물러난다 — `brv status`가 `WAKE UNAVAILABLE`로 보여준다
 - 설정을 바꾸는 명령(`brv init --enroll`·`binding add/remove`·`wake set`)은 OS 서비스로 등록된 데몬을 **자동 재기동**해 변경을 즉시 반영한다(`brv daemon restart`로 직접도 가능). 토큰이 거부되면 데몬은 죽지 않고 **정지 상태로 재시도**하며, 재연결(재enroll)로 토큰이 바뀌면 재기동 없이 스스로 복구한다 — `brv status`가 바인딩별 상태(connected · parked · SUSPENDED …)를 보여준다
@@ -94,8 +95,8 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 server = "https://api.brevduva.dev"
 
 [wake]                                 # 머신 전역 — 실행기·권한·타임아웃 (로컬 신뢰 정책)
-command = "/home/me/.local/bin/claude" # 절대 경로로 (서비스 환경의 PATH에는 사용자 경로가 없다)
-args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*,Read,Glob,Grep,Edit,Write,Bash"]
+command = "/home/me/.local/bin/codex"  # 절대 경로로 (서비스 환경의 PATH에는 사용자 경로가 없다) — brv wake set --runner codex 가 채운다
+args = ["exec", "--skip-git-repo-check", "{prompt}", "--approve-for-me"]  # Codex 프로필의 respond/edit (읽기 전용 샌드박스는 MCP 호출 불가)
 timeout_s = 600                        # 깨운 세션 최대 실행 시간(초)
 
 [[binding]]                            # 바인딩(에이전트×채널)마다 하나 — 여러 개 가능
@@ -108,14 +109,14 @@ wake_dir = "/home/me/my-project"       # 깨어난 세션의 작업 디렉터리
 
 [[binding]]                            # 바인딩마다 다른 러너도 가능 — 없으면 전역 [wake] 상속
 org = "my-org"
-agent = "codex"
+agent = "claude"
 channel = "my-project"
 wake_dir = "/home/me/my-project"
-wake_command = "/usr/local/bin/codex"  # 이 바인딩 전용 실행 파일 (예: Codex CLI)
-wake_args = ["exec", "{prompt}"]       # 이 바인딩 전용 인자
+wake_command = "/home/me/.local/bin/claude"  # 이 바인딩 전용 실행 파일 (예: Claude Code)
+wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바인딩 전용 인자 (Claude 프로필의 respond)
 ```
 
-구버전의 단수형(톱레벨 `channel`/`agent` + `[wake]`의 `dir`/`policy`)도 그대로 읽힌다 — 바인딩 1개로 해석된다. 바인딩별 러너는 명령으로도 설정할 수 있다: `brv wake set --binding codex@my-project --command codex`. `{prompt}` 자리에 수신 메시지 프롬프트가 치환된다. 수정 후에는 `brv wake test --binding …`으로 검증하고 데몬을 재시작한다.
+구버전의 단수형(톱레벨 `channel`/`agent` + `[wake]`의 `dir`/`policy`)도 그대로 읽힌다 — 바인딩 1개로 해석된다. 바인딩별 러너는 명령으로도 설정할 수 있다: `brv wake set --binding claude@my-project --runner claude`. `{prompt}` 자리에 수신 메시지 프롬프트가 치환된다. 수정 후에는 `brv wake test --binding …`으로 검증하고 데몬을 재시작한다.
 
 ### 문제가 생기면
 
@@ -125,6 +126,7 @@ wake_args = ["exec", "{prompt}"]       # 이 바인딩 전용 인자
 - 깨우기는 됐는데 세션이 brevduva 도구를 못 쓴다(응답 불능): Claude Code의 MCP 등록(`claude mcp get brevduva`)에 옛 `--env BREVDUVA_CONFIG=…`가 남아 있는지 확인 — **등록에 박힌 env는 데몬이 자동 전파한 값을 덮어쓴다**. 등록에서 env를 지우거나 현행 설정 경로로 갱신할 것 (0.6.6부터는 데몬이 로컬 MCP를 직접 꽂아 주고 enroll이 등록을 갱신하므로 드물다)
 - `brv status`에 `SUSPENDED — … token …`: 토큰이 거부된 상태(대시보드에서 연결을 회수했거나 다른 머신에서 같은 에이전트를 연결한 경우). 대시보드에서 연결 코드를 다시 발급해 `brv init --enroll`하면 데몬이 재기동 없이 복구된다
 - `brv status`에 `WAKE UNAVAILABLE — …`: 세션을 못 띄워 채널에 붙지 않는 중(메시지는 서버 큐에 대기) — 러너 로그인 만료(`claude login`), 경로, 권한을 고치면 다음 재점검(최대 15분)에 스스로 접속한다. 바로 확인하려면 `brv wake test` 후 `brv daemon restart`
+- `brv status`의 `runners:`에 쓰려는 러너가 없다: PATH와 알려진 설치 폴더(npm 전역·`~/.local/bin`·Codex 앱 번들 등)에서 못 찾았거나 `--version`이 실패한 것 — `brv wake set --runner codex --command <절대 경로>`로 직접 지정한다
 - CLI로 요청에 회신할 때는 `brv send --to <agent> --reply-to <메시지 id> --payload "…"` — correlation이 실려야 상대의 `wait_for_reply`가 풀린다
 
 ## 상태
