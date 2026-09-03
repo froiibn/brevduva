@@ -92,6 +92,7 @@ fn config_from_plist(text: &str) -> Option<String> {
 
 /// SCM BinaryPathName(`"C:\…\brv.exe" daemon service-run --config "C:\x y\config.toml" …`)에서
 /// `--config` 다음 토큰 — 따옴표로 묶인 토큰은 하나로 본다.
+#[cfg(any(windows, test))]
 fn config_from_command_line(line: &str) -> Option<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
