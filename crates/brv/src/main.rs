@@ -102,11 +102,16 @@ enum Cmd {
         #[arg(long)]
         binding: Option<String>,
     },
-    /// Local MCP server (stdio) — for MCP hosts such as Claude Code
+    /// Local MCP server (stdio) for agent runners — or `brv mcp register` to add it to the runners on this machine
     Mcp {
         /// Binding for this session — required when multiple bindings exist (pin it in each project's .mcp.json)
         #[arg(long)]
         binding: Option<String>,
+        /// Absolute path to the config file (default: BREVDUVA_CONFIG env, then the OS path) — runner registrations pin it
+        #[arg(long)]
+        config: Option<String>,
+        #[command(subcommand)]
+        action: Option<McpCmd>,
     },
     /// Resident daemon — receives on all bindings at once and wakes a session per message (needs [wake] in config)
     Daemon {
@@ -164,8 +169,12 @@ enum WakeCmd {
         /// With --binding, overrides args for that binding only; otherwise global
         #[arg(long)]
         allow: Option<String>,
-        /// Wake executable — if omitted, finds claude on PATH and stores its absolute path.
-        /// With --binding, overrides the runner for that binding only (e.g. codex); otherwise global
+        /// Runner profile to wake with (codex, claude, gemini, …) — finds its executable on this machine and
+        /// sets the one-shot arguments for it. `brv status` lists detected runners. With --binding, that binding only
+        #[arg(long)]
+        runner: Option<String>,
+        /// Wake executable path — for a runner not in the profile table, or to pin a specific binary.
+        /// If omitted, the runner is detected (exactly one must be installed, else pass --runner)
         #[arg(long)]
         command: Option<String>,
         /// Working directory for woken sessions — **per binding** (new single binding defaults to the current directory)
@@ -185,6 +194,22 @@ enum WakeCmd {
         /// Which binding's wake_dir to run in — required when multiple bindings exist
         #[arg(long)]
         binding: Option<String>,
+    },
+}
+
+/// `brv mcp register` (2026-09-04, 온보딩 재설계 1): 이 머신에서 탐지된 러너 **전부**에 로컬 MCP
+/// 서버를 등록한다 — 어느 러너를 열어도 Brevduva 도구가 있게(유인용). 깨우기 러너 선택과는
+/// 별개다(그건 바인딩당 하나, `brv wake set --runner`).
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Register the local `brv mcp` server in every agent runner detected on this machine
+    Register {
+        /// Only this runner (codex, claude, gemini, …) — default: all detected
+        #[arg(long)]
+        runner: Option<String>,
+        /// Print the registration commands/snippets without running anything
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -302,6 +327,10 @@ fn changes_local_policy(cmd: &Cmd) -> bool {
             | Cmd::Wake {
                 action: WakeCmd::Set { .. },
             }
+            | Cmd::Mcp {
+                action: Some(_),
+                ..
+            }
             | Cmd::Daemon {
                 action: Some(
                     DaemonCmd::Install { .. }
@@ -368,7 +397,23 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             binding,
         } => send(to, payload, expects_ack, reply_to, binding.as_deref()).await,
         Cmd::Listen { binding } => listen(binding.as_deref()).await,
-        Cmd::Mcp { binding } => mcp(binding.as_deref()).await,
+        Cmd::Mcp {
+            binding,
+            config,
+            action,
+        } => {
+            if let Some(c) = config {
+                let p = std::path::PathBuf::from(&c);
+                anyhow::ensure!(p.is_absolute(), "--config must be an absolute path: {c}");
+                config::set_path_override(p);
+            }
+            match action {
+                Some(McpCmd::Register { runner, dry_run }) => {
+                    mcp_register(&config::load()?, runner.as_deref(), dry_run)
+                }
+                None => mcp(binding.as_deref()).await,
+            }
+        }
         Cmd::Daemon { config, action } => match action {
             None => {
                 // 포그라운드 프로필 고정 (2026-09-01) — 서비스 모드의 PATH_OVERRIDE와 같은 통로
@@ -403,11 +448,19 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Wake { action } => match action {
             WakeCmd::Set {
                 allow,
+                runner,
                 command,
                 dir,
                 timeout,
                 binding,
-            } => wake_set(allow, command, dir, timeout, binding.as_deref()),
+            } => wake_set(
+                allow,
+                runner.as_deref(),
+                command,
+                dir,
+                timeout,
+                binding.as_deref(),
+            ),
             WakeCmd::Show => wake_show(),
             WakeCmd::Test { binding } => wake_test(binding.as_deref()).await,
         },
@@ -471,18 +524,7 @@ fn connect_from_config(selector: Option<&str>) -> anyhow::Result<(Binding, Clien
 /// 2026-08-29 실사고의 교훈: 서비스(systemd 등) 환경의 PATH에는 사용자 설치 경로가 없어
 /// 상대 이름 "claude"가 안 풀렸다. 설정 시점에 절대 경로로 못 박으면 재발하지 않는다.
 fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-    let exts: &[&str] = if cfg!(windows) {
-        &[".exe", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).find_map(|dir| {
-        exts.iter().find_map(|ext| {
-            let p = dir.join(format!("{name}{ext}"));
-            p.is_file().then_some(p)
-        })
-    })
+    brv::runners::find_in_path(name)
 }
 
 /// 실행 파일 경로 해석 — 결과는 항상 절대 경로 (2026-08-29 실사고: 서비스 환경 PATH에는
@@ -510,53 +552,162 @@ fn resolve_command(c: String) -> anyhow::Result<String> {
 /// 재시작·재init(보존은 upsert가 담당)에도 계속 유지된다.
 fn wake_set(
     allow: Option<String>,
+    runner: Option<&str>,
     command: Option<String>,
     dir: Option<String>,
     timeout: Option<u64>,
     binding_sel: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut cfg = config::load()?; // 연결 설정(init) 위에 얹는다 — 미init이면 여기서 안내됨
-    // --binding이 있으면 --command/--allow는 그 바인딩의 오버라이드 (2026-09-01 러너 혼용)
+    // --binding이 있으면 --runner/--command/--allow는 그 바인딩의 오버라이드 (2026-09-01 러너 혼용)
     let binding_scoped = binding_sel.is_some();
     if let Some(level) = &allow {
         anyhow::ensure!(
-            config::wake_preset_args(level).is_some(),
+            matches!(level.as_str(), "respond" | "edit" | "full"),
             "unknown --allow {level:?} — one of: respond, edit, full"
         );
     }
-
-    // ---- 전역부: 바인딩 스코프가 아닐 때의 --command/--allow + 항상 전역인 --timeout ----
     let existing = cfg.wake.take();
-    let g_command = match (&command, binding_scoped) {
-        (Some(c), false) => resolve_command(c.clone())?,
-        _ => match &existing {
-            Some(w) => w.command.clone(),
-            None => find_in_path("claude")
-                .context(
-                    "claude not found in PATH — install Claude Code CLI, \
-                     or point --command at another agent runner (absolute path)",
-                )?
-                .to_string_lossy()
-                .into_owned(),
+    // 지금 이 스코프가 쓰는 실행 파일 — 바인딩 오버라이드 → 전역
+    let current_cmd = if binding_scoped {
+        cfg.select(binding_sel)?
+            .wake_command
+            .clone()
+            .or_else(|| existing.as_ref().map(|w| w.command.clone()))
+    } else {
+        existing.as_ref().map(|w| w.command.clone())
+    };
+
+    // ---- 러너 결정 (2026-09-04 프로필) ----
+    // --runner: 표에서 찾아 이 머신의 실행 파일을 탐지 (--command가 있으면 그 경로를 그 프로필로)
+    // --command만: 경로를 쓰고 파일 이름으로 프로필을 역추정 (표에 없으면 custom)
+    // 둘 다 없음: 기존 설정 유지. 기존도 없으면 탐지 결과가 **하나일 때만** 자동 — 여럿이면 묻지
+    // 않고 --runner를 요구한다 (조용히 고르면 엉뚱한 러너가 깨어난다)
+    let (new_cmd, spec): (Option<String>, Option<&'static brv::runners::RunnerSpec>) = match (
+        runner, &command,
+    ) {
+        (Some(id), c) => {
+            let spec = brv::runners::spec(id).with_context(|| {
+                format!(
+                    "unknown runner {id:?} — known: {}",
+                    brv::runners::RUNNERS
+                        .iter()
+                        .map(|r| r.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            let path = match c {
+                Some(c) => resolve_command(c.clone())?,
+                None => {
+                    let det = brv::runners::detect(spec).with_context(|| {
+                            format!(
+                                "{} not found on this machine — install it, or pass --command <absolute path>",
+                                spec.display
+                            )
+                        })?;
+                    println!(
+                        "runner {}: {} ({})",
+                        spec.id,
+                        det.path.display(),
+                        det.version
+                    );
+                    det.path.to_string_lossy().into_owned()
+                }
+            };
+            (Some(path), Some(spec))
+        }
+        (None, Some(c)) => {
+            let path = resolve_command(c.clone())?;
+            (Some(path.clone()), brv::runners::spec_for_command(&path))
+        }
+        (None, None) => match &current_cmd {
+            Some(c) => (None, brv::runners::spec_for_command(c)),
+            None => {
+                let found: Vec<_> = brv::runners::detect_all()
+                    .into_iter()
+                    .filter(|d| d.spec.wake.is_some())
+                    .collect();
+                match found.as_slice() {
+                    [] => anyhow::bail!(
+                        "no agent runner found on this machine — install one (Codex, Claude Code, Gemini CLI, …) \
+                             or pass --command <absolute path>. `brv status` shows what was looked for"
+                    ),
+                    [one] => {
+                        println!(
+                            "runner {}: {} ({}) — the only one found",
+                            one.spec.id,
+                            one.path.display(),
+                            one.version
+                        );
+                        (
+                            Some(one.path.to_string_lossy().into_owned()),
+                            Some(one.spec),
+                        )
+                    }
+                    many => anyhow::bail!(
+                        "several runners found — pick one with --runner: {}",
+                        many.iter()
+                            .map(|d| format!("{} ({})", d.spec.id, d.version))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
         },
     };
-    let g_args = match (&allow, binding_scoped) {
-        (Some(level), false) => config::wake_preset_args(level).expect("validated above"),
-        _ => match &existing {
-            Some(w) => w.args.clone(),
-            None => config::wake_preset_args("respond").expect("respond preset exists"),
-        },
+    if let Some(s) = spec
+        && !s.measured
+        && new_cmd.is_some()
+    {
+        eprintln!(
+            "warning: the {} wake profile is documented but not yet measured by brv — run `brv wake test` and check the reply path",
+            s.display
+        );
+    }
+    // 권한 수준 → 이 러너의 인자. 표에 없는 러너(custom)는 프리셋이 없으니 손으로 적어야 한다
+    let args_for = |level: &str| -> anyhow::Result<Vec<String>> {
+        let s = spec.context(
+            "--allow needs a runner from the profile table — for a custom command edit `args`/`wake_args` in the config file by hand",
+        )?;
+        brv::runners::wake_args(s, level)
+            .with_context(|| format!("{} has no arguments for level {level:?}", s.display))
     };
+    // 러너를 바꾸면 옛 러너의 인자는 무의미하다 — 기존 수준을 새 러너로 옮겨 다시 만든다
+    let level_of_existing = |cmd: &str, args: &[String]| -> &'static str {
+        brv::runners::spec_for_command(cmd)
+            .and_then(|s| brv::runners::level_of(s, args))
+            .unwrap_or("respond")
+    };
+
+    // ---- 전역부: 바인딩 스코프가 아닐 때의 러너/권한 + 항상 전역인 --timeout ----
     let timeout_s = timeout
         .or(existing.as_ref().map(|w| w.timeout_s))
         .unwrap_or(600);
-    cfg.wake = Some(config::WakeConfig {
-        command: g_command,
-        args: g_args,
-        timeout_s,
-    });
+    if binding_scoped {
+        let mut w = existing
+            .context("no [wake] configured — run `brv wake set` without --binding first")?;
+        w.timeout_s = timeout_s;
+        cfg.wake = Some(w);
+    } else {
+        let g_command = new_cmd
+            .clone()
+            .or_else(|| existing.as_ref().map(|w| w.command.clone()))
+            .expect("a command was resolved or already configured");
+        let g_args = match (&allow, &existing, new_cmd.is_some()) {
+            (Some(level), _, _) => args_for(level)?,
+            (None, Some(w), false) => w.args.clone(),
+            (None, Some(w), true) => args_for(level_of_existing(&w.command, &w.args))?,
+            (None, None, _) => args_for("respond")?,
+        };
+        cfg.wake = Some(config::WakeConfig {
+            command: g_command,
+            args: g_args,
+            timeout_s,
+        });
+    }
 
-    // ---- 바인딩부 (페이즈 27): dir + 스코프된 command/allow ----
+    // ---- 바인딩부 (페이즈 27): dir + 스코프된 러너/권한 ----
     let needs_binding = binding_scoped || dir.is_some();
     // 신규 단일 바인딩에서 wake_dir 미설정이면 현재 디렉터리를 기본으로 —
     // "프로젝트 루트에서 설정한다"는 페이즈 21의 자연 동작 유지
@@ -577,11 +728,18 @@ fn wake_set(
             target.wake_dir = Some(d);
         }
         if binding_scoped {
-            if let Some(c) = command {
-                target.wake_command = Some(resolve_command(c)?);
+            if let Some(c) = &new_cmd {
+                let prev_level = match (&target.wake_command, &target.wake_args) {
+                    (Some(pc), Some(pa)) => level_of_existing(pc, pa),
+                    _ => "respond",
+                };
+                target.wake_command = Some(c.clone());
+                if allow.is_none() {
+                    target.wake_args = Some(args_for(prev_level)?);
+                }
             }
             if let Some(level) = &allow {
-                target.wake_args = Some(config::wake_preset_args(level).expect("validated above"));
+                target.wake_args = Some(args_for(level)?);
             }
         }
     }
@@ -601,19 +759,36 @@ fn wake_show() -> anyhow::Result<()> {
         println!("no [wake] configured — run `brv wake set --allow respond|edit|full`");
         return Ok(());
     };
-    let level = config::wake_preset_of(&wake.args).unwrap_or("custom (hand-edited args)");
+    let describe = |cmd: &str, args: &[String]| -> (String, &'static str) {
+        match brv::runners::spec_for_command(cmd) {
+            Some(s) => (
+                if s.measured {
+                    s.id.to_owned()
+                } else {
+                    format!("{} (profile not yet measured — run `brv wake test`)", s.id)
+                },
+                brv::runners::level_of(s, args).unwrap_or("custom (hand-edited args)"),
+            ),
+            None => (
+                "custom (not in the profile table)".to_owned(),
+                "custom (hand-edited args)",
+            ),
+        }
+    };
+    let (runner, level) = describe(&wake.command, &wake.args);
+    println!("runner   : {runner} (global)");
     println!("allow    : {level} (global)");
-    println!(
-        "tools    : {}",
-        config::wake_allowed_tools(&wake.args).unwrap_or("(no --allowedTools in args)")
-    );
+    if let Some(tools) = config::wake_allowed_tools(&wake.args) {
+        println!("tools    : {tools}");
+    }
     println!("command  : {} (global)", wake.command);
     println!("timeout  : {}s", wake.timeout_s);
     println!("bindings :");
     for b in &cfg.bindings {
         let eff = brv::daemon::effective_wake(wake, b);
         let runner = if b.wake_command.is_some() || b.wake_args.is_some() {
-            format!("runner {} {} (override)", eff.command, eff.args.join(" "))
+            let (id, level) = describe(&eff.command, &eff.args);
+            format!("runner {id} / allow {level} (override)")
         } else {
             "runner (global)".to_owned()
         };
@@ -806,7 +981,7 @@ async fn enroll_init(
     let path = config::store(&cfg)?;
     println!("  config: {path:?} / {}", token_store_note(&stored));
     if no_mcp {
-        println!("to use from an agent: claude mcp add brevduva -- brv mcp");
+        println!("to register the MCP server in your agent runners later: brv mcp register");
     } else {
         register_mcp(&cfg);
     }
@@ -834,64 +1009,118 @@ async fn enroll_init(
 /// 바인딩이 여럿이면 자동 등록하지 않는다 — 전역 `brv mcp`는 바인딩 선택이 안 되므로,
 /// 프로젝트별 등록(--binding 포함)을 안내한다 (페이즈 27).
 fn register_mcp(cfg: &BrvConfig) {
-    if cfg.bindings.len() > 1 {
-        println!(
-            "multiple bindings — skipping global MCP auto-registration. In each project directory:"
-        );
-        for b in &cfg.bindings {
-            println!(
-                "  claude mcp add brevduva -- brv mcp --binding {}",
-                b.label()
-            );
-        }
-        return;
+    if let Err(e) = mcp_register(cfg, None, false) {
+        println!("MCP registration skipped: {e:#} — later: brv mcp register");
     }
-    let config_env = config::config_path()
-        .map(|p| format!("BREVDUVA_CONFIG={}", p.display()))
-        .ok();
-    let add = || {
-        let mut cmd = std::process::Command::new("claude");
-        cmd.args(["mcp", "add", "--scope", "user"]);
-        if let Some(env) = &config_env {
-            cmd.args(["--env", env]);
+}
+
+/// 탐지된 러너 전부에 로컬 `brv mcp`를 등록한다 (2026-09-04 — 유인용, 깨우기 러너와 별개).
+/// 러너에 등록 명령이 있으면 실행하고, 없으면 붙여 넣을 조각을 출력한다 — brv가 사용자의
+/// 러너 설정 파일을 직접 고치지 않는다(형식이 제각각이라 파손 위험 > 편의).
+/// 등록은 `--config`로 이 설정 파일을 못 박는다 — 러너가 MCP 자식에 환경변수를 넘기지 않아도
+/// (Codex는 허용 목록만 전달) 같은 프로필을 본다.
+fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    let config_path = config::config_path()?;
+    let brv = std::env::current_exe().context("current exe")?;
+    let targets = match runner {
+        Some(id) => {
+            let spec = brv::runners::spec(id).with_context(|| format!("unknown runner {id:?}"))?;
+            vec![
+                brv::runners::detect(spec)
+                    .with_context(|| format!("{} not found on this machine", spec.display))?,
+            ]
         }
-        cmd.args(["brevduva", "--", "brv", "mcp"]).output()
+        None => brv::runners::detect_all(),
     };
-    match add() {
-        Ok(out) if out.status.success() => {
-            println!("Claude Code MCP registered — the agent can use the channel right away");
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            if err.contains("already exists") {
-                let removed = std::process::Command::new("claude")
-                    .args(["mcp", "remove", "brevduva", "-s", "user"])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-                match add() {
-                    Ok(out) if removed && out.status.success() => {
-                        println!(
-                            "Claude Code MCP registration refreshed — it now points at this config"
-                        );
+    if targets.is_empty() {
+        println!(
+            "no agent runner found on this machine — nothing to register (brv mcp register later)"
+        );
+        return Ok(());
+    }
+    // 바인딩이 여럿이면 `brv mcp`가 --binding을 요구한다 — 전역 등록은 어느 바인딩인지 모르니
+    // 프로젝트별 등록 명령을 안내한다 (깨어난 세션은 데몬이 바인딩을 넘기므로 무관)
+    let binding_note = (cfg.bindings.len() > 1).then(|| {
+        cfg.bindings
+            .iter()
+            .map(|b| format!("--binding {}", b.label()))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    });
+    for d in &targets {
+        match &d.spec.mcp {
+            brv::runners::McpRegistration::Command(args) => {
+                let filled: Vec<String> = args
+                    .iter()
+                    .map(|a| brv::runners::fill(a, &brv, &config_path))
+                    .collect();
+                let shown = format!("{} {}", d.path.display(), filled.join(" "));
+                if let Some(note) = &binding_note {
+                    println!(
+                        "{}: multiple bindings — register per project, appending one of [{note}]:\n  {shown}",
+                        d.spec.display
+                    );
+                    continue;
+                }
+                if dry_run {
+                    println!("{}: would run\n  {shown}", d.spec.display);
+                    continue;
+                }
+                let run = || std::process::Command::new(&d.path).args(&filled).output();
+                match run() {
+                    Ok(out) if out.status.success() => {
+                        println!("{}: brevduva MCP registered", d.spec.display);
                     }
-                    _ => println!(
-                        "Claude Code MCP is already registered but could not be refreshed — redo manually: claude mcp remove brevduva -s user && claude mcp add --scope user brevduva -- brv mcp"
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                        let already = err.to_ascii_lowercase().contains("already");
+                        // Claude Code는 종전처럼 갱신한다 — 다른 설정 경로로 재init한 머신이 옛 등록을
+                        // 물고 있던 실사고(2026-09-02)의 대응. 다른 러너는 remove 문법을 실측 전이라 안내만
+                        if already && d.spec.id == "claude" {
+                            let removed = std::process::Command::new(&d.path)
+                                .args(["mcp", "remove", "brevduva", "-s", "user"])
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
+                            match run() {
+                                Ok(out) if removed && out.status.success() => println!(
+                                    "{}: brevduva MCP registration refreshed — it now points at this config",
+                                    d.spec.display
+                                ),
+                                _ => println!(
+                                    "{}: already registered but could not be refreshed — by hand: claude mcp remove brevduva -s user && {shown}",
+                                    d.spec.display
+                                ),
+                            }
+                        } else if already {
+                            println!(
+                                "{}: a `brevduva` MCP entry already exists — left as is. If it is the remote connector (url = https://brevduva.dev/mcp), rename that entry (e.g. brevduva-remote) and re-run `brv mcp register`, so the local receiver owns the name",
+                                d.spec.display
+                            );
+                        } else {
+                            println!(
+                                "{}: registration failed ({}) — by hand:\n  {shown}",
+                                d.spec.display,
+                                err.lines().next().unwrap_or("no error output")
+                            );
+                        }
+                    }
+                    Err(e) => println!(
+                        "{}: could not run its CLI ({e}) — by hand:\n  {shown}",
+                        d.spec.display
                     ),
                 }
-            } else {
+            }
+            brv::runners::McpRegistration::Snippet { file, body } => {
                 println!(
-                    "MCP auto-registration failed — register manually: claude mcp add brevduva -- brv mcp\n  ({})",
-                    err.trim()
+                    "{}: no registration command — add this to {file}:\n{}\n",
+                    d.spec.display,
+                    brv::runners::fill(body, &brv, &config_path)
                 );
             }
         }
-        Err(_) => {
-            println!(
-                "claude CLI not found — skipping MCP registration. To use from an agent: claude mcp add brevduva -- brv mcp"
-            );
-        }
     }
+    Ok(())
 }
 
 async fn init(
@@ -1151,6 +1380,34 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
     );
     for b in &cfg.bindings {
         println!("  {}", b.label());
+    }
+    // 러너 탐지 (2026-09-04) — 이 머신에서 깨울 수 있는 CLI 에이전트와 실제 경로·버전.
+    // 사용자가 "왜 codex를 못 찾지"를 물을 때 답이 여기 있어야 한다
+    let runners = brv::runners::detect_all();
+    if runners.is_empty() {
+        println!(
+            "runners: none found — attended use only. For unattended wake install one of: {}",
+            brv::runners::RUNNERS
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        println!("runners:");
+        for d in &runners {
+            println!(
+                "  {:10} {:26} {}{}",
+                d.spec.id,
+                d.version,
+                d.path.display(),
+                if d.spec.measured {
+                    ""
+                } else {
+                    "  (wake profile not yet measured)"
+                }
+            );
+        }
     }
     // 데몬 상태 파일 (2026-09-02) — "idle인지 죽었는지"를 프레즌스가 아니라 데몬 자신이 답한다
     match brv::daemon::read_state() {

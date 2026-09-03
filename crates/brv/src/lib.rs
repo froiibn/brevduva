@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod enroll;
 pub mod hook;
 pub mod mcp;
+pub mod runners;
 pub mod service;
 #[cfg(windows)]
 pub mod winspawn;
