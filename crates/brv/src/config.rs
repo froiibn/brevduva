@@ -487,18 +487,36 @@ pub(crate) fn user_sid() -> anyhow::Result<String> {
     Ok(sid)
 }
 
+/// 토큰 파일 쓰기 — 저장·이전의 공통 출구. 원자적이다 (2026-09-04): 임시 파일에 쓰고
+/// (유닉스는 그 시점에 0600) 제자리 rename — 도중에 죽어도 반쯤 쓰인 파일이 `load_token`의
+/// "파일 우선" 조회에 잡혀 멀쩡한 키체인 사본을 가리는 일이 없다. 남는 것은 무시되는 `.tmp`뿐.
 fn write_token_file(token_id: &str, token: &str) -> anyhow::Result<PathBuf> {
     let path = token_file(token_id)?;
     std::fs::create_dir_all(path.parent().expect("token path has parent"))?;
     // 파일을 만들기 **전에** 좁힌다 — 새 파일이 좁혀진 권한을 상속받게 (윈도우)
     secure_config_dir();
-    std::fs::write(&path, token).with_context(|| format!("token file write failed at {path:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_secret_file(&path, token)?;
     Ok(path)
+}
+
+/// 비밀 파일의 원자적 교체: `<path>.tmp`에 쓰고 → (유닉스) 0600 → rename. 어느 단계가
+/// 실패해도 임시 파일을 치우고 `path`는 손대지 않은 채 남는다.
+fn write_secret_file(path: &Path, content: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let staged = (|| -> anyhow::Result<()> {
+        std::fs::write(&tmp, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged.with_context(|| format!("token file write failed at {path:?}"))
 }
 
 /// 이 플랫폼·바이너리에서 OS 키체인을 **주 저장소**로 써도 되는가 — 아니면 토큰 파일이 주다.
@@ -630,7 +648,8 @@ fn migrate_keychain_to_file(
 ///
 /// 각 저장소 안에서는 org 포함 키 → 구형 agent 키 순. 마지막으로 구형 단일 파일(`token`,
 /// 바인딩이 하나일 때만 — 어느 에이전트 것인지 판별 불가). 구형 폴백들 덕에 기존 머신은
-/// 재enroll 없이 동작한다. 어느 이전도 **검증 전에는 원본을 지우지 않는다**.
+/// 재enroll 없이 동작한다. 어느 이전도 **검증 전에는 원본을 지우지 않는다**. 빈 토큰 파일은
+/// 토큰이 아니다 — 이전 대상도, 키체인 사본을 가리는 파일도 아니다.
 pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("BREVDUVA_TOKEN") {
         return Ok(token);
@@ -641,8 +660,9 @@ pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> 
     let from_files = || {
         ids.iter().find_map(|c| {
             let path = token_file(c).ok()?;
-            let t = std::fs::read_to_string(&path).ok()?;
-            Some((path, t.trim().to_owned()))
+            let t = std::fs::read_to_string(&path).ok()?.trim().to_owned();
+            // 빈 파일은 없는 것으로 — 이전할 "유효한 토큰"이 아니고, 키체인 사본을 가려서도 안 된다
+            (!t.is_empty()).then_some((path, t))
         })
     };
     let from_keyring = || {
@@ -814,6 +834,29 @@ mod tests {
             before, after,
             "a file behind a planted junction must be untouched"
         );
+    }
+
+    /// 2026-09-04: 토큰 파일 쓰기는 원자적이어야 한다 — 임시 파일 경유·제자리 교체, 임시 파일
+    /// 잔존 없음, 유닉스 0600. 반쯤 쓰인 파일이 "파일 우선" 조회에 잡히면 키체인 사본을 가린다.
+    #[test]
+    fn secret_file_write_is_atomic_and_private() {
+        let dir = std::env::temp_dir().join(format!("brv-secret-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("token-x");
+        std::fs::write(&path, "old").expect("seed");
+        write_secret_file(&path, "brv_new").expect("write");
+        let content = std::fs::read_to_string(&path).expect("read");
+        let leftover = path.with_extension("tmp").exists();
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(content, "brv_new", "replaces the old content in place");
+        assert!(!leftover, "no staging file may remain");
+        #[cfg(unix)]
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
