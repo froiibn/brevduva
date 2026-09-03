@@ -85,11 +85,16 @@ fn allow_claude(level: &str) -> Option<Vec<&'static str>> {
     })
 }
 
+/// Codex 실측 (2026-09-04, codex-cli 0.153.0): `codex exec`는 비대화형에서 MCP 도구 호출에
+/// 승인을 요구하고 승인 정책이 `never`라 **read-only 샌드박스에서는 MCP 호출이 거부된다**
+/// ("MCP tool call requires approval, but approval policy is never"; openai/codex #24135, 미해결).
+/// 유일하게 되는 길은 `--approve-for-me`(승인 요청을 자동 검토로 돌림, 샌드박스는 workspace-write
+/// 고정 — `--sandbox`와 동시 사용 불가). 그래서 Codex의 respond와 edit은 **같은 인자**다: 이 러너의
+/// 최소 수준이 곧 작업 폴더 안 편집 허용이다. full은 샌드박스·승인 전부 해제.
 fn allow_codex(level: &str) -> Option<Vec<&'static str>> {
     Some(match level {
-        "respond" => vec!["--sandbox", "read-only"],
-        "edit" => vec!["--sandbox", "workspace-write"],
-        "full" => vec!["--sandbox", "danger-full-access"],
+        "respond" | "edit" => vec!["--approve-for-me"],
+        "full" => vec!["--dangerously-bypass-approvals-and-sandbox"],
         _ => return None,
     })
 }
@@ -210,17 +215,18 @@ pub static RUNNERS: &[RunnerSpec] = &[
         version_args: &["--version"],
         version_marker: Some("codex-cli"),
         wake: Some(WakeProfile {
-            // 실측(2026-09-04, 이 머신, codex-cli 0.153.0-alpha.5): stdin NUL·stdout 파일로도
-            // 한 턴 정상 종료(exit 0). `-c mcp_servers.*` 실행 시 주입은 **안 됨** → 영구 등록 필수
+            // 실측(2026-09-04, 이 머신, codex-cli 0.153.0): stdin NUL·stdout 파일로도 한 턴 정상
+            // 종료(exit 0), `--approve-for-me`로 로컬 MCP 도구 호출 완주(list_channels 왕복).
+            // `-c mcp_servers.*` 실행 시 주입은 **안 됨** → 영구 등록 필수 (brv mcp register)
             args: &["exec", "--skip-git-repo-check", "{prompt}"],
             allow: Some(allow_codex),
         }),
-        measured: false, // 한 턴 실행은 실측, MCP 도구 호출(respond 수준)은 미실측
+        measured: true, // 한 턴 실행 + MCP 도구 호출 실측. 데몬 경유 E2E(깨움→답신)는 별도
         mcp: McpRegistration::Command(&[
             "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}",
         ]),
         tool_prefix: "mcp__brevduva__<tool>",
-        note: "데스크톱 앱 번들 CLI는 PATH에 없다 — %LOCALAPPDATA%\\OpenAI\\Codex\\bin 폴백",
+        note: "respond=edit(workspace-write, 자동 검토 승인) — read-only에서는 MCP 호출 불가(#24135). 앱 번들 CLI는 PATH에 없어 %LOCALAPPDATA%\\OpenAI\\Codex\\bin 폴백",
     },
     RunnerSpec {
         id: "openclaw",
@@ -604,6 +610,21 @@ impl std::fmt::Debug for RunnerSpec {
             .field("id", &self.id)
             .field("measured", &self.measured)
             .finish_non_exhaustive()
+    }
+}
+
+/// 깨우기 프롬프트의 권한 정직성 문단에 넣을 "이 러너의 이 수준이 실제로 허용하는 것".
+/// Claude Code는 도구 목록 자체가 설명이라 daemon.rs가 `--allowedTools`를 직접 쓴다.
+pub fn allow_description(spec: &RunnerSpec, level: &str) -> String {
+    match (spec.id, level) {
+        ("codex", "respond" | "edit") => {
+            "workspace-write sandbox with automatic approval review — edits inside the working directory only, no shell outside it".to_owned()
+        }
+        ("codex", "full") => "no sandbox, no approvals".to_owned(),
+        (_, "respond") => "reply-only — MCP tools, no file edits or shell".to_owned(),
+        (_, "edit") => "MCP tools plus file reads and edits, no shell".to_owned(),
+        (_, "full") => "MCP tools, file edits and shell".to_owned(),
+        _ => format!("level {level}"),
     }
 }
 

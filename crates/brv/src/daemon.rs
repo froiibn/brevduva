@@ -774,10 +774,23 @@ pub fn build_prompt(binding: &Binding, wake: &WakeConfig, batch: &[Envelope]) ->
     }
     // 권한 정직성 라인 (페이즈 21): 무인 세션은 사전 허용 도구가 전부다 — 깨어난 에이전트가
     // 권한 밖 요청에 우회를 시도하는 대신 "왜 안 되는지 + 여는 방법"을 답신하게 근거를 준다
-    let perms = crate::config::wake_allowed_tools(&wake.args)
-        .map(|tools| {
+    // 러너 무관 (2026-09-04): Claude Code는 --allowedTools 목록 자체가 설명이고, 다른 러너는
+    // 프로필의 수준 설명을 쓴다. 표에 없는 러너(custom)는 문단 없음 — 모르는 것을 지어내지 않는다
+    let allowed = crate::config::wake_allowed_tools(&wake.args)
+        .map(|tools| format!("Pre-approved: {tools}."))
+        .or_else(|| {
+            let spec = crate::runners::spec_for_command(&wake.command)?;
+            let level = crate::runners::level_of(spec, &wake.args)?;
+            Some(format!(
+                "Permission level `{level}` for the {} runner: {}.",
+                spec.display,
+                crate::runners::allow_description(spec, level)
+            ))
+        });
+    let perms = allowed
+        .map(|allowed| {
             format!(
-                "\nThis is a headless session — only pre-approved tools work here. Pre-approved: {tools}. \
+                "\nThis is a headless session — only pre-approved capabilities work here. {allowed} \
                  If a request needs capabilities beyond them (file edits, shell, ...), do not attempt \
                  workarounds: reply that this machine's wake permission level blocks it, and that the \
                  machine owner can widen it with `brv wake set --allow edit|full` (see the README's \
@@ -914,6 +927,10 @@ pub async fn spawn_wake(
                 // 깨운 세션(과 그 자식 brv mcp)이 데몬과 같은 프로필·바인딩을 보게 (위 문서 주석)
                 .env("BREVDUVA_CONFIG", &config_path)
                 .env("BREVDUVA_BINDING", binding_label)
+                // 표준 입력은 NUL (2026-09-04 실측): 물려받은 stdin이 닫히지 않는 파이프면
+                // Codex(`codex exec`는 비TTY stdin을 문맥으로 읽는다)가 EOF를 기다리며 멈춘다 —
+                // 윈도우 사용자 세션 스폰(winspawn)은 처음부터 NUL이었고, 이 경로만 상속이었다
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(
                     log.try_clone().context("clone log handle")?,
                 ))
