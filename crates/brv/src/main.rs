@@ -1521,7 +1521,15 @@ async fn mcp(binding_sel: Option<&str>) -> anyhow::Result<()> {
     // 깨웠는지"를 이어받는 통로 (2026-09-02). 바인딩이 여럿인 머신에서도 깨운 세션이
     // 올바른 정체성으로 붙는다 (플래그 없는 user-scope 등록 + 다중 바인딩 = select 불가였음)
     let env_sel = std::env::var("BREVDUVA_BINDING").ok();
-    let binding_sel = binding_sel.or(env_sel.as_deref());
+    // 셋째 폴백 (2026-09-04): 데몬 상태 파일의 "깨우기 진행 중" 바인딩 — Codex처럼 MCP 자식에
+    // 환경변수를 넘기지 않는 러너의 정적 등록(`brv mcp register`)이 다중 바인딩 머신에서도
+    // 깨운 바인딩으로 붙는 길. 정확히 하나가 깨어 있을 때만 쓴다
+    let state_sel = match (binding_sel, &env_sel) {
+        (None, None) => brv::daemon::read_state()
+            .and_then(|st| brv::daemon::waking_binding(&st).map(str::to_owned)),
+        _ => None,
+    };
+    let binding_sel = binding_sel.or(env_sel.as_deref()).or(state_sel.as_deref());
     // lazy-JOIN: 여기서 접속하지 않는다 — 첫 도구 호출 때 McpServer가 접속 (플랩 방지)
     let (_, binding, mut opts) = options_from_config(binding_sel)?;
     // 유휴 파킹 (2026-09-01): 도구 호출이 끊긴 세션은 자리를 내려놓는다 — 방치된 대화형

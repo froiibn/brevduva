@@ -143,6 +143,13 @@ pub struct BindingStatus {
     pub since_unix: u64,
     /// 기동 시 깨우기 사전 점검 결과 — "ok (4.2s)" / "failed: …" / None(미실시).
     pub wake_check: Option<String>,
+    /// 이 바인딩의 깨어난 세션이 도는 중인가 (2026-09-04, 온보딩 재설계 1). 두 곳이 읽는다:
+    /// ① 정적으로 등록된 `brv mcp`가 --binding·env 없이 떴을 때 "누가 깨웠는지"를 이어받는
+    ///    통로 — Codex처럼 MCP 자식에 환경변수를 넘기지 않는 러너용 ② (예정) 리시버 관리 도구의
+    ///    유인/무인 판별. 데몬이 죽으면 값이 남을 수 있으나 다음 기동이 상태 파일을 통째로 새로
+    ///    쓴다 — 그 사이엔 "무인" 쪽으로 틀리는 것이라 안전한 방향이다.
+    #[serde(default)]
+    pub waking: bool,
 }
 
 impl BindingStatus {
@@ -535,6 +542,7 @@ async fn binding_loop(
                             state: s.clone(),
                             since_unix: now_unix(),
                             wake_check: None,
+                            waking: false,
                         });
                         if entry.state != s {
                             entry.state = s;
@@ -622,6 +630,8 @@ async fn binding_loop(
             // 재시도되고, 반복 실패는 max_deliver 소진 → 포이즌 표시로 대시보드에 드러난다.
             // 완주가 아니라 스폰을 기준으로 하는 이유: 장시간 깨우기 동안 미확인분이 재전달되는
             // 중복 폭주를 피하기 위함 (깨어난 세션의 크래시는 저널 + 세션 로그가 잡는다).
+            // 깨우기 표식은 스폰 **전에** 켠다 — 깨어난 세션의 MCP가 뜨는 시점에 이미 보여야 한다
+            set_waking(&rt, &binding.full_label(), true).await;
             match spawn_wake(&wake, dir, &binding.full_label(), &prompt, &rt.wake_spawn).await {
                 Ok(child) => {
                     for (_, token) in &batch {
@@ -651,9 +661,12 @@ async fn binding_loop(
                     }
                 }
             }
+            set_waking(&rt, &binding.full_label(), false).await;
             // 깨어난 세션이 활동하는 동안 이 바인딩의 클라이언트는 standby — 종료 후 자동 복귀.
             // 다른 바인딩 루프는 독립 태스크라 그동안에도 수신·깨우기를 계속한다 (병렬 wake)
         };
+        // 관문으로 되돌아가는 break 경로도 표식을 끈다
+        set_waking(&rt, &binding.full_label(), false).await;
         watcher.abort();
         drop(client);
         if regate {
@@ -703,6 +716,7 @@ async fn set_status(
             state: ClientState::Connecting,
             since_unix: now_unix(),
             wake_check: None,
+            waking: false,
         });
     if let Some(s) = state
         && entry.state != s
@@ -714,6 +728,29 @@ async fn set_status(
         entry.wake_check = wake_check;
     }
     write_state(&rt.state_file, &map).await;
+}
+
+/// 깨우기 진행 표식 갱신 — `BindingStatus::waking` 참조.
+async fn set_waking(rt: &BindingRuntime, label: &str, waking: bool) {
+    let mut map = rt.shared.lock().await;
+    if let Some(entry) = map.get_mut(label)
+        && entry.waking != waking
+    {
+        entry.waking = waking;
+        write_state(&rt.state_file, &map).await;
+    }
+}
+
+/// 지금 깨어난 세션이 도는 바인딩 — 정확히 하나일 때만. 둘 이상이면 어느 세션의 MCP인지
+/// 알 수 없으니 None (그 경우 데몬이 넘긴 env/--binding이 필요하다).
+pub fn waking_binding(state: &DaemonState) -> Option<&str> {
+    let mut it = state
+        .bindings
+        .iter()
+        .filter(|(_, b)| b.waking)
+        .map(|(label, _)| label.as_str());
+    let first = it.next()?;
+    it.next().is_none().then_some(first)
 }
 
 async fn journal_append(
@@ -1115,6 +1152,37 @@ mod tests {
 
     /// 2026-09-03: 관문 재점검 간격은 1분→15분 상한 — 깨울 수 없는 동안 자리를 안 잡되,
     /// 로그인만 다시 하면 15분 안에는 반드시 돌아온다
+    /// 2026-09-04: 정적 등록된 `brv mcp`(Codex처럼 env를 안 넘기는 러너)가 상태 파일에서
+    /// "지금 깨어난 바인딩"을 이어받는다 — 정확히 하나일 때만. 구형 상태 파일(필드 없음)은 false.
+    #[test]
+    fn waking_marker_names_exactly_one_binding() {
+        let status = |waking: bool| BindingStatus {
+            state: ClientState::Connected,
+            since_unix: 0,
+            wake_check: None,
+            waking,
+        };
+        let mut state = DaemonState {
+            pid: 1,
+            updated_unix: 0,
+            bindings: BTreeMap::new(),
+        };
+        assert_eq!(waking_binding(&state), None);
+        state.bindings.insert("a/x@c".into(), status(true));
+        state.bindings.insert("a/y@c".into(), status(false));
+        assert_eq!(waking_binding(&state), Some("a/x@c"));
+        state.bindings.insert("a/y@c".into(), status(true));
+        assert_eq!(
+            waking_binding(&state),
+            None,
+            "two waking sessions are ambiguous"
+        );
+        let legacy: BindingStatus =
+            serde_json::from_str(r#"{"state":{"state":"connected"},"since_unix":0,"wake_check":null}"#)
+                .expect("old state files have no waking field");
+        assert!(!legacy.waking);
+    }
+
     #[test]
     fn gate_backoff_grows_then_caps() {
         let base = Duration::from_secs(60);
