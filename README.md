@@ -33,6 +33,8 @@ irm https://brevduva.dev/install.ps1 | iex
 
 `~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치되고, 그 경로가 PATH에 없으면 자동으로 등록한다(유닉스는 셸 설정에 마커 달린 한 줄 — `BRV_NO_MODIFY_PATH=1`로 거부 가능, 윈도우는 사용자 PATH). 설치가 끝나면 다음 단계(머신 연결 `brv init --enroll`)를 화면에 안내한다. 이미 데몬이 OS 서비스로 돌고 있으면 설치 직후 자동으로 재기동해 새 버전이 바로 뜬다 — **갱신도 같은 한 줄**이다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사, PATH 등록이 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다.
 
+연결 명령(`brv init --server … --enroll <코드>`)이 끝나면 **무인 수신도 켤지 한 번 묻는다** — Enter면 러너 탐지(여럿이면 번호 하나) → 권한 respond → 실제 깨우기 1회 → OS 서비스 등록까지 이어서 한다. 묻지 않게 하려면 `--unattended`(켠다) 또는 `--attended-only`(안 켠다), 러너를 미리 정하려면 `--runner codex`. 터미널이 아닌 곳(스크립트·에이전트가 대신 실행)에서는 묻지 않고 플래그만 따른다. 이미 무인 설정과 서비스가 있는 머신(두 번째 에이전트)은 묻지 않는다.
+
 ## 여러 에이전트를 한 머신에서 — 다중 바인딩
 
 `brv` 프로세스 하나가 여러 **바인딩**(에이전트 × 채널)을 동시에 수신한다. 연결(`brv init --enroll <코드>`)을 반복하면 바인딩이 **추가**되고(같은 에이전트@채널이면 갱신), 데몬은 전부를 한꺼번에 받는다 — 프로세스나 서비스를 늘릴 필요가 없다. 대시보드에서 에이전트 여러 명을 한 코드에 담아 발급하면(에이전트 연결 화면) 연결 한 번에 그 에이전트들의 바인딩이 전부 생긴다.
@@ -60,10 +62,12 @@ cd ~/proj-b && claude mcp add --scope user brevduva -- brv mcp --binding docs@pr
 
 ### 설정 3단계 (연결된 머신의 프로젝트 루트에서)
 
+`brv init --enroll`이 끝날 때 묻는 질문에 Enter를 치면 이 세 단계를 대신 한다 — 아래는 손으로 할 때다.
+
 ```sh
 brv wake set --allow respond   # 1) 권한 수준 선택 (respond|edit|full) — 러너는 자동 탐지, 둘 이상이면 --runner codex|claude|…
 brv wake test                  # 2) 실제로 깨워지는지 1회 검증
-brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS=launchd·windows=SCM 시스템 서비스(관리자 터미널에서 1회)
+brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS=launchd·windows=SCM 시스템 서비스(관리자 승인 창 1클릭)
 ```
 
 | `--allow` | 깨워진 세션이 할 수 있는 일 | 이런 에이전트에 |
@@ -79,11 +83,11 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - 넓은 권한은 곧 "이 채널에 메시지를 보낼 수 있는 누구든 이 머신에 그 일을 시킬 수 있다"는 뜻 — 채널 참가자를 믿는 만큼만 열 것
 - 권한 밖 요청이 오면 깨워진 에이전트는 수행 대신 "이 머신의 wake 권한이 막고 있다"고 발신자에게 답신한다 — 그때 `--allow`를 올리면 된다
 - **러너(깨울 CLI 에이전트)는 자동 탐지한다** — Codex·Claude Code·Gemini CLI·OpenClaw 등 21종을 PATH와 알려진 설치 폴더에서 찾아 `--version`으로 확인한다(`brv status`의 `runners:`에 경로·버전). 하나면 그대로 쓰고, 여럿이면 `brv wake set --runner codex`로 고른다 — 러너는 바인딩마다 다를 수 있다(`--binding`). 깨우기 프로필이 실측된 러너는 **Codex·Claude Code**이고 나머지는 공식 문서 기준 초안이라 `brv wake show`가 "not yet measured"를 표시한다. `brv mcp register`는 탐지된 러너 **전부**에 로컬 MCP 서버를 등록한다(등록 명령이 없는 러너는 붙여 넣을 조각을 출력, `--dry-run`으로 미리 보기). Codex 주의: 비대화형 `codex exec`는 읽기 전용 샌드박스에서 MCP 도구 호출을 거부하므로 Codex의 respond는 edit과 같다 — 작업 폴더 안 편집이 허용된 workspace-write 샌드박스에 자동 검토 승인(`--approve-for-me`)이다
-- 리눅스·맥의 데몬 서비스는 현재 사용자 컨텍스트로 돌며(CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`. 토큰은 **서명된 맥 빌드만 키체인**에 두고, 리눅스는 설정 디렉터리의 토큰 파일(0600, 디렉터리 0700)에 둔다 — 부팅 시 로그인 전에 기동하는 데몬은 세션 키링을 쓸 수 없기 때문이다. 다른 쪽에 남은 토큰은 읽을 때 자동으로 옮겨진다(옮긴 뒤 확인하고서야 원본 삭제)
+- 리눅스·맥의 데몬 서비스는 현재 사용자 컨텍스트로 돌며(CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`. 토큰은 **서명된 맥 빌드만 키체인**에 두고, 리눅스는 설정 디렉터리의 토큰 파일(0600, 디렉터리 0700)에 둔다 — 부팅 시 로그인 전에 기동하는 데몬은 세션 키링을 쓸 수 없기 때문이다. 다른 쪽에 남은 토큰은 읽을 때 자동으로 옮겨진다(옮긴 뒤 확인하고서야 원본 삭제) 서비스가 전용 프로필로 등록돼 있으면 이후 모든 `brv` 명령이 그 프로필을 기본으로 따른다(`brv status`의 `profile:` 줄) — `BREVDUVA_CONFIG`나 `--config`가 있으면 그것이 우선이다.
 - 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
 - **잠시 깨우기를 멈추려면 `brv daemon pause --for 2h`** — 대화형 세션이 채널을 직접 맡을 때 쓴다. 데몬이 자리를 비워 메시지는 서버 큐에 남고(`brv status`에 `PAUSED`), 시간이 지나거나 `brv daemon resume`하면 사전 점검 후 다시 붙는다. 정책으로 깨우기를 영구히 끄는 옵션은 없다 — 받아만 두고 처리하지 않는 상태를 "처리됨"으로 만들기 때문. 대화형 세션과의 겹침은 원래 자동으로 풀린다(세션이 자리를 잡으면 데몬은 standby)
 - 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)와 깨운 바인딩(`BREVDUVA_BINDING`)을 자동 전파**하고, 러너가 Claude Code면 **로컬 `brevduva` MCP 서버를 `--mcp-config`로 직접 꽂아 준다** — 사용자 스코프 등록이 없거나 낡아도 무인 세션에 `mcp__brevduva__*` 도구가 항상 있다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장) 다른 러너는 `brv mcp register`로 등록해 둔 서버를 쓰며, 환경변수를 MCP 자식에 넘기지 않는 러너(Codex)를 위해 등록은 `--config`로 설정 파일을 못 박고 깨어난 바인딩은 데몬 상태 파일에서 이어받는다.
-- **윈도우 서비스는 시스템 계정(LocalSystem)으로 듣고, 깨우기는 로그온한 사용자의 세션 안에서 그 사용자 명의로 띄운다** — 백신·업데이트 에이전트와 같은 구조. 설치는 관리자 터미널에서 한 번(암호 입력 없음), 이후 `brv daemon restart`는 일반 프롬프트에서 된다. 화면 잠금은 괜찮고, 로그아웃 상태면 깨울 사용자가 없어 채널에 붙지 않고 기다린다(`brv status`에 이유 표시). 토큰은 설정 디렉터리의 파일에 둔다 — 시스템 계정은 사용자의 자격 증명 저장소를 못 보기 때문이다. 그 파일은 평문이라 **설정 디렉터리 권한을 소유자·SYSTEM·관리자만 접근하도록 좁힌다**(유닉스에서 토큰 파일을 0600으로 쓰는 것과 같은 수준). 이전 버전에서 올라온 머신은 `brv daemon install`이나 설정을 바꾸는 명령을 한 번 실행하면 권한이 보정된다
+- **윈도우 서비스는 시스템 계정(LocalSystem)으로 듣고, 깨우기는 로그온한 사용자의 세션 안에서 그 사용자 명의로 띄운다** — 백신·업데이트 에이전트와 같은 구조. 설치는 `brv daemon install`이 스스로 관리자 승인(UAC) 창을 띄워 한 번(암호 입력 없음, 조용한 승격 없음), 이후 `brv daemon restart`는 일반 프롬프트에서 된다. 화면 잠금은 괜찮고, 로그아웃 상태면 깨울 사용자가 없어 채널에 붙지 않고 기다린다(`brv status`에 이유 표시). 토큰은 설정 디렉터리의 파일에 둔다 — 시스템 계정은 사용자의 자격 증명 저장소를 못 보기 때문이다. 그 파일은 평문이라 **설정 디렉터리 권한을 소유자·SYSTEM·관리자만 접근하도록 좁힌다**(유닉스에서 토큰 파일을 0600으로 쓰는 것과 같은 수준). 이전 버전에서 올라온 머신은 `brv daemon install`이나 설정을 바꾸는 명령을 한 번 실행하면 권한이 보정된다
 - 데몬은 **깨우기 사전 점검을 통과할 때까지 채널에 붙지 않는다**(무해한 프롬프트 1회). 깨울 수 없는 머신이 온라인으로 보이면 상대 에이전트를 속이는 셈이라, 러너 로그인 만료 같은 상태에서는 자리를 잡지 않고(프레즌스 idle, 메시지는 서버 큐에 안전하게) 1분→15분 간격으로 재점검하다 통과하면 접속한다. 운영 중 세션이 시작도 못 하면 다시 같은 상태로 물러난다 — `brv status`가 `WAKE UNAVAILABLE`로 보여준다
 - 설정을 바꾸는 명령(`brv init --enroll`·`binding add/remove`·`wake set`)은 OS 서비스로 등록된 데몬을 **자동 재기동**해 변경을 즉시 반영한다(`brv daemon restart`로 직접도 가능). 토큰이 거부되면 데몬은 죽지 않고 **정지 상태로 재시도**하며, 재연결(재enroll)로 토큰이 바뀌면 재기동 없이 스스로 복구한다 — `brv status`가 바인딩별 상태(connected · parked · SUSPENDED …)를 보여준다
 
@@ -127,6 +131,7 @@ wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바�
 - `brv status`에 `SUSPENDED — … token …`: 토큰이 거부된 상태(대시보드에서 연결을 회수했거나 다른 머신에서 같은 에이전트를 연결한 경우). 대시보드에서 연결 코드를 다시 발급해 `brv init --enroll`하면 데몬이 재기동 없이 복구된다
 - `brv status`에 `WAKE UNAVAILABLE — …`: 세션을 못 띄워 채널에 붙지 않는 중(메시지는 서버 큐에 대기) — 러너 로그인 만료(`claude login`), 경로, 권한을 고치면 다음 재점검(최대 15분)에 스스로 접속한다. 바로 확인하려면 `brv wake test` 후 `brv daemon restart`
 - `brv status`의 `runners:`에 쓰려는 러너가 없다: PATH와 알려진 설치 폴더(npm 전역·`~/.local/bin`·Codex 앱 번들 등)에서 못 찾았거나 `--version`이 실패한 것 — `brv wake set --runner codex --command <절대 경로>`로 직접 지정한다
+- `brv status`의 `profile:`에 뜻밖의 경로가 보인다: 등록된 OS 서비스의 프로필을 따른 것이다 — 다른 프로필을 보려면 `BREVDUVA_CONFIG`를 주거나 `--config`를 붙인다
 - CLI로 요청에 회신할 때는 `brv send --to <agent> --reply-to <메시지 id> --payload "…"` — correlation이 실려야 상대의 `wait_for_reply`가 풀린다
 
 ## 상태
