@@ -1,13 +1,15 @@
 // Copyright 2026 SEIZIA (Jaeyoung Ko)
 // SPDX-License-Identifier: Apache-2.0
 
-//! brv 설정 — 파일(비밀 제외) + OS 키체인(토큰).
+//! brv 설정 — 파일(비밀 제외) + 토큰 보관처(OS 키체인 또는 토큰 파일).
 //!
 //! 원칙(PLAN·PROTOCOL 5.1): 클라이언트에 비밀 없음 — 토큰은 설정 파일 본문에 넣지 않는다.
-//! 보관처는 OS 키체인, 아니면 설정 디렉터리의 별도 토큰 파일이다. 키체인이 없는 환경(일부
-//! headless 리눅스)과 **윈도우**(2026-09-03 — 데몬이 LocalSystem 서비스라 사용자 자격 증명
-//! 저장소를 못 본다), 서명 없는 맥 빌드(프롬프트 폭풍)는 파일을 쓴다. `BREVDUVA_TOKEN`
-//! 환경 변수도 대체 경로다(단일 바인딩 전용).
+//! 보관처는 플랫폼마다 하나만 **주 저장소**다 (`keychain_is_reliable`): 서명된 맥 빌드는
+//! 키체인, 그 외 — **윈도우**(2026-09-03, 데몬이 LocalSystem 서비스라 사용자 자격 증명
+//! 저장소를 못 본다)·**리눅스**(2026-09-04, systemd 사용자 유닛+linger는 부팅 시 세션 키링
+//! 없이 기동한다)·서명 없는 맥 빌드(프롬프트 폭풍) — 는 설정 디렉터리의 토큰 파일이다.
+//! 다른 쪽에 남은 토큰은 읽을 때 주 저장소로 **이전**한다(쓰고 되읽어 확인한 뒤에야 원본
+//! 삭제 — `load_token`). `BREVDUVA_TOKEN` 환경 변수도 대체 경로다(단일 바인딩 전용).
 //!
 //! 파일 보관은 곧 **평문 보관**이라 접근 통제가 저장의 일부다 — `secure_config_dir()`가
 //! 설정 디렉터리를 소유자 전용으로 좁힌다(유닉스 0700, 윈도우 DACL). 토큰뿐 아니라
@@ -435,8 +437,28 @@ fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
     //    SYSTEM이라 사람이 고칠 수 없고, 사람이 만든 파일은 그 반대다. 서로의 사각을 메운다.
     //    실측(2026-09-03): 관리자 터미널의 install이 만든 토큰 파일은 사용자 문맥에서
     //    "Access is denied"로 남았고, 서비스가 다음 기동에 스스로 고쳤다.
-    //    빈 디렉터리면 와일드카드가 아무것도 못 찾아 실패하는데, 고칠 파일이 없다는 뜻이다
-    let _ = icacls(&dir.join("*"), &["/reset", "/T", "/C", "/Q"]);
+    //    재귀(`/T`)·와일드카드는 쓰지 않는다 (2026-09-04): 이 단계는 SYSTEM 문맥에서도 돌고
+    //    디렉터리는 사용자 소유다. `icacls`는 `/L`이 없으면 링크의 **대상**을 조작하므로,
+    //    사용자가 안에 심은 정션·심볼릭 링크를 SYSTEM이 따라가 바깥 경로의 ACL을 초기화하는
+    //    권한 상승 통로가 된다. 항목을 직접 열거해 재분석 지점(정션·링크·플레이스홀더)은
+    //    건너뛰고 일반 파일만 하나씩 `/L`로 처리한다 — 설정 디렉터리는 평면이라 하위 폴더가
+    //    없다. 검사와 실행 사이의 교체 창(TOCTOU)은 남지만 재귀가 없어 대상 하위로 번지지
+    //    않고, 디렉터리 소유자는 서비스를 설치한 관리자라 그 창은 이미 관리자인 사람에게만 열린다
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("list {dir:?}"))? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        // symlink_metadata: 링크를 따라가지 않고 항목 자체를 본다
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            continue;
+        }
+        // 다른 문맥이 소유한 파일은 여기서 못 고친다 — 그쪽이 자기 기동 때 고친다 (위 설명)
+        let _ = icacls(&path, &["/reset", "/L", "/Q"]);
+    }
     Ok(())
 }
 
@@ -479,27 +501,25 @@ fn write_token_file(token_id: &str, token: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// 이 바이너리에서 키체인이 "조용히" 동작하는가 (2026-09-01 맥 실측의 근본 대응).
-/// macOS 키체인 ACL은 코드 서명 정체성 기준인데, 애드혹 서명(cargo·CI 기본)은 고정
-/// 정체성이 없어 **"항상 허용"조차 유지되지 않는다** — 토큰을 읽는 모든 표면(데몬 재기동·
-/// 세션 MCP·훅)에서 프롬프트 폭풍. 그런 빌드에서는 키체인을 쓰지 않고 파일 저장을
-/// 택한다(사용자 개입 0). Developer ID 서명 배포부터는 자동으로 키체인 사용에 복귀한다.
+/// 이 플랫폼·바이너리에서 OS 키체인을 **주 저장소**로 써도 되는가 — 아니면 토큰 파일이 주다.
+///
+/// - 맥 (2026-09-01 실측의 근본 대응): 키체인 ACL은 코드 서명 정체성 기준인데, 애드혹 서명
+///   (cargo·CI 기본)은 고정 정체성이 없어 **"항상 허용"조차 유지되지 않는다** — 토큰을 읽는
+///   모든 표면(데몬 재기동·세션 MCP·훅)에서 프롬프트 폭풍. 그런 빌드는 파일(사용자 개입 0),
+///   Developer ID 서명 배포부터는 자동으로 키체인.
+/// - 윈도우 (2026-09-03): 데몬이 LocalSystem 서비스라 사용자의 자격 증명 저장소를 못 본다.
+/// - 리눅스 (2026-09-04, 종전 `true`를 번복): systemd 사용자 유닛 + `loginctl enable-linger`는
+///   **로그인 세션 없이 부팅 때** 데몬을 띄운다. 이 crate의 리눅스 저장소는 D-Bus Secret
+///   Service(GNOME Keyring·KWallet)인데 그 컬렉션은 세션이 열고 잠금을 푸는 것이라, 그 시점엔
+///   없거나 잠겨 있다 — 키링이 주 저장소면 기동 시점마다 결과가 달라진다. 파일이 주.
 fn keychain_is_reliable() -> bool {
     // cfg!(런타임 분기)인 이유: cfg 속성으로 갈랐다가는 맥 전용 본문이 이 윈도우 개발
     // 머신의 검사(clippy·test)를 영영 안 거친다 — 전 플랫폼 컴파일로 검증 사각을 없앤다
-    // 윈도우 (2026-09-03): 데몬이 LocalSystem 서비스로 돌아 사용자의 자격 증명 저장소를 못
-    // 본다 — 토큰은 설정 디렉터리의 파일로 (기존 저장소 항목은 첫 읽기 때 파일로 자가 이전)
-    if cfg!(windows) {
-        return false;
-    }
-    // 리눅스 (2026-09-03): systemd --user + loginctl enable-linger는 부팅 시
-    // 사용자 세션 전에 데몬을 시작할 수 있다. GNOME Keyring/KWallet은 세션 기반이므로
-    // 이 단계에서 접근 불가능하다 — 파일 우선(키링 폴백)이 안정적이고 일관성 있다.
-    if cfg!(target_os = "linux") {
+    if cfg!(windows) || cfg!(target_os = "linux") {
         return false;
     }
     if !cfg!(target_os = "macos") {
-        return true;
+        return true; // 그 밖의 유닉스(BSD 등) — 데몬 서비스 미지원 플랫폼, 종전 동작 유지
     }
     static RELIABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *RELIABLE.get_or_init(|| {
@@ -521,72 +541,137 @@ fn keychain_is_reliable() -> bool {
     })
 }
 
-/// 토큰 저장 — 키체인 우선, 불가하면 토큰 파일(600) 폴백. 키는 바인딩의 token_id 기준.
-/// 키체인이 비신뢰(무서명 맥 빌드)면 처음부터 파일로 — 키체인을 건드리지 않아 프롬프트 0회.
+/// 토큰 조회 키 후보 — 현행 `org/agent`, 그리고 org를 알 때는 구형 `agent`(단일 조직 시절 저장분).
+fn token_ids(binding: &Binding) -> Vec<String> {
+    let mut ids = vec![binding.token_id()];
+    if binding.org.is_some() {
+        ids.push(binding.agent.clone());
+    }
+    ids
+}
+
+/// 토큰 저장 — 주 저장소에 쓴다 (`keychain_is_reliable`: 서명된 맥은 키체인, 그 외는 토큰
+/// 파일 0600). 키는 바인딩의 token_id. 키체인이 주인데 쓰기가 실패하면 파일로 폴백.
+/// 키체인에 썼으면 **같은 정체성의 토큰 파일은 지운다** (2026-09-04): `load_token`은 파일을
+/// 키체인보다 먼저 보고 키체인으로 이전하므로, 옛 파일이 남으면 다음 읽기가 방금 저장한 새
+/// 토큰을 옛 것으로 되돌린다. 주 저장소는 하나여야 한다.
 pub fn store_token(server: &str, binding: &Binding, token: &str) -> anyhow::Result<TokenStore> {
     let id = binding.token_id();
     if keychain_is_reliable()
         && let Ok(entry) = keyring_entry(server, &id)
         && entry.set_password(token).is_ok()
     {
+        for stale in token_ids(binding).iter().filter_map(|c| token_file(c).ok()) {
+            if stale.exists()
+                && let Err(e) = std::fs::remove_file(&stale)
+            {
+                eprintln!("warning: could not remove the superseded token file {stale:?}: {e}");
+            }
+        }
         return Ok(TokenStore::Keyring);
     }
     Ok(TokenStore::File(write_token_file(&id, token)?))
 }
 
-/// 토큰 로드 우선순위: `BREVDUVA_TOKEN` env → 키체인(org 포함 키 → 구형 agent 키) →
-/// 토큰 파일(org 포함 → 구형 `token-{agent}`) → 구형 단일 파일(`token`, 바인딩이
-/// 하나일 때만 — 어느 에이전트 것인지 판별 불가). 구형 폴백들 덕에 기존 머신
-/// (org 없는 키로 저장됨)은 재enroll 없이 동작한다.
-/// 키체인 비신뢰 빌드는 파일을 먼저 보고, 키체인은 마지막에 한 번만 — 성공하면 파일로
-/// **자가 이전**해 그 프롬프트가 마지막이 된다 (기존 키체인 사용자 무개입 마이그레이션).
-/// env는 단일 바인딩 전용 편의 — 에이전트가 여럿이면 전원에게 같은 값이 가므로 부적합.
+/// 파일 → 키체인 이전 (키체인이 주 저장소가 된 시점 — 무서명 빌드에서 서명 빌드로 갱신).
+/// 순서: 키체인에 쓰기 → **되읽어 같은 값인지 확인** → 그제야 파일 삭제. 어느 단계가
+/// 실패해도 파일은 남는다 — 토큰을 잃는 경로가 없다.
+fn migrate_file_to_keychain(
+    server: &str,
+    id: &str,
+    path: &Path,
+    token: &str,
+) -> anyhow::Result<()> {
+    let entry = keyring_entry(server, id)?;
+    entry.set_password(token).context("keychain write")?;
+    let back = entry.get_password().context("keychain read-back")?;
+    anyhow::ensure!(
+        back == token,
+        "keychain read-back differs from what was written"
+    );
+    std::fs::remove_file(path).with_context(|| format!("remove {path:?}"))
+}
+
+/// 키체인 → 파일 이전 (파일이 주 저장소인 플랫폼에 키체인 시절의 항목이 남은 경우).
+/// 같은 순서: 파일 쓰기(0600·디렉터리 좁힘 포함) → 되읽어 확인 → 그제야 키체인 항목 삭제.
+/// 삭제 이유는 비밀 사본 최소화와, 파일이 사라졌을 때 옛 항목이 폴백으로 되살아나는 것
+/// (stale fallback) 방지다 — 서버에서 회수된 토큰은 어디에 있든 무효이므로 "회수 안 되는
+/// 사본"이 이유가 아니다 (2026-09-04 정정). 맥은 지우기도 프롬프트를 띄우는데 프롬프트 회피가
+/// 파일 이전의 이유였으므로 항목을 남긴다 (서명 배포로 키체인에 복귀하면 `migrate_file_to_keychain`
+/// 이 그 항목을 덮어쓴다).
+fn migrate_keychain_to_file(
+    server: &str,
+    id: &str,
+    found_id: &str,
+    token: &str,
+) -> anyhow::Result<()> {
+    let path = write_token_file(id, token)?;
+    let back = std::fs::read_to_string(&path).with_context(|| format!("read back {path:?}"))?;
+    anyhow::ensure!(
+        back.trim() == token.trim(),
+        "token file read-back differs from what was written"
+    );
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    keyring_entry(server, found_id)?
+        .delete_credential()
+        .context("keychain entry delete")
+}
+
+/// 토큰 로드 — `BREVDUVA_TOKEN` env가 있으면 그것(단일 바인딩 전용 편의 — 에이전트가 여럿이면
+/// 전원에게 같은 값이 가므로 부적합). 없으면 주 저장소·보조 저장소를 보되, **보조에서 찾은
+/// 토큰은 주 저장소로 이전한다** (2026-09-04, 양방향):
+/// - 키체인이 주(서명된 맥): 파일 → (있으면 키체인으로 이전 후 파일 삭제) → 키체인. 파일이
+///   먼저인 이유: 무서명 빌드 시절 재enroll로 **파일만 새 토큰**이 됐을 수 있다 — 키체인을
+///   먼저 읽으면 옛 토큰으로 접속해 실패한다. 이전이 실패하면 파일을 그대로 두고 그 값을 쓴다.
+/// - 파일이 주(윈도우·리눅스·무서명 맥): 파일 → 키체인 → (찾으면 파일로 이전 후 항목 삭제,
+///   맥 제외). 무개입 마이그레이션 — 기존 키체인 사용자는 다음 읽기 한 번으로 끝난다.
+///
+/// 각 저장소 안에서는 org 포함 키 → 구형 agent 키 순. 마지막으로 구형 단일 파일(`token`,
+/// 바인딩이 하나일 때만 — 어느 에이전트 것인지 판별 불가). 구형 폴백들 덕에 기존 머신은
+/// 재enroll 없이 동작한다. 어느 이전도 **검증 전에는 원본을 지우지 않는다**.
 pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("BREVDUVA_TOKEN") {
         return Ok(token);
     }
     let id = binding.token_id();
-    let mut ids = vec![id.clone()];
-    if binding.org.is_some() {
-        ids.push(binding.agent.clone()); // 구형 키 폴백
-    }
-    let from_files = |ids: &[String]| {
+    let ids = token_ids(binding);
+    // 어느 파일·어느 키로 찾았는지까지 돌려준다 — 이전 후 그 원본을 지우기 위해
+    let from_files = || {
         ids.iter().find_map(|c| {
-            token_file(c)
-                .ok()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|t| t.trim().to_owned())
+            let path = token_file(c).ok()?;
+            let t = std::fs::read_to_string(&path).ok()?;
+            Some((path, t.trim().to_owned()))
         })
     };
-    // 어느 키로 찾았는지까지 돌려준다 — 자가 이전 후 그 항목을 지우기 위해 (2026-09-03)
-    let from_keyring = |ids: &[String]| -> Option<(String, String)> {
+    let from_keyring = || {
         ids.iter().find_map(|c| {
             let token = keyring_entry(&cfg.server, c).ok()?.get_password().ok()?;
             Some((c.clone(), token))
         })
     };
     if keychain_is_reliable() {
-        if let Some((_, t)) = from_keyring(&ids) {
+        if let Some((path, t)) = from_files() {
+            if let Err(e) = migrate_file_to_keychain(&cfg.server, &id, &path, &t) {
+                eprintln!(
+                    "warning: token file {path:?} could not be moved into the keychain (kept as is, will retry next time): {e:#}"
+                );
+            }
             return Ok(t);
         }
-        if let Some(t) = from_files(&ids) {
+        if let Some((_, t)) = from_keyring() {
             return Ok(t);
         }
     } else {
-        if let Some(t) = from_files(&ids) {
+        if let Some((_, t)) = from_files() {
             return Ok(t);
         }
-        if let Some((_found_id, t)) = from_keyring(&ids) {
-            // 자가 이전 — 다음부터 저장소를 건드리지 않는다
-            if write_token_file(&id, &t).is_ok() {
-                // 윈도우 (2026-09-03): 이전이 끝나면 저장소의 사본은 **회수되지 않는 두 번째
-                // 비밀**이다 (대시보드의 연결 회수는 서버 토큰만 바꾼다) — 지운다.
-                // 맥은 지우기도 프롬프트를 띄우는데 프롬프트 회피가 파일 이전의 이유였으므로
-                // 손대지 않는다 (서명 배포로 키체인에 복귀할 때 그 항목이 그대로 쓰인다)
-                #[cfg(windows)]
-                if let Ok(entry) = keyring_entry(&cfg.server, &_found_id) {
-                    let _ = entry.delete_credential();
-                }
+        if let Some((found_id, t)) = from_keyring() {
+            if let Err(e) = migrate_keychain_to_file(&cfg.server, &id, &found_id, &t) {
+                eprintln!(
+                    "warning: keychain token could not be moved to the token file (kept in the keychain, will retry next time): {e:#}"
+                );
             }
             return Ok(t);
         }
@@ -644,6 +729,15 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn acl_of(p: &Path) -> String {
+        let out = std::process::Command::new("icacls")
+            .arg(p)
+            .output()
+            .expect("icacls");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(windows)]
     #[test]
     fn config_dir_is_locked_to_the_owner_on_windows() {
         let dir = std::env::temp_dir().join(format!("brv-acl-test-{}", std::process::id()));
@@ -652,13 +746,6 @@ mod tests {
         let existing = dir.join("token-existing");
         std::fs::write(&existing, "brv_x").expect("token file");
         restrict_dir(&dir).expect("restrict");
-        let acl_of = |p: &Path| {
-            let out = std::process::Command::new("icacls")
-                .arg(p)
-                .output()
-                .expect("icacls");
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
         let (dir_acl, file_acl) = (acl_of(&dir), acl_of(&existing));
         std::fs::remove_dir_all(&dir).ok();
         // 그룹 이름은 OS 언어에 따라 달라지므로 **주체 수**로 검사한다 — 딱 셋만 남아야 한다
@@ -678,6 +765,54 @@ mod tests {
         assert!(
             file_acl.to_lowercase().contains(&me),
             "the owner must keep access: {file_acl:?}"
+        );
+    }
+
+    /// 2026-09-04: 자식 권한 초기화는 SYSTEM 문맥에서도 도는데 디렉터리는 사용자 소유다 —
+    /// 사용자가 심어 둔 정션을 따라가 바깥 경로의 ACL을 건드리면 권한 상승이다. 정션(재분석
+    /// 지점)은 건너뛰고 그 대상은 손대지 않아야 한다. 대상 파일에 미리 explicit ACE를 줘
+    /// 두어, 따라갔다면(`/reset` = 상속 복원) 주체 수가 달라져 드러나게 한다.
+    #[cfg(windows)]
+    #[test]
+    fn child_reset_does_not_follow_junctions_on_windows() {
+        let base = std::env::temp_dir().join(format!("brv-junction-test-{}", std::process::id()));
+        let (dir, outside) = (base.join("config"), base.join("outside"));
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, "keep my acl").expect("victim");
+        let sid = user_sid().expect("sid");
+        let out = std::process::Command::new("icacls")
+            .arg(&victim)
+            .args(["/inheritance:r", "/grant:r", &format!("*{sid}:F"), "/Q"])
+            .output()
+            .expect("icacls");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        // 정션은 특권 없이 만들 수 있다 (심볼릭 링크와 달리) — 공격자 모델에 맞는 쪽
+        let out = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(dir.join("planted"))
+            .arg(&outside)
+            .output()
+            .expect("mklink");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let before = acl_of(&victim);
+        restrict_dir(&dir).expect("restrict");
+        let after = acl_of(&victim);
+        std::fs::remove_dir_all(&base).ok();
+        let principals = |acl: &str| acl.lines().filter(|l| l.contains(":(")).count();
+        assert_eq!(principals(&before), 1, "setup: {before:?}");
+        assert_eq!(
+            before, after,
+            "a file behind a planted junction must be untouched"
         );
     }
 

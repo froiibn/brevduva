@@ -1135,7 +1135,7 @@ fn binding_remove(selector: &str) -> anyhow::Result<()> {
     println!("binding {full} removed — {path:?}");
     if !cfg.bindings.iter().any(|b| b.token_id() == token_id) {
         println!(
-            "  (the agent's token stays in the keychain — to revoke it, rotate the token in the dashboard)"
+            "  (the agent's token stays where it is stored — keychain or token file; to revoke it, revoke the connection in the dashboard)"
         );
     }
     restart_daemon(false)?;
