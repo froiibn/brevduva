@@ -1177,9 +1177,10 @@ mod tests {
             None,
             "two waking sessions are ambiguous"
         );
-        let legacy: BindingStatus =
-            serde_json::from_str(r#"{"state":{"state":"connected"},"since_unix":0,"wake_check":null}"#)
-                .expect("old state files have no waking field");
+        let legacy: BindingStatus = serde_json::from_str(
+            r#"{"state":{"state":"connected"},"since_unix":0,"wake_check":null}"#,
+        )
+        .expect("old state files have no waking field");
         assert!(!legacy.waking);
     }
 
