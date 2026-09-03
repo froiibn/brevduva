@@ -492,6 +492,12 @@ fn keychain_is_reliable() -> bool {
     if cfg!(windows) {
         return false;
     }
+    // 리눅스 (2026-09-03): systemd --user + loginctl enable-linger는 부팅 시
+    // 사용자 세션 전에 데몬을 시작할 수 있다. GNOME Keyring/KWallet은 세션 기반이므로
+    // 이 단계에서 접근 불가능하다 — 파일 우선(키링 폴백)이 안정적이고 일관성 있다.
+    if cfg!(target_os = "linux") {
+        return false;
+    }
     if !cfg!(target_os = "macos") {
         return true;
     }
