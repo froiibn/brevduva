@@ -59,9 +59,18 @@ enum Cmd {
         /// If the agent already exists, rotate its token and reuse it
         #[arg(long, conflicts_with = "enroll")]
         rotate: bool,
-        /// Skip the automatic Claude Code MCP registration after enroll
+        /// Skip registering the MCP server in the agent runners detected on this machine
         #[arg(long)]
         no_mcp: bool,
+        /// Runner to wake with when setting up unattended receiving (codex, claude, …) — skips the question when several are installed
+        #[arg(long)]
+        runner: Option<String>,
+        /// Set up unattended receiving without asking (wake runner, one test wake, OS service)
+        #[arg(long, conflicts_with = "attended_only")]
+        unattended: bool,
+        /// Do not offer unattended receiving — attended use only
+        #[arg(long)]
+        attended_only: bool,
     },
     /// Manage bindings (agent × channel) — list, add, remove
     Binding {
@@ -363,8 +372,22 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             description,
             rotate,
             no_mcp,
+            runner,
+            unattended,
+            attended_only,
         } => match enroll {
-            Some(code) => enroll_init(server, code, channel, no_mcp).await,
+            Some(code) => {
+                enroll_init(
+                    server,
+                    code,
+                    channel,
+                    no_mcp,
+                    runner.as_deref(),
+                    unattended,
+                    attended_only,
+                )
+                .await
+            }
             None => {
                 // clap의 required_unless_present가 보장 — 여기 도달하면 전부 Some
                 init(
@@ -937,6 +960,9 @@ async fn enroll_init(
     code: String,
     channel: Option<String>,
     no_mcp: bool,
+    runner: Option<&str>,
+    unattended: bool,
+    attended_only: bool,
 ) -> anyhow::Result<()> {
     let enrolled = brv::enroll::exchange(&server, code.trim(), channel.as_deref()).await?;
     let mut cfg = open_config_for(&enrolled.server)?;
@@ -988,16 +1014,154 @@ async fn enroll_init(
     // 돌고 있는 데몬에 새 토큰·바인딩을 즉시 반영 (2026-09-02 맥북 실사고 — 재enroll 후 재기동
     // 없이는 데몬이 옛 토큰으로 죽어 있었다). 서비스 미등록이면 조용히 지나간다
     restart_daemon(false)?;
-    // 온보딩 가이드 체인 (2026-09-02 사용자 확정): 마법사 대신 각 단계의 완료
-    // 메시지가 다음 단계를 안내한다 — 설치기는 enroll을, enroll은 무인 모드를.
+    // 무인 수신 통합 흐름 (2026-09-04, 온보딩 재설계 2): 종전엔 세 명령을 안내만 했다 —
+    // 이제 질문 하나로 잇는다. 이미 무인 설정+서비스가 있는 머신(두 번째 에이전트)은 묻지 않는다
+    if cfg.wake.is_some() && brv::service::registered() {
+        println!(
+            "unattended receiving is already set up on this machine — the daemon picked up the new binding"
+        );
+        return Ok(());
+    }
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let go = if unattended {
+        true
+    } else if attended_only || !interactive {
+        // 터미널이 아니면(스크립트·에이전트가 대신 실행) 묻지 않는다 — 플래그로 정한다
+        false
+    } else {
+        println!();
+        ask_yes_no(
+            "Also receive while you're away — wake an agent session per message? [Y/n] ",
+            true,
+        )?
+    };
+    if !go {
+        println!();
+        println!("attended use is ready. For unattended receiving later:");
+        println!("  brv init --server … --enroll … --unattended   # or step by step:");
+        println!(
+            "  brv wake set --allow respond   # unattended-session allowance (respond|edit|full)"
+        );
+        println!("  brv wake test                  # verify one wake actually works");
+        println!("  brv daemon install             # register the resident OS service");
+        return Ok(());
+    }
+    setup_unattended(&cfg, runner, interactive).await
+}
+
+/// 무인 수신 셋업 — 러너 결정 → 권한 respond → 실제 깨우기 1회 → OS 서비스. 어느 단계가 막히면
+/// 거기서 멈추고 이유와 다음 명령을 말한다 — 유인 모드는 이미 쓸 수 있으니 실패가 아니다.
+async fn setup_unattended(
+    cfg: &BrvConfig,
+    runner: Option<&str>,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    let runner_id: Option<String> = match runner {
+        Some(id) => Some(id.to_owned()),
+        // 러너가 이미 정해져 있다 (무인 설정은 있고 서비스만 없는 재실행) — wake_set이 유지한다
+        None if cfg.wake.is_some() => None,
+        None => {
+            let found: Vec<_> = brv::runners::detect_all()
+                .into_iter()
+                .filter(|d| d.spec.wake.is_some())
+                .collect();
+            match found.as_slice() {
+                [] => {
+                    println!(
+                        "no agent runner found on this machine — attended use works now. For unattended receiving install one of: {} — then `brv wake set --allow respond`, `brv wake test`, `brv daemon install`",
+                        brv::runners::RUNNERS
+                            .iter()
+                            .map(|r| r.id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    return Ok(());
+                }
+                [one] => Some(one.spec.id.to_owned()),
+                many => {
+                    let list: Vec<String> = many
+                        .iter()
+                        .map(|d| format!("{} ({})", d.spec.id, d.version))
+                        .collect();
+                    if !interactive {
+                        println!(
+                            "several runners found: {} — re-run with --runner <id> to set up unattended receiving",
+                            list.join(", ")
+                        );
+                        return Ok(());
+                    }
+                    println!();
+                    println!("Which runner should wake this machine's agent?");
+                    for (i, item) in list.iter().enumerate() {
+                        println!("  [{}] {item}", i + 1);
+                    }
+                    let n = ask_number("choice: ", list.len())?;
+                    Some(many[n - 1].spec.id.to_owned())
+                }
+            }
+        }
+    };
     println!();
-    println!(
-        "to receive while you're away (optional) — this machine wakes an agent session per message:"
-    );
-    println!("  brv wake set --allow respond   # unattended-session allowance (respond|edit|full)");
-    println!("  brv wake test                  # verify one wake actually works");
-    println!("  brv daemon install             # register the resident OS service");
+    println!("setting up unattended receiving:");
+    wake_set(
+        Some("respond".to_owned()),
+        runner_id.as_deref(),
+        None,
+        None,
+        None,
+        None,
+    )?;
+    // 바인딩이 여럿(한 코드에 여러 에이전트)이면 첫 바인딩으로 점검한다
+    let first = cfg.bindings.first().map(|b| b.full_label());
+    if let Err(e) = wake_test(first.as_deref()).await {
+        println!();
+        println!(
+            "wake test failed: {e:#}\n  attended use still works. Fix the cause (runner login? `brv wake show`), then `brv wake test` and `brv daemon install`"
+        );
+        return Ok(());
+    }
+    println!();
+    match brv::service::install(None) {
+        Ok(()) => {
+            println!("unattended receiving is on — messages wake the runner while you're away")
+        }
+        Err(e) => println!(
+            "service registration failed: {e:#}\n  attended use still works — run `brv daemon install` later"
+        ),
+    }
     Ok(())
+}
+
+/// 예/아니오 질문 — Enter는 기본값. 터미널일 때만 부른다.
+fn ask_yes_no(prompt: &str, default: bool) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim().to_ascii_lowercase().as_str() {
+        "" => default,
+        "y" | "yes" => true,
+        _ => false,
+    })
+}
+
+/// 1..=max 번호 질문 — 잘못 치면 다시 묻는다.
+fn ask_number(prompt: &str, max: usize) -> anyhow::Result<usize> {
+    use std::io::Write as _;
+    loop {
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            anyhow::bail!("no input");
+        }
+        match line.trim().parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => return Ok(n),
+            _ => println!("enter a number between 1 and {max}"),
+        }
+    }
 }
 
 /// Claude Code MCP 자동 등록 (기본 켬, --no-mcp로 생략) — 실패는 온보딩 실패가 아니라 안내.
@@ -1373,6 +1537,11 @@ fn binding_remove(selector: &str) -> anyhow::Result<()> {
 
 async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
     let cfg = config::load()?;
+    println!(
+        "profile: {} ({})",
+        config::config_path()?.display(),
+        config::profile_source()
+    );
     println!(
         "config: server {} / {} binding(s)",
         cfg.server,

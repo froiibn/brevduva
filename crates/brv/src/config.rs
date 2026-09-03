@@ -240,15 +240,40 @@ pub fn set_path_override(path: PathBuf) {
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
-    // 우선순위: 프로세스 내 고정(서비스 모드) → env(다중 프로필) → OS 기본 경로
+    // 우선순위: 프로세스 내 고정(서비스 모드) → env(다중 프로필) → 등록된 OS 서비스의 프로필
+    // (2026-09-04 — 서비스가 있는 머신의 "이 머신 프로필"은 그것이다) → OS 기본 경로
     if let Some(path) = PATH_OVERRIDE.get() {
         return Ok(path.clone());
     }
     if let Ok(path) = std::env::var("BREVDUVA_CONFIG") {
         return Ok(PathBuf::from(path));
     }
+    if let Some(path) = registered_service_config() {
+        return Ok(path.clone());
+    }
     let dir = dirs::config_dir().context("cannot resolve OS config directory")?;
     Ok(dir.join("brevduva").join("config.toml"))
+}
+
+/// 등록된 서비스의 프로필 — 프로세스당 1회 조회 (윈도우는 SCM 질의). 파일이 실제로 있을 때만.
+fn registered_service_config() -> Option<&'static PathBuf> {
+    static CACHE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| crate::service::registered_config_path().filter(|p| p.is_file()))
+        .as_ref()
+}
+
+/// `config_path()`가 어느 규칙으로 정해졌는지 — `brv status`가 사용자에게 보여준다.
+pub fn profile_source() -> &'static str {
+    if PATH_OVERRIDE.get().is_some() {
+        "pinned by --config"
+    } else if std::env::var_os("BREVDUVA_CONFIG").is_some() {
+        "BREVDUVA_CONFIG"
+    } else if registered_service_config().is_some() {
+        "the registered OS service"
+    } else {
+        "OS default"
+    }
 }
 
 /// 원본 파싱용 — 신형(`[[binding]]`)과 구형(톱레벨 channel/agent, [wake]의 dir/policy)을

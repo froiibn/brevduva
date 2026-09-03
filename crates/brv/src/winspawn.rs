@@ -17,6 +17,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, RawHandle};
+use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use anyhow::Context as _;
@@ -38,8 +39,8 @@ use windows_sys::Win32::System::RemoteDesktop::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-    GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::daemon::NoUserSession;
@@ -307,6 +308,74 @@ fn enable_privileges() {
             };
         }
     });
+}
+
+/// 이 프로세스가 관리자 권한(승격)으로 도는가 — `brv daemon install`의 UAC 자기 승격 판단
+/// (2026-09-04, 온보딩 재설계 2).
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    let mut token: HANDLE = null_mut();
+    // SAFETY: 자기 프로세스 핸들, 출력 포인터는 로컬
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    // SAFETY: 방금 받은 토큰의 소유권
+    let token = unsafe { OwnedHandle::from_raw_handle(token as RawHandle) };
+    // SAFETY: 평범한 C 구조체
+    let mut elevation: TOKEN_ELEVATION = unsafe { zeroed() };
+    let mut len = 0u32;
+    // SAFETY: 유효한 토큰, 구조체 크기만큼의 출력 버퍼
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle() as HANDLE,
+            TokenElevation,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    ok != 0 && elevation.TokenIsElevated != 0
+}
+
+/// 같은 실행 파일을 관리자 권한으로 다시 실행하고 끝나기를 기다린다 — UAC 창이 한 번 뜬다.
+/// 승격된 프로세스의 출력은 이 콘솔로 돌아오지 않으므로 `cmd /c … > log 2>&1`로 파일에 받고,
+/// 호출자가 그 파일을 보여준다. 반환값은 종료 코드. UAC를 취소하면 Err.
+pub fn run_elevated(exe: &Path, args: &[String], log: &Path) -> anyhow::Result<i32> {
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    let inner = command_line(&exe.to_string_lossy(), args);
+    // cmd의 인용 규칙: 전체를 한 쌍의 따옴표로 감싸면 안쪽 따옴표를 그대로 보존한다
+    let params = wide(&format!("/d /c \"{inner} > \"{}\" 2>&1\"", log.display()));
+    let verb = wide("runas");
+    let file = wide("cmd.exe");
+    // SAFETY: 평범한 C 구조체
+    let mut info: SHELLEXECUTEINFOW = unsafe { zeroed() };
+    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = 0; // SW_HIDE — 승격된 cmd 창은 띄우지 않는다 (UAC 창은 별도로 뜬다)
+    // SAFETY: 모든 포인터는 이 함수 안의 살아 있는 버퍼를 가리킨다
+    check(
+        unsafe { ShellExecuteExW(&mut info) },
+        "ShellExecuteExW (the administrator prompt was declined or failed)",
+    )?;
+    anyhow::ensure!(!info.hProcess.is_null(), "elevated process handle missing");
+    // SAFETY: SEE_MASK_NOCLOSEPROCESS로 받은 프로세스 핸들의 소유권
+    let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess as RawHandle) };
+    // SAFETY: 유효한 프로세스 핸들
+    unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE) };
+    let mut code = 0u32;
+    // SAFETY: 유효한 프로세스 핸들, 종료 확인 후 호출
+    check(
+        unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut code) },
+        "GetExitCodeProcess",
+    )?;
+    Ok(code as i32)
 }
 
 fn check(ok: i32, what: &str) -> anyhow::Result<()> {

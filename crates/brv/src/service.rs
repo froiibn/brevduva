@@ -17,6 +17,145 @@
 
 pub const SERVICE_NAME: &str = "brv-daemon";
 
+/// 등록된 OS 서비스가 있는가 — `init --enroll`이 "이미 무인 셋업이 끝난 머신"을 판별하는 데 쓴다.
+pub fn registered() -> bool {
+    registration().is_some()
+}
+
+/// 등록된 OS 서비스가 쓰는 설정 파일 (2026-09-04, 온보딩 재설계 2) — `config::config_path()`의
+/// 폴백. 실측 발단: 서비스는 `C:\brevduva\config.toml`로 등록돼 있는데 사용자 셸의 `brv status`가
+/// 기본 경로(`%APPDATA%`)의 옛 설정을 봐 "토큰 없음·데몬 없음"으로 헤맸다. 서비스가 있는 머신의
+/// "이 머신 프로필"은 서비스의 것이다. None = 미등록이거나 기본 경로를 쓰는 서비스.
+pub fn registered_config_path() -> Option<std::path::PathBuf> {
+    registration()?.map(std::path::PathBuf::from)
+}
+
+/// Some(Some(path)) = 등록됨·전용 프로필, Some(None) = 등록됨·기본 경로, None = 미등록.
+#[cfg(target_os = "linux")]
+fn registration() -> Option<Option<String>> {
+    let unit = dirs::config_dir()?
+        .join("systemd")
+        .join("user")
+        .join(format!("{SERVICE_NAME}.service"));
+    let text = std::fs::read_to_string(unit).ok()?;
+    Some(config_from_unit(&text))
+}
+
+#[cfg(target_os = "macos")]
+fn registration() -> Option<Option<String>> {
+    let plist = dirs::home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+    let text = std::fs::read_to_string(plist).ok()?;
+    Some(config_from_plist(&text))
+}
+
+#[cfg(windows)]
+fn registration() -> Option<Option<String>> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+        .ok()?;
+    let config = service.query_config().ok()?;
+    // executable_path는 SCM의 BinaryPathName — 실행 파일과 인자가 한 줄로 들어 있다
+    Some(config_from_command_line(
+        &config.executable_path.to_string_lossy(),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn registration() -> Option<Option<String>> {
+    None
+}
+
+/// systemd 유닛에서 `Environment=BREVDUVA_CONFIG=…` 값.
+#[cfg(any(target_os = "linux", test))]
+fn config_from_unit(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("Environment=BREVDUVA_CONFIG=")
+            .map(|v| v.trim().trim_matches('"').to_owned())
+    })
+}
+
+/// launchd plist에서 `<key>BREVDUVA_CONFIG</key><string>…</string>` 값.
+#[cfg(any(target_os = "macos", test))]
+fn config_from_plist(text: &str) -> Option<String> {
+    let after = text.split("<key>BREVDUVA_CONFIG</key>").nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(after[start..end].to_owned())
+}
+
+/// SCM BinaryPathName(`"C:\…\brv.exe" daemon service-run --config "C:\x y\config.toml" …`)에서
+/// `--config` 다음 토큰 — 따옴표로 묶인 토큰은 하나로 본다.
+fn config_from_command_line(line: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+        .iter()
+        .position(|t| t == "--config")
+        .and_then(|i| tokens.get(i + 1).cloned())
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    /// 2026-09-04: 세 OS의 등록 파일/SCM 문자열에서 프로필 경로를 읽는다 — 공백·따옴표 포함.
+    #[test]
+    fn registered_profile_is_read_from_each_registration_form() {
+        assert_eq!(
+            config_from_unit(
+                "[Service]\nEnvironment=\"PATH=/a b\"\nEnvironment=BREVDUVA_CONFIG=/home/u/.config/brevduva/config.toml\nExecStart=/x daemon\n"
+            ),
+            Some("/home/u/.config/brevduva/config.toml".to_owned())
+        );
+        assert_eq!(config_from_unit("[Service]\nExecStart=/x daemon\n"), None);
+        assert_eq!(
+            config_from_plist(
+                "<dict>\n<key>PATH</key><string>/usr/bin</string>\n<key>BREVDUVA_CONFIG</key><string>/Users/u/proj/config.toml</string>\n</dict>"
+            ),
+            Some("/Users/u/proj/config.toml".to_owned())
+        );
+        assert_eq!(config_from_plist("<dict></dict>"), None);
+        assert_eq!(
+            config_from_command_line(
+                r#""C:\brevduva\brv.exe" daemon service-run --config "C:\my profile\config.toml" --wake-user Jaeyoung"#
+            ),
+            Some(r"C:\my profile\config.toml".to_owned())
+        );
+        assert_eq!(
+            config_from_command_line(
+                r"C:\brevduva\brv.exe daemon service-run --config C:\brevduva\config.toml --wake-user Jaeyoung"
+            ),
+            Some(r"C:\brevduva\config.toml".to_owned())
+        );
+        assert_eq!(
+            config_from_command_line(r"C:\brevduva\brv.exe daemon"),
+            None
+        );
+    }
+}
+
 /// 서비스 정의에 심을 설정 경로 검증 — 서비스는 다른 cwd에서 뜨므로 절대 경로만 허용.
 fn require_absolute(config: Option<&str>) -> anyhow::Result<Option<&str>> {
     if let Some(c) = config {
@@ -268,6 +407,29 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     crate::config::set_path_override(config_path.clone());
     let exe = std::env::current_exe()?;
     let user = std::env::var("USERNAME").context("USERNAME env")?;
+
+    // UAC 자기 승격 (2026-09-04, 온보딩 재설계 2): 관리자 터미널을 따로 열게 하지 않는다 —
+    // 같은 명령을 승격해 다시 실행하고 기다린다(클릭 1회, 조용한 승격은 없다). 승격된 프로세스는
+    // 같은 사용자(USERNAME 동일)라 소유자 판단이 유지되고, 출력은 파일로 받아 여기서 보여준다
+    if !crate::winspawn::is_elevated() {
+        let log = std::env::temp_dir().join("brv-daemon-install.log");
+        let _ = std::fs::remove_file(&log);
+        let args = vec![
+            "daemon".to_owned(),
+            "install".to_owned(),
+            "--config".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+        ];
+        println!(
+            "registering the Windows service needs administrator rights — approve the prompt (once)"
+        );
+        let code = crate::winspawn::run_elevated(&exe, &args, &log)?;
+        if let Ok(out) = std::fs::read_to_string(&log) {
+            print!("{out}");
+        }
+        anyhow::ensure!(code == 0, "elevated install exited with code {code}");
+        return Ok(());
+    }
 
     // 토큰을 파일로 — 시스템 계정은 사용자의 자격 증명 저장소를 못 본다. 윈도우의 load_token은
     // 파일 우선 + 저장소→파일 자가 이전이라, 여기서 한 번 돌려 서비스가 읽을 파일을 보장한다.
