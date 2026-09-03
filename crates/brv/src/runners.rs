@@ -634,7 +634,9 @@ pub fn spec(id: &str) -> Option<&'static RunnerSpec> {
 
 /// 실행 파일 경로에서 프로필을 역추정 — 설정에 `runner`가 없는 구형 설정용 (`wake show`).
 pub fn spec_for_command(command: &str) -> Option<&'static RunnerSpec> {
-    let name = Path::new(command).file_name()?.to_str()?;
+    // 두 구분자를 직접 나눈다 — `Path::file_name`은 리눅스에서 백슬래시를 구분자로 보지 않아
+    // 윈도우 설정 파일을 다른 OS에서 읽을 때(CI 실측 2026-09-04) 프로필을 못 찾는다
+    let name = command.rsplit(['/', '\\']).next()?;
     let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
     RUNNERS
         .iter()
