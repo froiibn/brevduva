@@ -30,6 +30,81 @@ pub fn registered_config_path() -> Option<std::path::PathBuf> {
     registration()?.map(std::path::PathBuf::from)
 }
 
+/// 서비스가 실제로 실행하는 바이너리 — 갱신이 이 파일에 닿아야 새 코드가 뜬다 (`align_binary`).
+pub fn registered_exe() -> Option<std::path::PathBuf> {
+    registration_exe()
+}
+
+/// 갱신 설치가 서비스에 닿게 한다 (2026-09-04, 사용자 지적 "왜 사용자가 파일을 복사해야 하나").
+///
+/// 설치기는 CLI 경로(`~/.local/bin`)만 바꾸고 `brv daemon restart`를 부른다. 그런데 서비스가
+/// **다른 경로로 등록돼 있으면**(이 윈도우 머신 실측: 서비스는 `C:\brevduva\brv.exe`, 설치기는
+/// `%USERPROFILE%\.local\bin\brv.exe`) 재기동해도 옛 바이너리가 다시 뜬다 — 갱신했다고 믿는데
+/// 코드는 그대로인 **조용한 실패**다. 그래서 재기동 전에 서비스 쪽 파일을 지금 이 바이너리로
+/// 맞춘다: 실행 중인 파일은 지우지 못하므로 이름을 바꿔 비켜 두고(두 OS 모두 허용) 복사한다.
+///
+/// 버전이 같으면 아무것도 하지 않는다 — 설정 변경마다 파일을 건드리지 않기 위해. 실패는
+/// 치명적이지 않다(경고 후 재기동은 그대로 진행) — 다만 그때는 사용자가 알아야 한다.
+/// 반환: `Some((경로, 옛 버전))` = 교체함, `None` = 할 일 없음·판단 불가.
+pub fn align_binary() -> Option<(std::path::PathBuf, String)> {
+    let current = std::env::current_exe().ok()?;
+    let registered = registered_exe()?;
+    // 같은 파일이면 설치기가 이미 덮었다 (유닉스의 보통 경우)
+    if same_file(&current, &registered) {
+        return None;
+    }
+    let installed_version = probe_version(&registered)?;
+    let ours = format!("brv {}", env!("CARGO_PKG_VERSION"));
+    if installed_version.trim() == ours {
+        return None;
+    }
+    let parked = registered.with_extension("old");
+    let _ = std::fs::remove_file(&parked); // 지난 갱신의 잔재 (실행 중이면 실패 — 무시)
+    if let Err(e) = std::fs::rename(&registered, &parked) {
+        eprintln!(
+            "warning: the service runs {} but this is {ours} — could not move the old file aside ({e}). The daemon keeps running the old version.",
+            registered.display()
+        );
+        return None;
+    }
+    if let Err(e) = std::fs::copy(&current, &registered) {
+        let _ = std::fs::rename(&parked, &registered); // 되돌린다 — 반쪽 상태로 두지 않는다
+        eprintln!(
+            "warning: could not update the service binary at {} ({e}) — the daemon keeps the old version",
+            registered.display()
+        );
+        return None;
+    }
+    Some((registered, installed_version.trim().to_owned()))
+}
+
+/// 같은 파일인가 — 경로 표기 차이(대소문자·구분자·`.`)를 정규화해 비교한다.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .to_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+/// `<exe> --version` 한 줄. 못 읽으면 None(판단 불가 → 건드리지 않는다).
+fn probe_version(exe: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(exe)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(str::to_owned)
+}
+
 /// Some(Some(path)) = 등록됨·전용 프로필, Some(None) = 등록됨·기본 경로, None = 미등록.
 #[cfg(target_os = "linux")]
 fn registration() -> Option<Option<String>> {
@@ -71,6 +146,62 @@ fn registration() -> Option<Option<String>> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn registration_exe() -> Option<std::path::PathBuf> {
+    let unit = dirs::config_dir()?
+        .join("systemd")
+        .join("user")
+        .join(format!("{SERVICE_NAME}.service"));
+    exe_from_unit(&std::fs::read_to_string(unit).ok()?).map(std::path::PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn registration_exe() -> Option<std::path::PathBuf> {
+    let plist = dirs::home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+    exe_from_plist(&std::fs::read_to_string(plist).ok()?).map(std::path::PathBuf::from)
+}
+
+#[cfg(windows)]
+fn registration_exe() -> Option<std::path::PathBuf> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+        .ok()?;
+    let config = service.query_config().ok()?;
+    // BinaryPathName = 실행 파일 + 인자 한 줄 — 첫 토큰이 실행 파일
+    tokenize(&config.executable_path.to_string_lossy())
+        .into_iter()
+        .next()
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn registration_exe() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// systemd 유닛의 `ExecStart=<exe> daemon` 첫 토큰.
+#[cfg(any(target_os = "linux", test))]
+fn exe_from_unit(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))
+        .and_then(|v| tokenize(v).into_iter().next())
+}
+
+/// launchd plist의 `ProgramArguments` 첫 `<string>`.
+#[cfg(any(target_os = "macos", test))]
+fn exe_from_plist(text: &str) -> Option<String> {
+    let after = text.split("<key>ProgramArguments</key>").nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(after[start..end].to_owned())
+}
+
 /// systemd 유닛에서 `Environment=BREVDUVA_CONFIG=…` 값.
 #[cfg(any(target_os = "linux", test))]
 fn config_from_unit(text: &str) -> Option<String> {
@@ -90,10 +221,8 @@ fn config_from_plist(text: &str) -> Option<String> {
     Some(after[start..end].to_owned())
 }
 
-/// SCM BinaryPathName(`"C:\…\brv.exe" daemon service-run --config "C:\x y\config.toml" …`)에서
-/// `--config` 다음 토큰 — 따옴표로 묶인 토큰은 하나로 본다.
-#[cfg(any(windows, test))]
-fn config_from_command_line(line: &str) -> Option<String> {
+/// 명령줄 한 줄 → 토큰 — 따옴표로 묶인 토큰은 하나로 본다 (공백 있는 경로).
+fn tokenize(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
@@ -111,6 +240,13 @@ fn config_from_command_line(line: &str) -> Option<String> {
     if !cur.is_empty() {
         tokens.push(cur);
     }
+    tokens
+}
+
+/// SCM BinaryPathName에서 `--config` 다음 토큰.
+#[cfg(any(windows, test))]
+fn config_from_command_line(line: &str) -> Option<String> {
+    let tokens = tokenize(line);
     tokens
         .iter()
         .position(|t| t == "--config")
@@ -742,6 +878,33 @@ mod registration_tests {
         assert_eq!(
             config_from_command_line(r"C:\brevduva\brv.exe daemon"),
             None
+        );
+    }
+
+    /// 2026-09-04: 갱신이 서비스에 닿으려면 **서비스가 실행하는 파일**을 알아야 한다 —
+    /// 설치기는 CLI 경로만 바꾸므로, 등록 경로가 다르면 그 파일을 교체해야 한다 (align_binary).
+    #[test]
+    fn registered_executable_is_read_from_each_registration_form() {
+        assert_eq!(
+            exe_from_unit(
+                "[Service]\nEnvironment=BREVDUVA_CONFIG=/c\nExecStart=/home/u/.local/bin/brv daemon\n"
+            ),
+            Some("/home/u/.local/bin/brv".to_owned())
+        );
+        assert_eq!(exe_from_unit("[Service]\nRestart=always\n"), None);
+        assert_eq!(
+            exe_from_plist(
+                "<dict>\n<key>ProgramArguments</key>\n<array>\n<string>/Users/u/.local/bin/brv</string>\n<string>daemon</string>\n</array>\n</dict>"
+            ),
+            Some("/Users/u/.local/bin/brv".to_owned())
+        );
+        assert_eq!(exe_from_plist("<dict></dict>"), None);
+        // 공백 있는 경로는 따옴표 안이 한 토큰
+        assert_eq!(
+            tokenize(r#""C:\Program Files\brv.exe" daemon service-run"#)
+                .first()
+                .map(String::as_str),
+            Some(r"C:\Program Files\brv.exe")
         );
     }
 }

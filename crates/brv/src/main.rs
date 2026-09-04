@@ -1501,6 +1501,15 @@ fn parse_duration_secs(spec: &str) -> anyhow::Result<u64> {
 /// 설정을 바꾼 명령들이 부른다 (2026-09-02): 서비스가 등록돼 있으면 재기동해 변경을 즉시 반영,
 /// 아니면 직접 재시작하라고 안내. explicit(`brv daemon restart`)면 미등록을 오류로 돌려준다.
 fn restart_daemon(explicit: bool) -> anyhow::Result<()> {
+    // 갱신이 서비스에 닿게 (2026-09-04): 설치기는 CLI 경로만 바꾸는데 서비스가 다른 경로로
+    // 등록돼 있으면 재기동해도 옛 코드가 다시 뜬다 — 사용자가 파일을 손으로 복사할 일이 아니다
+    if let Some((path, previous)) = brv::service::align_binary() {
+        println!(
+            "service binary updated: {} ({previous} → brv {})",
+            path.display(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     match brv::service::restart() {
         Ok(true) => println!("daemon restarted (OS service) — changes are live"),
         Ok(false) if explicit => anyhow::bail!(
