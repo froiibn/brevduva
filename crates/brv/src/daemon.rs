@@ -321,20 +321,52 @@ pub async fn run_with_options(
         !cfg.bindings.is_empty(),
         "no bindings configured — run `brv init --enroll <code>` first"
     );
-    // 기동 시 일괄 검증 — 설정된 바인딩이 런타임에 조용히 죽는 것보다 기동 거부가 정직하다
-    for b in &cfg.bindings {
-        anyhow::ensure!(
-            tokens.contains_key(&b.token_id()),
-            "no token for binding {} — run `brv init --enroll` for this agent",
-            b.full_label()
-        );
-        anyhow::ensure!(
-            b.wake_dir.is_some(),
-            "binding {} has no wake_dir — set with `brv wake set --dir <project> --binding {}`",
-            b.label(),
-            b.label()
-        );
-    }
+    // 기동 시 일괄 검증 — 설정된 바인딩이 런타임에 조용히 죽는 것보다 드러내는 것이 정직하다.
+    // 다만 **못 쓰는 바인딩 하나가 나머지를 막지는 않는다** (2026-09-04 실측: 새로 추가한 바인딩에
+    // wake_dir이 없어 데몬 전체가 기동을 거부했고, 잘 돌던 바인딩까지 몇 시간 멈춰 있었다).
+    // 못 쓰는 것은 건너뛰되 상태 파일에 이유를 남겨 `brv status`가 드러낸다 — 침묵이 아니라 표시다.
+    let mut unusable: Vec<(String, String)> = Vec::new();
+    let usable: Vec<Binding> = cfg
+        .bindings
+        .iter()
+        .filter(|b| {
+            let problem = if !tokens.contains_key(&b.token_id()) {
+                Some(format!(
+                    "no token — run `brv init --enroll` for {}",
+                    b.agent
+                ))
+            } else if b.wake_dir.is_none() {
+                Some(format!(
+                    "wake_dir unset — `brv wake set --dir <project> --binding {}`",
+                    b.label()
+                ))
+            } else {
+                None
+            };
+            match problem {
+                Some(why) => {
+                    tracing::error!(binding = %b.full_label(), reason = %why, "binding cannot receive — skipped");
+                    unusable.push((b.full_label(), why));
+                    false
+                }
+                None => true,
+            }
+        })
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        !usable.is_empty(),
+        "no binding can receive — {}",
+        unusable
+            .iter()
+            .map(|(label, why)| format!("{label}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let cfg = BrvConfig {
+        bindings: usable,
+        ..cfg
+    };
     let journal = crate::config::config_path()?
         .parent()
         .expect("config has parent")
@@ -350,6 +382,25 @@ pub async fn run_with_options(
     // 상태 파일 (2026-09-02): 바인딩별 접속 상태·사전 점검 결과 — `brv status`가 읽는다
     let state_file = state_path()?;
     let shared: SharedState = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    // 건너뛴 바인딩도 상태 파일에 남긴다 (2026-09-04) — 데몬은 돌지만 그 바인딩은 못 받는다는
+    // 사실이 `brv status`에 보여야 한다. 로그에만 있으면 사용자는 "왜 조용하지"를 못 푼다
+    if !unusable.is_empty() {
+        let mut map = shared.lock().await;
+        for (label, why) in &unusable {
+            map.insert(
+                label.clone(),
+                BindingStatus {
+                    state: ClientState::Stopped {
+                        reason: why.clone(),
+                    },
+                    since_unix: now_unix(),
+                    wake_check: None,
+                    waking: false,
+                },
+            );
+        }
+        write_state(&state_file, &map).await;
+    }
 
     let mut set = tokio::task::JoinSet::new();
     for b in cfg.bindings.clone() {

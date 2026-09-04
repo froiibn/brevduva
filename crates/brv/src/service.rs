@@ -795,11 +795,23 @@ fn run_service() -> anyhow::Result<()> {
         )
         .await
     });
-    set_status(
+    // 실패는 **Stopped 보고 전에** 기록한다 (2026-09-04 실측): Stopped를 알리면 SCM이 프로세스를
+    // 곧바로 정리할 수 있어, 그 뒤의 로그 한 줄은 파일에 닿지 못한다 — 실제로 기동 실패가
+    // `sc query` 종료 코드 0 + 로그 0바이트로 완전히 침묵했다(설정 오류인데 원인을 알 길이 없음).
+    // 종료 코드도 실패면 1로 — "깨끗이 멈춤"과 "떠보지도 못함"은 다른 사실이다.
+    let failed = match &result {
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "daemon could not run — service stops");
+            true
+        }
+        Ok(()) => false,
+    };
+    set_status_code(
         &status_handle,
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
         Duration::ZERO,
+        u32::from(failed),
     )?;
     result
 }
@@ -811,12 +823,24 @@ fn set_status(
     accept: windows_service::service::ServiceControlAccept,
     wait_hint: std::time::Duration,
 ) -> windows_service::Result<()> {
+    set_status_code(handle, state, accept, wait_hint, 0)
+}
+
+/// 종료 코드까지 지정하는 상태 보고 — 기동 실패를 `sc query`가 드러내게 (2026-09-04).
+#[cfg(windows)]
+fn set_status_code(
+    handle: &windows_service::service_control_handler::ServiceStatusHandle,
+    state: windows_service::service::ServiceState,
+    accept: windows_service::service::ServiceControlAccept,
+    wait_hint: std::time::Duration,
+    exit_code: u32,
+) -> windows_service::Result<()> {
     use windows_service::service::{ServiceExitCode, ServiceStatus, ServiceType};
     handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: accept,
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: ServiceExitCode::ServiceSpecific(exit_code),
         checkpoint: 0,
         wait_hint,
         process_id: None,

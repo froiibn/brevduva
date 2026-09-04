@@ -93,6 +93,7 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - **깨운 세션이 답 없이 죽으면 데몬이 대신 알린다** (0.6.22) — 요청을 처리하러 깨어난 세션이 타임아웃·크래시·조용한 종료로 사라지면, 데몬이 발신자에게 `report{status:"failed", reason:"session-exited"}`를 원본 correlation과 함께 보낸다. 발신자가 영원히 기다리지 않게 하기 위함이다(실측: 발신자가 90분 뒤 되물어서야 드러난 사고). 세션이 실제로 답했는지는 서버 이력을 대조해 판정하므로 정상 응답에는 아무것도 발행되지 않는다. 스폰 직후에는 `report{status:"in-progress"}`로 "작업 중"을 먼저 알린다. 깨어난 세션에는 자기 수명(`timeout_s`)도 알려 준다 — 시간 안에 못 끝낼 일이면 부분 결과라도 답하게
 - 설정을 바꾸는 명령(`brv init --enroll`·`binding add/remove`·`wake set`)은 OS 서비스로 등록된 데몬을 **자동 재기동**해 변경을 즉시 반영한다(`brv daemon restart`로 직접도 가능). 토큰이 거부되면 데몬은 죽지 않고 **정지 상태로 재시도**하며, 재연결(재enroll)로 토큰이 바뀌면 재기동 없이 스스로 복구한다 — `brv status`가 바인딩별 상태(connected · parked · SUSPENDED …)를 보여준다
 - **갱신은 설치 한 줄이 전부다** — 설치기가 새 바이너리를 놓고 데몬을 재기동하는데, 서비스가 다른 경로로 등록된 머신(예: 서비스는 `C:revduvarv.exe`, 설치기는 `%USERPROFILE%\.localin`)에서는 재기동만으로는 옛 코드가 다시 떴다. 이제 재기동 전에 **서비스가 실행하는 파일을 새 바이너리로 맞춘다**(버전이 다를 때만, 옛 파일은 `.old`로 비켜 둔다) — 사용자가 파일을 손으로 복사할 일이 없다. 바꾼 경우 `service binary updated: …`로 알린다
+- **못 쓰는 바인딩 하나가 나머지를 막지 않는다** — 토큰이 없거나 `wake_dir`이 없는 바인딩은 건너뛰고 나머지는 정상 수신한다. 건너뛴 바인딩은 `brv status`에 이유와 함께 나온다(예: `wake_dir unset — brv wake set --dir <프로젝트> --binding …`). 전부 못 쓰면 그때 기동을 거부한다. 윈도우 서비스는 기동에 실패하면 종료 코드를 남기고 이유를 `daemon-service.log`에 적는다 — 조용히 멈추지 않는다
 
 ### AI 비서에게 맡기기
 
