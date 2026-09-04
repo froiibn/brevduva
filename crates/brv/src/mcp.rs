@@ -25,6 +25,10 @@ const PUBLISH_CONFIRM_S: u64 = 10;
 
 pub struct McpServer {
     opts: ClientOptions,
+    /// 이 MCP 프로세스를 띄운 러너 id — 등록 시 `--host`로 받은 값 (2026-09-05, 1단계). 추측하지
+    /// 않으므로 손 등록은 None이 정상. 지금은 initialize 응답에 되비치기만 한다 — 유인 세션
+    /// 등록(2단계)이 생기면 그 등록의 host 필드가 된다.
+    host: Option<String>,
     /// **lazy-JOIN**: 첫 도구 호출 때 접속한다 (플랩 실측 후 변경) — MCP 호스트가
     /// 도구 탐색용으로 프로세스를 여분 스폰해도, 쓰지 않는 인스턴스는 에이전트
     /// 자리를 두고 경쟁하지 않는다 (2.2 테이크오버 전쟁 방지).
@@ -34,9 +38,10 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(opts: ClientOptions) -> Self {
+    pub fn new(opts: ClientOptions, host: Option<String>) -> Self {
         Self {
             opts,
+            host,
             client: None,
             hops_by_id: HashMap::new(),
         }
@@ -89,7 +94,7 @@ impl McpServer {
                 respond(json!({
                     "protocolVersion": requested,
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "brv", "version": env!("CARGO_PKG_VERSION") },
+                    "serverInfo": { "name": "brv", "version": env!("CARGO_PKG_VERSION"), "host": self.host },
                     "instructions": INSTRUCTIONS,
                 }))
             }
@@ -549,8 +554,8 @@ fn tool_definitions() -> Value {
 }
 
 /// 진입점 — 설정된 정체성으로 접속해 stdio MCP를 돌린다.
-pub async fn run_stdio(opts: ClientOptions) -> anyhow::Result<()> {
-    McpServer::new(opts).run().await
+pub async fn run_stdio(opts: ClientOptions, host: Option<String>) -> anyhow::Result<()> {
+    McpServer::new(opts, host).run().await
 }
 
 #[cfg(test)]
@@ -569,7 +574,7 @@ mod tests {
     async fn initialize_and_tools_list_shapes() {
         // 클라이언트 연결 없이 프로토콜 계층만 검증 (dead client — 도구 호출은 안 함)
         let opts = ClientOptions::new("http://127.0.0.1:1", "x", "x", "t");
-        let mut mcp = McpServer::new(opts);
+        let mut mcp = McpServer::new(opts, Some("codex".to_owned()));
         let init = mcp
             .dispatch(
                 serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -579,6 +584,8 @@ mod tests {
             .unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2026-06-18");
         assert_eq!(init["result"]["serverInfo"]["name"], "brv");
+        // 등록 시 받은 호스트를 되비친다 (2026-09-05) — 추측이 아니라 등록이 준 값
+        assert_eq!(init["result"]["serverInfo"]["host"], "codex");
 
         let list = mcp
             .dispatch(serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))

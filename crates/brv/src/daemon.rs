@@ -1139,12 +1139,20 @@ pub async fn spawn_wake(
     prompt: &str,
     spawn: &WakeSpawn,
 ) -> anyhow::Result<WakeChild> {
+    let config_path = crate::config::config_path()?;
+    // 자리표시자 치환은 **깨우는 순간** 여기서 한다 (2026-09-05): 설정에는 프로필 템플릿이 그대로
+    // 남아야 `wake show`의 수준 역판별(level_of)이 살고, `{brv}`·`{config}`는 실행 시점의 값이
+    // 맞다. 실행마다 MCP를 주입하는 러너(goose의 --with-extension)는 이 치환이 없으면 `{brv}`가
+    // 글자 그대로 넘어간다 — 미실측 프로필에 숨어 있던 결함. `{host}`는 깨우는 러너의 id
+    let brv = std::env::current_exe().context("current exe")?;
+    let host = crate::runners::spec_for_command(&wake.command)
+        .map(|s| s.id)
+        .unwrap_or("");
     let args: Vec<String> = wake
         .args
         .iter()
-        .map(|a| a.replace("{prompt}", prompt))
+        .map(|a| crate::runners::fill(a, &brv, &config_path, host).replace("{prompt}", prompt))
         .collect();
-    let config_path = crate::config::config_path()?;
     // 깨운 세션의 출력은 wake.log로 — 실패 원인 추적용 (버리면 디버깅 불가, 실측 교훈)
     let log_dir = config_path
         .parent()
@@ -1272,6 +1280,34 @@ pub async fn wait_wake(wake: &WakeConfig, mut child: WakeChild) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-05: 실행마다 MCP를 주입하는 프로필(goose)의 `{brv}`·`{config}`·`{host}`는 깨우기
+    /// 시점에 채워진다 — 설정에는 템플릿이 남고, 명령줄에는 값만 간다. `{prompt}`는 별도 치환.
+    #[test]
+    fn wake_time_fill_resolves_profile_placeholders() {
+        let goose = crate::runners::spec("goose").expect("goose profile");
+        let args = crate::runners::wake_args(goose, "respond").expect("goose args");
+        let raw = args.join(" ");
+        assert!(raw.contains("{brv}") && raw.contains("{config}") && raw.contains("{host}"));
+        let filled: Vec<String> = args
+            .iter()
+            .map(|a| {
+                crate::runners::fill(
+                    a,
+                    Path::new("/opt/brv"),
+                    Path::new("/c/config.toml"),
+                    "goose",
+                )
+                .replace("{prompt}", "hello")
+            })
+            .collect();
+        let line = filled.join(" ");
+        assert!(
+            line.contains("/opt/brv mcp --config /c/config.toml --host goose"),
+            "{line}"
+        );
+        assert!(!line.contains('{'), "no placeholder may survive: {line}");
+    }
     use brevduva_protocol::{Address, ClientKey, Ident, Kind};
 
     /// 2026-09-02: 러너가 claude면 로컬 brevduva MCP를 --mcp-config로 꽂고, 사용자 지정

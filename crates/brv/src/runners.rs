@@ -17,8 +17,10 @@
 //!    흔한 이름)과 깨진 링크를 거른다. 출력 형식이 문서화된 러너는 문자열까지 대조한다.
 //!    로그인 여부는 여기서 보지 않는다 — 그건 `wake test`(사전 점검)의 일이다.
 //!
-//! 깨우기 프로필은 **실측한 러너만** `measured`다. 나머지는 문서 기준 초안으로, `wake set
+//! 깨우기 프로필은 **실측한 러너만** `wake_measured`다. 나머지는 문서 기준 초안으로, `wake set
 //! --runner`가 경고를 붙이고 `wake show`에 "unmeasured"로 표시한다 — 문서 확인은 실측이 아니다.
+//! 이 플래그는 **새 한 턴 실행(깨우기)만** 보증한다 — "이미 떠 있는 대화형 세션에 넣을 수 있다"는
+//! 별개의 능력(`attended`)이고, 지금은 어느 러너도 즉시 주입을 실측하지 않았다 (2026-09-05).
 //! MCP 등록은 러너에 `mcp add` 계열 명령이 있으면 그 명령으로(러너가 자기 파일을 책임진다),
 //! 설정 파일만 있는 러너는 붙여 넣을 조각을 출력한다 — 형식이 제각각(JSON·TOML·YAML·JSONC·
 //! crushrc)이라 brv가 사용자 파일을 직접 고치면 파손 위험이 편의보다 크다.
@@ -40,6 +42,31 @@ pub struct WakeProfile {
 
 /// 권한 수준(respond/edit/full) → 덧붙일 인자.
 pub type AllowFn = fn(&str) -> Option<Vec<&'static str>>;
+
+/// **이미 떠 있는 대화형 세션**에 메시지를 어떻게 전달할 수 있는가 (2026-09-05, "대화형 세션
+/// 우선 전달" 설계안 1단계 — 구조만, 동작 변경 없음). 깨우기 프로필(`WakeProfile`)이 "새 실행체를
+/// 띄우는 법"이라면 이것은 "떠 있는 실행체를 다시 움직이는 법"이다 — 둘을 한 플래그로 합치면
+/// "`codex exec`가 된다"가 "기존 Codex 세션에 넣을 수 있다"로 잘못 읽힌다.
+///
+/// `Direct`(세션에 즉시 새 턴 삽입)는 변형조차 두지 않았다: 어느 러너도 그런 인터페이스를 코드로
+/// 확인하지 못했고, 확인 전에 자리를 만들면 추측이 구현으로 굳는다. 실측된 러너가 생길 때 추가한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttendedDelivery {
+    /// 턴이 끝날 때 러너의 훅이 큐를 살펴 같은 세션이 이어서 처리한다 (`brv hook stop`).
+    /// 데몬이 밀어 넣는 것이 아니라 세션이 스스로 가져가는 경로 — 이미 코드에 있다.
+    TurnEndHook,
+    /// 떠 있는 세션에 넣을 확인된 경로가 없다. 메시지는 서버 큐에 남고 데몬의 깨우기가 맡는다.
+    Passive,
+}
+
+impl AttendedDelivery {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::TurnEndHook => "turn-end hook",
+            Self::Passive => "passive",
+        }
+    }
+}
 
 /// 로컬 `brv mcp`를 러너에 등록하는 방법.
 pub enum McpRegistration {
@@ -63,7 +90,10 @@ pub struct RunnerSpec {
     pub version_marker: Option<&'static str>,
     pub wake: Option<WakeProfile>,
     /// 깨우기 프로필이 실측됐는가 (한 턴 실행 + MCP 도구 호출까지). 문서 확인만이면 false.
-    pub measured: bool,
+    /// **깨우기만** 보증한다 — 떠 있는 세션 전달(`attended`)의 실측과는 별개.
+    pub wake_measured: bool,
+    /// 떠 있는 대화형 세션에 전달하는 방법 — 코드로 확인된 경로만 (2026-09-05).
+    pub attended: AttendedDelivery,
     pub mcp: McpRegistration,
     /// 이 러너가 MCP 도구를 모델에 보여주는 이름 형식 — 표시·문서용.
     pub tool_prefix: &'static str,
@@ -175,8 +205,7 @@ fn allow_grok(level: &str) -> Option<Vec<&'static str>> {
     })
 }
 
-const MCP_SNIPPET_JSON: &str =
-    r#"{"mcpServers":{"brevduva":{"command":"{brv}","args":["mcp","--config","{config}"]}}}"#;
+const MCP_SNIPPET_JSON: &str = r#"{"mcpServers":{"brevduva":{"command":"{brv}","args":["mcp","--config","{config}","--host","{host}"]}}}"#;
 
 /// 러너 표 — RUNNERS.md 1등급(한 턴 실행 + MCP 클라이언트, 공식 문서 확인). 순서 = 탐지·표시 순서.
 pub static RUNNERS: &[RunnerSpec] = &[
@@ -190,7 +219,9 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_claude),
         }),
-        measured: true,
+        wake_measured: true,
+        // Stop 훅(hook.rs)이 턴 종료 시 큐를 peek해 같은 세션이 처리한다 — 데몬 push가 아니다
+        attended: AttendedDelivery::TurnEndHook,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -204,6 +235,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             "mcp",
             "--config",
             "{config}",
+            "--host",
+            "{host}",
         ]),
         tool_prefix: "mcp__brevduva__<tool>",
         note: "실행 시 --mcp-config 주입도 됨 (daemon.rs) — 등록이 없어도 깨어난 세션에 도구가 있다",
@@ -221,9 +254,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["exec", "--skip-git-repo-check", "{prompt}"],
             allow: Some(allow_codex),
         }),
-        measured: true, // 한 턴 실행 + MCP 도구 호출 실측. 데몬 경유 E2E(깨움→답신)는 별도
+        wake_measured: true, // 한 턴 실행 + MCP 도구 호출 실측. 데몬 경유 E2E(깨움→답신)는 별도
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
-            "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}",
+            "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
+            "{host}",
         ]),
         tool_prefix: "mcp__brevduva__<tool>",
         note: "respond=edit(workspace-write, 자동 검토 승인) — read-only에서는 MCP 호출 불가(#24135). 앱 번들 CLI는 PATH에 없어 %LOCALAPPDATA%\\OpenAI\\Codex\\bin 폴백",
@@ -238,7 +273,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["agent", "--local", "--message", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -251,6 +287,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             "--config",
             "--arg",
             "{config}",
+            "--host",
+            "{host}",
         ]),
         tool_prefix: "brevduva__<tool>",
         note: "상주 게이트웨이 겸용 — --local 한 턴만 쓴다. 권한은 MCP 서버별 --approval 설정",
@@ -265,9 +303,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_gemini),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "-s", "user", "brevduva", "{brv}", "mcp", "--config", "{config}",
+            "--host", "{host}",
         ]),
         tool_prefix: "mcp_brevduva_<tool>",
         note: "",
@@ -282,7 +322,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}", "-s"],
             allow: Some(allow_copilot),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -294,6 +335,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             "mcp",
             "--config",
             "{config}",
+            "--host",
+            "{host}",
         ]),
         tool_prefix: "(undocumented)",
         note: "MCP 도구를 --allow-tool에 적는 표기 미확인",
@@ -308,7 +351,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_cursor),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.cursor/mcp.json",
             body: MCP_SNIPPET_JSON,
@@ -326,10 +370,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["run", "--auto", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.config/opencode/opencode.json",
-            body: r#"{"mcp":{"brevduva":{"type":"local","command":["{brv}","mcp","--config","{config}"],"enabled":true}}}"#,
+            body: r#"{"mcp":{"brevduva":{"type":"local","command":["{brv}","mcp","--config","{config}","--host","{host}"],"enabled":true}}}"#,
         },
         tool_prefix: "brevduva_<tool>",
         note: "권한은 설정 permission.edit|bash — 실행 인자 없음",
@@ -347,16 +392,17 @@ pub static RUNNERS: &[RunnerSpec] = &[
                 "--no-session",
                 "-q",
                 "--with-extension",
-                "{brv} mcp --config {config}",
+                "{brv} mcp --config {config} --host {host}",
                 "-t",
                 "{prompt}",
             ],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.config/goose/config.yaml",
-            body: "extensions:\n  brevduva:\n    name: brevduva\n    type: stdio\n    cmd: {brv}\n    args: [mcp, --config, {config}]\n    enabled: true\n    timeout: 300",
+            body: "extensions:\n  brevduva:\n    name: brevduva\n    type: stdio\n    cmd: {brv}\n    args: [mcp, --config, {config}, --host, {host}]\n    enabled: true\n    timeout: 300",
         },
         tool_prefix: "brevduva__<tool>",
         note: "승인은 env GOOSE_MODE — 서비스에서는 GOOSE_DISABLE_KEYRING 필요할 수 있음",
@@ -371,9 +417,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_qwen),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "-s", "user", "brevduva", "{brv}", "mcp", "--config", "{config}",
+            "--host", "{host}",
         ]),
         tool_prefix: "<tool> (충돌 시 brevduva__<tool>)",
         note: "",
@@ -388,7 +436,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["chat", "--no-interactive", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.kiro/settings/mcp.json",
             body: MCP_SNIPPET_JSON,
@@ -406,9 +455,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-x", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
-            "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}",
+            "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
+            "{host}",
         ]),
         tool_prefix: "(undocumented)",
         note: "기본이 무승인 실행 — 제한은 amp.permissions 설정. 윈도우는 WSL",
@@ -423,7 +474,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["--print", "--quiet", "--allow-indexing", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -431,7 +483,7 @@ pub static RUNNERS: &[RunnerSpec] = &[
             "--command",
             "{brv}",
             "--args",
-            "mcp --config {config}",
+            "mcp --config {config} --host {host}",
         ]),
         tool_prefix: "<tool>_brevduva",
         note: "윈도우는 WSL",
@@ -446,12 +498,13 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["exec", "{prompt}"],
             allow: Some(allow_droid),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
             "brevduva",
-            "{brv} mcp --config {config}",
+            "{brv} mcp --config {config} --host {host}",
             "--type",
             "stdio",
         ]),
@@ -468,10 +521,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["run", "-q", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.config/crush/crushrc",
-            body: "mcp add brevduva --command {brv} --args mcp --args --config --args {config}",
+            body: "mcp add brevduva --command {brv} --args mcp --args --config --args {config} --args --host --args {host}",
         },
         tool_prefix: "mcp_brevduva_<tool>",
         note: "`run`에 --yolo 없음 — 권한은 crushrc `permissions allow …`로 사전 허용",
@@ -487,9 +541,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["--yolo", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
-            "mcp", "install", "brevduva", "--", "{brv}", "mcp", "--config", "{config}",
+            "mcp", "install", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
+            "{host}",
         ]),
         tool_prefix: "(undocumented)",
         note: "",
@@ -504,7 +560,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.junie/mcp/mcp.json",
             body: MCP_SNIPPET_JSON,
@@ -522,10 +579,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_vibe),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.vibe/config.toml",
-            body: "[[mcp_servers]]\nname = \"brevduva\"\ntransport = \"stdio\"\ncommand = \"{brv}\"\nargs = [\"mcp\", \"--config\", \"{config}\"]",
+            body: "[[mcp_servers]]\nname = \"brevduva\"\ntransport = \"stdio\"\ncommand = \"{brv}\"\nargs = [\"mcp\", \"--config\", \"{config}\", \"--host\", \"{host}\"]",
         },
         tool_prefix: "brevduva_<tool>",
         note: "윈도우 비공식",
@@ -540,10 +598,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_grok),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.grok/config.toml",
-            body: "[mcp_servers.brevduva]\ncommand = \"{brv}\"\nargs = [\"mcp\", \"--config\", \"{config}\"]\nenabled = true",
+            body: "[mcp_servers.brevduva]\ncommand = \"{brv}\"\nargs = [\"mcp\", \"--config\", \"{config}\", \"--host\", \"{host}\"]\nenabled = true",
         },
         tool_prefix: "(undocumented)",
         note: "헤드리스는 XAI_API_KEY",
@@ -558,10 +617,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_continue),
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.continue/config.yaml",
-            body: "mcpServers:\n  - name: brevduva\n    type: stdio\n    command: {brv}\n    args: [mcp, --config, {config}]\n    allowHeadless: true",
+            body: "mcpServers:\n  - name: brevduva\n    type: stdio\n    command: {brv}\n    args: [mcp, --config, {config}, --host, {host}]\n    allowHeadless: true",
         },
         tool_prefix: "(undocumented)",
         note: "실행 파일 이름 `cn`이 흔하다 — --version 검증 필수. 헤드리스는 CONTINUE_API_KEY",
@@ -576,10 +636,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["run", "--auto", "{prompt}"],
             allow: None,
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Snippet {
             file: "~/.config/kilo/kilo.jsonc",
-            body: r#"{"mcp":{"brevduva":{"type":"local","command":["{brv}","mcp","--config","{config}"],"enabled":true}}}"#,
+            body: r#"{"mcp":{"brevduva":{"type":"local","command":["{brv}","mcp","--config","{config}","--host","{host}"],"enabled":true}}}"#,
         },
         tool_prefix: "brevduva_<tool>",
         note: "헤드리스는 KILO_API_KEY",
@@ -594,10 +655,11 @@ pub static RUNNERS: &[RunnerSpec] = &[
             args: &["-p", "{prompt}"],
             allow: Some(allow_claude), // Claude Code와 같은 --allowedTools 체계
         }),
-        measured: false,
+        wake_measured: false,
+        attended: AttendedDelivery::Passive,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "--scope", "user", "brevduva", "--", "{brv}", "mcp", "--config",
-            "{config}",
+            "{config}", "--host", "{host}",
         ]),
         tool_prefix: "mcp__brevduva__<tool>",
         note: "",
@@ -608,7 +670,8 @@ impl std::fmt::Debug for RunnerSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunnerSpec")
             .field("id", &self.id)
-            .field("measured", &self.measured)
+            .field("wake_measured", &self.wake_measured)
+            .field("attended", &self.attended)
             .finish_non_exhaustive()
     }
 }
@@ -836,11 +899,14 @@ fn run_with_timeout(path: &Path, args: &[&str], limit: Duration) -> Option<Strin
     }
 }
 
-/// MCP 등록 텍스트의 치환 — `{brv}`·`{config}`.
-pub fn fill(template: &str, brv: &Path, config: &Path) -> String {
+/// MCP 등록 텍스트의 치환 — `{brv}`·`{config}`·`{host}`. `host`는 등록하는 러너의 id: `brv mcp`가
+/// 자기 호스트를 **추측하지 않고 등록 시 명시적으로 받는** 통로 (2026-09-05). 손으로 등록한 MCP는
+/// host 없이 뜨는 것이 정상값이다 — 그것을 Claude/Codex로 추정하지 않는다.
+pub fn fill(template: &str, brv: &Path, config: &Path, host: &str) -> String {
     template
         .replace("{brv}", &brv.to_string_lossy())
         .replace("{config}", &config.to_string_lossy())
+        .replace("{host}", host)
 }
 
 #[cfg(test)]
@@ -915,6 +981,24 @@ mod tests {
         assert!(spec_for_command("/opt/tools/aider").is_none());
     }
 
+    /// 2026-09-05 (대화형 세션 우선 전달 1단계): 깨우기 실측과 유인 전달 능력은 별개다.
+    /// 코드로 확인된 유인 경로는 Claude Code의 Stop 훅뿐 — 나머지는 전부 passive여야 한다.
+    #[test]
+    fn attended_delivery_is_separate_from_wake_measurement() {
+        for r in RUNNERS {
+            let expected = if r.id == "claude" {
+                AttendedDelivery::TurnEndHook
+            } else {
+                AttendedDelivery::Passive
+            };
+            assert_eq!(r.attended, expected, "{}", r.id);
+        }
+        // 실측된 깨우기가 곧 유인 전달을 뜻하지 않는다 — codex가 그 반례
+        let codex = spec("codex").unwrap();
+        assert!(codex.wake_measured);
+        assert_eq!(codex.attended, AttendedDelivery::Passive);
+    }
+
     #[test]
     fn mcp_templates_substitute_both_placeholders() {
         let brv = Path::new("/usr/local/bin/brv");
@@ -924,10 +1008,23 @@ mod tests {
                 McpRegistration::Command(args) => args.join(" "),
                 McpRegistration::Snippet { body, .. } => (*body).to_owned(),
             };
-            let filled = fill(&text, brv, cfg);
+            let filled = fill(&text, brv, cfg, r.id);
             assert!(
-                !filled.contains("{brv}") && !filled.contains("{config}"),
+                !filled.contains("{brv}")
+                    && !filled.contains("{config}")
+                    && !filled.contains("{host}"),
                 "{}: unfilled placeholder in {filled}",
+                r.id
+            );
+            // 등록마다 호스트가 명시된다 — brv mcp가 부모 프로세스를 역추적하지 않는 근거
+            assert!(
+                filled.contains("--host"),
+                "{}: registration must pass --host",
+                r.id
+            );
+            assert!(
+                filled.contains(r.id),
+                "{}: host id must appear in the registration",
                 r.id
             );
             assert!(

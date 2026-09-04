@@ -119,6 +119,9 @@ enum Cmd {
         /// Absolute path to the config file (default: BREVDUVA_CONFIG env, then the OS path) — runner registrations pin it
         #[arg(long)]
         config: Option<String>,
+        /// Runner that launches this process — set by `brv mcp register`, never inferred (2026-09-05)
+        #[arg(long, hide = true)]
+        host: Option<String>,
         #[command(subcommand)]
         action: Option<McpCmd>,
     },
@@ -423,6 +426,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Mcp {
             binding,
             config,
+            host,
             action,
         } => {
             if let Some(c) = config {
@@ -434,7 +438,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
                 Some(McpCmd::Register { runner, dry_run }) => {
                     mcp_register(&config::load()?, runner.as_deref(), dry_run)
                 }
-                None => mcp(binding.as_deref()).await,
+                None => mcp(binding.as_deref(), host).await,
             }
         }
         Cmd::Daemon { config, action } => match action {
@@ -680,7 +684,7 @@ fn wake_set(
         },
     };
     if let Some(s) = spec
-        && !s.measured
+        && !s.wake_measured
         && new_cmd.is_some()
     {
         eprintln!(
@@ -785,7 +789,7 @@ fn wake_show() -> anyhow::Result<()> {
     let describe = |cmd: &str, args: &[String]| -> (String, &'static str) {
         match brv::runners::spec_for_command(cmd) {
             Some(s) => (
-                if s.measured {
+                if s.wake_measured {
                     s.id.to_owned()
                 } else {
                     format!("{} (profile not yet measured — run `brv wake test`)", s.id)
@@ -1216,7 +1220,7 @@ fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow:
             brv::runners::McpRegistration::Command(args) => {
                 let filled: Vec<String> = args
                     .iter()
-                    .map(|a| brv::runners::fill(a, &brv, &config_path))
+                    .map(|a| brv::runners::fill(a, &brv, &config_path, d.spec.id))
                     .collect();
                 let shown = format!("{} {}", d.path.display(), filled.join(" "));
                 if let Some(note) = &binding_note {
@@ -1279,7 +1283,7 @@ fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow:
                 println!(
                     "{}: no registration command — add this to {file}:\n{}\n",
                     d.spec.display,
-                    brv::runners::fill(body, &brv, &config_path)
+                    brv::runners::fill(body, &brv, &config_path, d.spec.id)
                 );
             }
         }
@@ -1574,12 +1578,15 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
     } else {
         println!("runners:");
         for d in &runners {
+            // attended = 떠 있는 대화형 세션에 넣는 방법 (2026-09-05, 1단계): "깨우기가 된다"와
+            // "기존 세션에 넣을 수 있다"를 한 줄에서 구분해 보여준다
             println!(
-                "  {:10} {:26} {}{}",
+                "  {:10} {:26} {}  attended: {}{}",
                 d.spec.id,
                 d.version,
                 d.path.display(),
-                if d.spec.measured {
+                d.spec.attended.describe(),
+                if d.spec.wake_measured {
                     ""
                 } else {
                     "  (wake profile not yet measured)"
@@ -1694,7 +1701,7 @@ async fn listen(binding_sel: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
-async fn mcp(binding_sel: Option<&str>) -> anyhow::Result<()> {
+async fn mcp(binding_sel: Option<&str>, host: Option<String>) -> anyhow::Result<()> {
     // 선택자 폴백: --binding → BREVDUVA_BINDING env — 데몬이 깨운 세션의 MCP가 "누가
     // 깨웠는지"를 이어받는 통로 (2026-09-02). 바인딩이 여럿인 머신에서도 깨운 세션이
     // 올바른 정체성으로 붙는다 (플래그 없는 user-scope 등록 + 다중 바인딩 = select 불가였음)
@@ -1715,5 +1722,5 @@ async fn mcp(binding_sel: Option<&str>) -> anyhow::Result<()> {
     // lazy-JOIN과 같은 경로로 자리를 되찾는다
     opts.idle_park = Some(brv::client::DEFAULT_IDLE_PARK);
     tracing::info!(binding = %binding.label(), "brv mcp server on stdio");
-    brv::mcp::run_stdio(opts).await
+    brv::mcp::run_stdio(opts, host).await
 }
