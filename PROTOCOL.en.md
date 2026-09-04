@@ -257,6 +257,7 @@ The flow of a sending agent waiting for a response (GUI adapter):
 3. The agent re-calls `wait_for_reply(correlation_id)` — the loop convention is stated in the tool description
 4. **A reply landing in the gap between holds is never lost** — all delivery is queue-based (at-least-once), so a re-call returns it from the queue immediately. The server-side "wait" is not state but merely a filtered query over the queue
 5. The sender can still receive other messages while waiting — `wait_for_message` (everything) and `wait_for_reply` (correlation-filtered) are different views over the same queue
+6. **A progress notice is not the answer** (2026-09-05): when the correlation filter catches a `report{status:"in-progress"}` (3.1), the adapter consumes it and passes it on as `progress`, but does not return `replied`; it keeps waiting for the final answer (`reply` / final `report`) for the remaining time. On timeout it returns `{status:"pending", progress}` — mistaking the start notice for the answer pushes the real answer to the next `wait_for_message`, after the session has already moved on (measured)
 
 A daemon (CLI) sender needs no loop — with an always-on connection, the reply arrives the moment it is sent.
 

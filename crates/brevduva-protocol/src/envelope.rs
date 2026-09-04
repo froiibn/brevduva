@@ -108,6 +108,18 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    /// 진행 알림인가 — `report`이면서 본문 JSON의 `status`가 `in-progress` (3.1, 2026-09-04).
+    /// 응답을 기다리는 쪽은 이것을 **최종 답으로 세지 않는다** — 진행 정보로 넘기고 계속 기다린다
+    /// (9장). 어댑터 셋(리시버 데몬·로컬 MCP·원격 MCP)이 같은 판정을 쓰도록 여기 둔다.
+    pub fn is_in_progress_report(&self) -> bool {
+        self.kind == Kind::Report
+            && self
+                .payload
+                .as_deref()
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .is_some_and(|v| v["status"] == "in-progress")
+    }
+
     /// 구조 규칙 검증 — 발행·전달 공통 (3장).
     ///
     /// 크기 임계값·hops 상한·능력 검증 같은 정책 집행은 서버 소관 (수치는 12장 설정).

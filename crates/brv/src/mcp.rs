@@ -16,7 +16,7 @@ use brevduva_protocol::{Envelope, Expects, Kind};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-use crate::client::{Client, ClientOptions, PublishSpec, RecvFilter};
+use crate::client::{Client, ClientOptions, PublishSpec, RecvFilter, ReplyWait};
 
 /// 도구가 기다릴 수 있는 상한 — MCP 호스트 타임아웃(9장 "60초 홀드 → 재호출 루프")과 정합.
 const MAX_WAIT_S: u64 = 120;
@@ -123,6 +123,31 @@ impl McpServer {
                 json!({ "jsonrpc": "2.0", "id": id,
                         "error": { "code": -32601, "message": format!("unknown method {method:?}") } })
             }),
+        }
+    }
+
+    /// `request`·`wait_for_reply`의 공통 응답 — 최종 답만 `replied`, 진행 알림은 `progress`로 (9장).
+    async fn render_reply_wait(&mut self, correlation: &str, outcome: ReplyWait) -> (Value, bool) {
+        match outcome {
+            ReplyWait::Replied { reply, progress } => {
+                let mut v =
+                    json!({ "status": "replied", "reply": self.record_and_resolve(&reply).await });
+                if let Some(p) = progress {
+                    v["progress"] = self.record_and_resolve(&p).await;
+                }
+                (v, false)
+            }
+            ReplyWait::Pending { progress } => {
+                let mut v = json!({ "status": "pending", "correlation_id": correlation,
+                        "message": "no final reply yet — the peer may be idle. Call wait_for_reply with this correlation_id to keep waiting, or proceed and check later." });
+                if let Some(p) = progress {
+                    v["progress"] = self.record_and_resolve(&p).await;
+                    v["message"] = json!(
+                        "the peer's session has started on it (progress report received) but has not answered yet — call wait_for_reply with this correlation_id to keep waiting, or proceed and check later."
+                    );
+                }
+                (v, false)
+            }
         }
     }
 
@@ -313,23 +338,10 @@ impl McpServer {
                     return (sent, true);
                 }
                 let correlation = sent["id"].as_str().unwrap_or_default().to_owned();
-                match client
-                    .recv(
-                        RecvFilter::Correlation(correlation.clone()),
-                        Duration::from_secs(timeout_s),
-                    )
-                    .await
-                {
-                    Some(env) => (
-                        json!({ "status": "replied", "reply": self.record_and_resolve(&env).await }),
-                        false,
-                    ),
-                    None => (
-                        json!({ "status": "pending", "correlation_id": correlation,
-                                "message": "no reply yet — the peer may be idle. Call wait_for_reply with this correlation_id to keep waiting, or proceed and check later." }),
-                        false,
-                    ),
-                }
+                let outcome = client
+                    .recv_reply(&correlation, Duration::from_secs(timeout_s))
+                    .await;
+                self.render_reply_wait(&correlation, outcome).await
             }
             "reply" | "report" => {
                 let Some(correlation_id) = s("correlation_id") else {
@@ -387,23 +399,10 @@ impl McpServer {
                 let Some(correlation_id) = s("correlation_id") else {
                     return missing("correlation_id");
                 };
-                match client
-                    .recv(
-                        RecvFilter::Correlation(correlation_id.clone()),
-                        Duration::from_secs(timeout_s),
-                    )
-                    .await
-                {
-                    Some(env) => (
-                        json!({ "status": "replied", "reply": self.record_and_resolve(&env).await }),
-                        false,
-                    ),
-                    None => (
-                        json!({ "status": "pending", "correlation_id": correlation_id,
-                                "message": "still no reply — call wait_for_reply again or proceed." }),
-                        false,
-                    ),
-                }
+                let outcome = client
+                    .recv_reply(&correlation_id, Duration::from_secs(timeout_s))
+                    .await;
+                self.render_reply_wait(&correlation_id, outcome).await
             }
             "fetch_history" => {
                 let after_id = s("after_id");

@@ -903,14 +903,6 @@ async fn publish_report(
     Ok(())
 }
 
-/// 이 보고가 "작업 중" 알림인가 — 최종 응답 판정에서 빼기 위한 구분 (아래 report_unanswered).
-fn is_in_progress(env: &Envelope) -> bool {
-    env.payload
-        .as_deref()
-        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
-        .is_some_and(|v| v["status"] == "in-progress")
-}
-
 /// 응답 없이 끝난 건을 발신자에게 알린다 (2026-09-04 — GPT 검토·노션 이슈 1번의 근본 조치).
 /// 종전에는 타임아웃·비정상 종료가 로그와 저널에만 남아 발신자가 영원히 대기했다(실측: 발신자가
 /// 90분 뒤 되물어서야 드러남). 이제 세션이 끝나면 배치의 각 건에 대해 **서버 이력을 조회해**
@@ -958,7 +950,7 @@ async fn report_unanswered(
         .filter(|e| e.from.as_str() == binding.agent)
         .filter(|e| match e.kind {
             Kind::Reply | Kind::Ack => true,
-            Kind::Report => !is_in_progress(e),
+            Kind::Report => !e.is_in_progress_report(),
             _ => false,
         })
         .filter_map(|e| e.correlation_id.as_ref().map(|c| c.as_str().to_owned()))

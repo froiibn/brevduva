@@ -254,6 +254,7 @@ WebSocket 위의 모든 통신 단위는 컨트롤 프레임. 메시지 엔벨�
 3. 에이전트는 `wait_for_reply(correlation_id)`를 재호출 — 도구 설명에 이 루프 규약 명시
 4. **홀드 사이 틈에 도착한 reply는 유실되지 않는다** — 모든 전달은 큐 기반(at-least-once)이므로, 재호출 시 큐에서 즉시 반환됨. 서버 측 "대기"는 상태가 아니라 큐에 대한 필터 조회일 뿐
 5. 발신자는 대기 중에도 다른 메시지를 받을 수 있음 — `wait_for_message`(전체)와 `wait_for_reply`(correlation 필터)는 같은 큐의 다른 뷰
+6. **진행 알림은 답이 아니다** (2026-09-05): correlation 필터에 `report{status:"in-progress"}`(3.1)가 걸리면 어댑터는 그것을 소비해 `progress`로 넘기되 `replied`로 돌리지 않고, 남은 시간만큼 최종 답(`reply`/최종 `report`)을 계속 기다린다. 시간이 다하면 `{status:"pending", progress}` — 착수 알림을 답으로 오인하면 실제 답이 다음 `wait_for_message`로 밀려 세션이 모른 채 넘어간다(실측)
 
 데몬(CLI) 발신자는 루프가 필요 없다 — 상시 연결로 reply가 오면 즉시 수신.
 

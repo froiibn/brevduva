@@ -161,6 +161,20 @@ impl PublishSpec {
     }
 }
 
+/// `wait_for_reply`의 결과 — 최종 답이 왔거나, 진행 알림만 온 채(또는 아무것도 없이) 시간이 다했거나.
+#[derive(Debug)]
+pub enum ReplyWait {
+    Replied {
+        /// Box: 봉투가 크고(수백 바이트) Pending 변형은 작다 — variant 크기 차이 경고 회피.
+        reply: Box<Envelope>,
+        /// 답 전에 온 마지막 진행 알림 (`report{status:"in-progress"}`) — 있으면 함께 넘긴다.
+        progress: Option<Envelope>,
+    },
+    Pending {
+        progress: Option<Envelope>,
+    },
+}
+
 /// 수신 필터 — wait_for_message(전체)와 wait_for_reply(correlation)는 같은 큐의 다른 뷰 (9.5).
 #[derive(Debug, Clone)]
 pub enum RecvFilter {
@@ -311,6 +325,34 @@ impl Client {
     }
 
     /// 다음 메시지 수신 (소비 시 ACK). 타임아웃이면 None — 메시지는 큐에 남는다.
+    /// correlation의 **최종** 반응을 기다린다 (9장). `report{status:"in-progress"}`(진행 알림, 3.1)는
+    /// 답이 아니다 — 소비하고(큐에 남겨 두면 미소비 재전달 예산을 태운다) 진행 정보로 넘긴 뒤 남은
+    /// 시간만큼 계속 기다린다. 발단(2026-09-05 실측): 0.6.22가 넣은 착수 알림을 `request`가 답으로
+    /// 돌려줬다 — 실제 답은 그 뒤에 오는데 세션은 이미 넘어간 뒤였다.
+    pub async fn recv_reply(&self, correlation: &str, wait: Duration) -> ReplyWait {
+        let deadline = Instant::now() + wait;
+        let mut progress = None;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return ReplyWait::Pending { progress };
+            }
+            match self
+                .recv(RecvFilter::Correlation(correlation.to_owned()), left)
+                .await
+            {
+                Some(env) if env.is_in_progress_report() => progress = Some(env),
+                Some(reply) => {
+                    return ReplyWait::Replied {
+                        reply: Box::new(reply),
+                        progress,
+                    };
+                }
+                None => return ReplyWait::Pending { progress },
+            }
+        }
+    }
+
     pub async fn recv(&self, filter: RecvFilter, wait: Duration) -> Option<Envelope> {
         let (tx, rx) = oneshot::channel();
         self.cmds.send(Cmd::Recv(filter, true, tx)).await.ok()?;
