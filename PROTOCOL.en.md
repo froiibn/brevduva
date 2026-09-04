@@ -107,7 +107,7 @@ The common schema for every message. Serialization is JSON (UTF-8) in v1; CBOR n
 | `request` | A request expecting a response (instructions included) | — |
 | `reply` | The response to a request | required |
 | `ack` | "Received; I'll handle it / it doesn't concern me" | required |
-| `report` | Completion/failure report for a task | required (the original request/message) |
+| `report` | Progress/completion/failure report for a task | required (the original request/message) |
 | `event` | System event (join/leave/capability change, …; sent by `_system`) | — |
 
 **Broadcast completion determination** (the answer to a previously open planning question): send `broadcast` + `expects: "ack"`, and each receiving agent answers with an `ack` carrying `{"relevant": true|false}`; agents that answered "relevant" send a `report` when done. The sender determines completion by "collect acks → await reports from the relevant ones." The ack deadline is the message's `ttl_ms`.
@@ -402,6 +402,8 @@ Premise (5.4): all delivery is at-least-once and queue-based, so a dropped conne
 - On disconnect, a send tool waits for reconnection **at most 10 seconds**, then returns the failure to the agent as-is (retryable — retrying, holding, or working around is the agent's decision)
 - **No silent local buffering to fake a send** — if the tool returned success, a server OK must have been received. Background buffering and auto-resend in the daemon may be considered later, opt-in only
 - Symmetry on the receiving side (2026-08-29): an adapter for which delivery triggers follow-up action (e.g. the daemon's wake) **ACKs only after that action's start is confirmed** — on start failure it stays un-ACKed so redelivery substitutes for retry. "Faking receipt" (ACK, then record the failure only locally) is forbidden — a failure leaking outside the queue (into logs) makes the sender misread it as delivered
+- **When an execution unit that started work disappears without answering, the adapter reports the failure on its behalf** (2026-09-04 extension, from a measured incident — a woken session died before replying and the sender waited 90 minutes): if, after ACKing, the execution unit (a woken session, say) ends without a `reply` or a final `report`, the adapter publishes `report{status:"failed", reason, correlation_id}` to the sender for every item that was awaiting an answer. The decision is made by **checking server history**: nothing is published when the unit did leave a final response (its own `in-progress` does not count as one; an already published `failed` does, which prevents duplicates). If history cannot be read, **nothing is published** — what is unknown is not declared a failure.
+- **The start notice is optional** — an adapter whose answers take a long time may publish `report{status:"in-progress"}` when work starts, so the sender can tell "working" from "never received" and from "died". It does not affect the failure decision above (it is not a final answer).
 
 ## 14. Remote MCP adapter authentication (multi-user)
 

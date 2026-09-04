@@ -981,6 +981,95 @@ pub async fn download_blob(
     Ok(resp.bytes().await.context("blob body")?.to_vec())
 }
 
+/// 롱폴 엔드포인트(7장 — WS와 동일 시맨틱)로 프레임 하나를 보내고 OK 본문을 받는다.
+/// **액터를 거치지 않는다**: 데몬이 자리를 양보한 standby 중에도 즉시 동작해야 하는 조회·발행용
+/// (2026-09-04 — `client.fetch()`는 standby 중 큐에 갇혀 최대 `standby_probe`만큼 늦는다).
+/// JOIN도 하지 않아 세션·프레즌스를 건드리지 않는다.
+async fn http_frame(
+    server: &str,
+    channel: &str,
+    token: &str,
+    op: ClientOp,
+) -> anyhow::Result<OkBody> {
+    use anyhow::Context as _;
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/frames?channel={}",
+            server.trim_end_matches('/'),
+            channel
+        ))
+        .bearer_auth(token)
+        .json(&ClientFrame {
+            seq: Some(1),
+            re: None,
+            op,
+        })
+        .send()
+        .await
+        .context("server unreachable")?;
+    let frame: ServerFrame = resp.json().await.context("malformed server frame")?;
+    match frame.op {
+        ServerOp::Ok(body) => Ok(body),
+        ServerOp::Err(e) => anyhow::bail!("{}", e.message),
+        other => anyhow::bail!("unexpected server op: {other:?}"),
+    }
+}
+
+/// 이력 조회 (FETCH) — JOIN 없는 읽기. standby와 무관하게 즉시 답한다.
+pub async fn fetch_history(
+    server: &str,
+    channel: &str,
+    token: &str,
+    after_id: Option<&str>,
+    limit: u32,
+) -> anyhow::Result<Vec<Envelope>> {
+    let op = ClientOp::Fetch {
+        topics: None,
+        after_id: after_id.and_then(|s| MessageId::parse(s).ok()),
+        after_ts: None,
+        limit: Some(limit),
+    };
+    Ok(http_frame(server, channel, token, op)
+        .await?
+        .messages
+        .unwrap_or_default())
+}
+
+/// 발행 (PUB) — 액터 밖. 데몬이 깨운 세션을 대신해 보고할 때 쓴다: 세션이 자리를 가져간
+/// standby 중에도 즉시 나가야 하고, 자리 다툼을 일으켜서도 안 된다 (2026-09-04).
+pub async fn publish_direct(
+    server: &str,
+    channel: &str,
+    token: &str,
+    agent: &str,
+    spec: &PublishSpec,
+) -> anyhow::Result<MessageId> {
+    let env = Envelope {
+        v: brevduva_protocol::PROTOCOL_VERSION,
+        id: None,
+        ts: None,
+        client_key: ClientKey::generate(),
+        from: Ident::parse(agent)?,
+        to: Address::parse(&spec.to)?,
+        kind: spec.kind,
+        correlation_id: match &spec.correlation_id {
+            Some(c) => Some(MessageId::parse(c)?),
+            None => None,
+        },
+        expects: spec.expects,
+        ttl_ms: spec.ttl_ms,
+        hops: spec.hops,
+        content_type: spec.content_type.clone(),
+        payload: spec.payload.clone(),
+        payload_ref: spec.payload_ref.clone(),
+        meta: spec.meta.clone(),
+    };
+    http_frame(server, channel, token, ClientOp::Pub(env))
+        .await?
+        .id
+        .ok_or_else(|| anyhow::anyhow!("server accepted the message but returned no id"))
+}
+
 /// 채널 발견 (PROTOCOL 10.2) — 토큰으로 자신의 grant 채널 조회. JOIN 불요라
 /// 세션·프레즌스에 영향이 없다. 반환: (org, agent, channels).
 pub async fn discover_channels(
