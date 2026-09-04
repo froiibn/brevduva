@@ -15,6 +15,7 @@ pub mod config;
 pub mod daemon;
 pub mod enroll;
 pub mod hook;
+pub mod manage;
 pub mod mcp;
 pub mod runners;
 pub mod service;

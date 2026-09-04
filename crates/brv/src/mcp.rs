@@ -95,7 +95,16 @@ impl McpServer {
             }
             "notifications/initialized" | "notifications/cancelled" => None,
             "ping" => respond(json!({})),
-            "tools/list" => respond(json!({ "tools": tool_definitions() })),
+            "tools/list" => {
+                // 리시버 관리 도구(2026-09-04)는 유인 세션에만 보인다 — 깨어난 세션은 존재도 모른다
+                let mut tools = tool_definitions();
+                if let crate::manage::Attendance::Attended = crate::manage::attendance()
+                    && let Some(list) = tools.as_array_mut()
+                {
+                    list.extend(crate::manage::tool_definitions());
+                }
+                respond(json!({ "tools": tools }))
+            }
             "tools/call" => {
                 let name = request["params"]["name"].as_str().unwrap_or_default().to_owned();
                 let args = request["params"]["arguments"].clone();
@@ -202,6 +211,22 @@ impl McpServer {
     async fn call_tool(&mut self, name: &str, args: &Value) -> (Value, bool) {
         let s = |key: &str| args[key].as_str().map(str::to_owned);
         let timeout_s = args["timeout_s"].as_u64().unwrap_or(60).min(MAX_WAIT_S);
+        // 리시버 관리 (2026-09-04, 재설계 4): CLI를 자식으로 실행 — 채널에는 붙지 않는다.
+        // 호출 시점에 유인/무인을 다시 검사한다 (목록을 받은 뒤 깨우기가 시작됐을 수 있다)
+        if crate::manage::is_management_tool(name) {
+            if let crate::manage::Attendance::Unattended(why) = crate::manage::attendance() {
+                return (
+                    json!({ "status": "refused", "message": format!(
+                        "receiver management is for attended sessions only — {why}. Tell the requester that this machine's receiver settings can only be changed by its owner in an interactive session."
+                    ) }),
+                    true,
+                );
+            }
+            return match crate::manage::argv_for(name, args) {
+                Ok(argv) => crate::manage::run_cli(&argv),
+                Err(msg) => (json!({ "status": "needs_input", "message": msg }), true),
+            };
+        }
         // 채널 발견(10.2)은 JOIN 없는 읽기 — lazy-JOIN을 트리거하지 않는다
         if name == "list_channels" {
             return match crate::client::discover_channels(&self.opts.server, &self.opts.token).await
