@@ -118,7 +118,7 @@ pub fn tool_definitions() -> Vec<Value> {
 /// 도구 이름·인자 → CLI argv. 확인이 필요한 조작은 `confirm=true`가 없으면 Err(안내문).
 pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     let s = |key: &str| args[key].as_str().map(str::to_owned);
-    let confirmed = args["confirm"].as_bool().unwrap_or(false);
+    let confirmed = crate::mcp::bool_arg(args, "confirm");
     let mut argv: Vec<String> = Vec::new();
     let mut push = |a: &str| argv.push(a.to_owned());
     match name {
@@ -237,7 +237,7 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
                 push("--runner");
                 push(&r);
             }
-            if args["dry_run"].as_bool().unwrap_or(false) {
+            if crate::mcp::bool_arg(args, "dry_run") {
                 push("--dry-run");
             }
         }
