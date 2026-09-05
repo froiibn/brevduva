@@ -181,7 +181,9 @@ esac
 # 갱신이면 돌고 있는 서비스 데몬을 새 바이너리로 재기동 (2026-09-03, 사용자 지적 "갱신마다
 # launchctl을 쳐야 하나") — 서비스가 없으면 조용히 지나간다 (brv daemon restart의 미등록 오류 숨김)
 step "restarting the daemon if one is registered"
-"$dest/brv" daemon restart 2>/dev/null || true
+# brv의 안내("daemon restarted …")는 받아서 line()으로 — 막대 줄 뒤에 그대로 붙던 것을 고침 (2026-09-06 실측)
+restart_msg=$("$dest/brv" daemon restart 2>/dev/null || true)
+[ -z "$restart_msg" ] || line "$restart_msg"
 draw 100 "done"
 [ "$tty" = 1 ] && printf '\n' >&2
 if [ -n "$enroll" ]; then
