@@ -107,17 +107,47 @@ pub struct Envelope {
     pub meta: Map<String, Value>,
 }
 
+/// report 본문이 **진행 알림**인가 (3.1, 2026-09-04 · 2026-09-05 확장).
+///
+/// 진행 알림 = JSON `status`가 `in-progress`이거나, **본문이 JSON이 아니거나 `status`가 없는 것**.
+/// 최종 응답은 `reply`, 또는 `status`가 `in-progress`가 아닌 JSON report(`failed` 등)뿐이다.
+/// 확장의 발단(2026-09-05 실측): 한 세션이 마크다운 본문(`## in-progress …`)의 report로 착수를
+/// 알렸고, 기다리는 쪽(원격 `wait_for_reply`)이 "JSON이 아니다 = in-progress가 아니다 = 최종"으로
+/// 읽어 `replied`를 돌렸다. 어휘를 못 밝힌 보고를 답으로 단정하는 것이 오독의 뿌리다 — 모르면
+/// 진행으로 본다. 어댑터 셋(리시버 데몬·로컬 MCP·원격 MCP)이 같은 판정을 쓰도록 여기 둔다.
+pub fn report_payload_is_progress(payload: Option<&str>) -> bool {
+    let Some(payload) = payload else {
+        return true;
+    };
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(v) => match v.get("status").and_then(serde_json::Value::as_str) {
+            Some(status) => status == "in-progress",
+            None => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// 어댑터의 `report` 도구가 본문을 발행 전에 어휘에 맞춘다 (3.1): JSON이 아니거나 `status`가 없는
+/// 본문은 `{"status":"in-progress","note":본문}`으로 감싼다. 감쌀 필요가 없으면 None.
+/// 읽는 쪽 규칙(위)과 뜻은 같고, 옛 읽는 쪽(감싸기 이전 버전)도 올바로 읽게 하는 것이 목적이다.
+pub fn coerce_report_payload(payload: &str) -> Option<String> {
+    if !report_payload_is_progress(Some(payload)) {
+        return None;
+    }
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload)
+        && map.get("status").is_some_and(|s| s == "in-progress")
+    {
+        return None; // 이미 어휘에 맞는 진행 알림
+    }
+    Some(serde_json::json!({ "status": "in-progress", "note": payload }).to_string())
+}
+
 impl Envelope {
-    /// 진행 알림인가 — `report`이면서 본문 JSON의 `status`가 `in-progress` (3.1, 2026-09-04).
-    /// 응답을 기다리는 쪽은 이것을 **최종 답으로 세지 않는다** — 진행 정보로 넘기고 계속 기다린다
-    /// (9장). 어댑터 셋(리시버 데몬·로컬 MCP·원격 MCP)이 같은 판정을 쓰도록 여기 둔다.
-    pub fn is_in_progress_report(&self) -> bool {
-        self.kind == Kind::Report
-            && self
-                .payload
-                .as_deref()
-                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
-                .is_some_and(|v| v["status"] == "in-progress")
+    /// 진행 알림인가 — `report`이면서 본문이 [`report_payload_is_progress`] (3.1). 응답을 기다리는 쪽은
+    /// 이것을 **최종 답으로 세지 않는다** — 진행 정보로 넘기고 계속 기다린다 (9장 6항).
+    pub fn is_progress_report(&self) -> bool {
+        self.kind == Kind::Report && report_payload_is_progress(self.payload.as_deref())
     }
 
     /// 구조 규칙 검증 — 발행·전달 공통 (3장).
@@ -220,6 +250,57 @@ mod tests {
         e.id = Some(MessageId::generate());
         e.ts = Some(Timestamp::parse("2026-08-25T09:30:00.000Z").unwrap());
         e.validate_delivered().unwrap();
+    }
+
+    /// 3.1 진행 알림 판정 (2026-09-05 확장): JSON in-progress·JSON status 없음·JSON 아님·본문 없음은
+    /// 전부 진행 알림, `failed`나 다른 status의 JSON만 최종. report가 아니면 진행 알림이 아니다.
+    #[test]
+    fn progress_report_vocabulary() {
+        assert!(report_payload_is_progress(Some(
+            r#"{"status":"in-progress","note":"x"}"#
+        )));
+        assert!(report_payload_is_progress(Some(
+            r#"{"note":"no status here"}"#
+        )));
+        assert!(report_payload_is_progress(Some(
+            "## in-progress\n마크다운 착수 알림"
+        )));
+        assert!(report_payload_is_progress(None));
+        assert!(!report_payload_is_progress(Some(
+            r#"{"status":"failed","reason":"boom"}"#
+        )));
+        assert!(!report_payload_is_progress(Some(
+            r#"{"status":"done","result":1}"#
+        )));
+
+        let mut e = base();
+        e.kind = Kind::Report;
+        e.payload = Some("## in-progress".to_owned());
+        assert!(e.is_progress_report());
+        e.payload = Some(r#"{"status":"failed","reason":"x"}"#.to_owned());
+        assert!(!e.is_progress_report());
+        e.kind = Kind::Reply;
+        e.payload = Some("plain reply".to_owned());
+        assert!(
+            !e.is_progress_report(),
+            "only reports can be progress notices"
+        );
+    }
+
+    /// 어댑터 `report` 도구의 본문 정규화: JSON 아님·status 없음 → in-progress로 감쌈(본문은 note에 보존),
+    /// 이미 어휘에 맞는 것(in-progress / failed / 다른 status)은 그대로.
+    #[test]
+    fn coerce_report_payload_wraps_only_non_vocabulary_bodies() {
+        let wrapped = coerce_report_payload("## in-progress\n착수").unwrap();
+        let v: Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(v["status"], "in-progress");
+        assert_eq!(v["note"], "## in-progress\n착수");
+        let wrapped = coerce_report_payload(r#"{"note":"no status"}"#).unwrap();
+        let v: Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(v["status"], "in-progress");
+        assert!(coerce_report_payload(r#"{"status":"in-progress","note":"x"}"#).is_none());
+        assert!(coerce_report_payload(r#"{"status":"failed","reason":"x"}"#).is_none());
+        assert!(coerce_report_payload(r#"{"status":"done"}"#).is_none());
     }
 
     #[test]

@@ -353,7 +353,21 @@ impl McpServer {
                 let Some(to) = s("to") else {
                     return missing("to");
                 };
-                let mut spec = PublishSpec::message(normalize_to(&to), payload);
+                // report 본문은 어휘(3.1)에 맞춘다 — JSON이 아니거나 status가 없으면 in-progress로
+                // 감싼다 (2026-09-05 실측: 마크다운 착수 report를 기다리는 쪽이 최종 답으로 삼았다)
+                let coerced = if name == "report" {
+                    brevduva_protocol::coerce_report_payload(&payload)
+                } else {
+                    None
+                };
+                let mut spec = match coerced {
+                    Some(json) => {
+                        let mut spec = PublishSpec::message(normalize_to(&to), json);
+                        spec.content_type = "application/json".to_owned();
+                        spec
+                    }
+                    None => PublishSpec::message(normalize_to(&to), payload),
+                };
                 spec.kind = if name == "reply" {
                     Kind::Reply
                 } else {
@@ -521,7 +535,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "report",
-            "description": "Report on work you promised via acknowledge(relevant=true) or were asked to do. correlation_id = the originating message's id. Payload vocabulary (PROTOCOL 3.1): an interim update is JSON {\"status\":\"in-progress\",\"note\":...} — it is passed on as progress and does NOT close the request; a failure is {\"status\":\"failed\",\"reason\":...}; anything else (plain text or JSON without those statuses) is the final report.",
+            "description": "Report on work you promised via acknowledge(relevant=true) or were asked to do. correlation_id = the originating message's id. Payload vocabulary (PROTOCOL 3.1): an interim update is JSON {\"status\":\"in-progress\",\"note\":...} — passed on as progress, does NOT close the request; a failure is {\"status\":\"failed\",\"reason\":...} — final. Plain text or JSON without a status is sent as an interim note ({\"status\":\"in-progress\",\"note\":<your text>}) and never closes the request — to answer a request, use `reply`.",
             "inputSchema": { "type": "object", "properties": {
                 "to": { "type": "string" },
                 "correlation_id": { "type": "string" },

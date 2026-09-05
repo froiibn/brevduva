@@ -928,7 +928,7 @@ async fn report_unanswered(
     // 답이 다음 페이지에 있어도 "미응답"이 된다. 기다리는 correlation이 전부 해소되면 일찍 멈추고,
     // 페이지 상한에 닿았는데 스트림이 안 끝났으면 **불확실**로 보고 침묵한다 — 불확실한 이력은
     // 미응답의 증거가 아니다.
-    // "응답했다"로 치는 것은 **최종** 반응뿐이다: reply·ack, 그리고 in-progress가 아닌 report.
+    // "응답했다"로 치는 것은 **최종** 반응뿐이다: reply·ack, 그리고 진행 알림(3.1)이 아닌 report.
     // 데몬 자신이 스폰 직후 낸 착수 알림(in-progress)을 응답으로 세면 실패가 영원히 가려진다
     // (2026-09-04 회귀 테스트가 처음 잡은 것). 이미 낸 failed 보고는 응답으로 친다 — 재깨움 때
     // 같은 correlation에 실패 보고가 두 번 나가지 않게 하는 멱등 장치다.
@@ -965,7 +965,7 @@ async fn report_unanswered(
                 .filter(|e| e.from.as_str() == binding.agent)
                 .filter(|e| match e.kind {
                     Kind::Reply | Kind::Ack => true,
-                    Kind::Report => !e.is_in_progress_report(),
+                    Kind::Report => !e.is_progress_report(),
                     _ => false,
                 })
                 .filter_map(|e| e.correlation_id.as_ref().map(|c| c.as_str().to_owned())),

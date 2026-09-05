@@ -334,9 +334,9 @@ impl Client {
     }
 
     /// 다음 메시지 수신 (소비 시 ACK). 타임아웃이면 None — 메시지는 큐에 남는다.
-    /// correlation의 **최종** 반응을 기다린다 (9장). `report{status:"in-progress"}`(진행 알림, 3.1)는
-    /// 답이 아니다 — 소비하고(큐에 남겨 두면 미소비 재전달 예산을 태운다) 진행 정보로 넘긴 뒤 남은
-    /// 시간만큼 계속 기다린다. 발단(2026-09-05 실측): 0.6.22가 넣은 착수 알림을 `request`가 답으로
+    /// correlation의 **최종** 반응을 기다린다 (9장). 진행 알림(3.1 — `report{status:"in-progress"}`,
+    /// 그리고 JSON이 아니거나 status 없는 report)은 답이 아니다 — 소비하고(큐에 남겨 두면 미소비
+    /// 재전달 예산을 태운다) 진행 정보로 넘긴 뒤 남은 시간만큼 계속 기다린다. 발단(2026-09-05 실측): 0.6.22가 넣은 착수 알림을 `request`가 답으로
     /// 돌려줬다 — 실제 답은 그 뒤에 오는데 세션은 이미 넘어간 뒤였다.
     pub async fn recv_reply(&self, correlation: &str, wait: Duration) -> ReplyWait {
         let deadline = Instant::now() + wait;
@@ -350,7 +350,7 @@ impl Client {
                 .recv(RecvFilter::Correlation(correlation.to_owned()), left)
                 .await
             {
-                Some(env) if env.is_in_progress_report() => progress = Some(env),
+                Some(env) if env.is_progress_report() => progress = Some(env),
                 Some(reply) => {
                     return ReplyWait::Replied {
                         reply: Box::new(reply),
