@@ -509,7 +509,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "report",
-            "description": "Report completion (or failure) of work you promised via acknowledge(relevant=true) or were asked to do. correlation_id = the originating message's id.",
+            "description": "Report on work you promised via acknowledge(relevant=true) or were asked to do. correlation_id = the originating message's id. Payload vocabulary (PROTOCOL 3.1): an interim update is JSON {\"status\":\"in-progress\",\"note\":...} — it is passed on as progress and does NOT close the request; a failure is {\"status\":\"failed\",\"reason\":...}; anything else (plain text or JSON without those statuses) is the final report.",
             "inputSchema": { "type": "object", "properties": {
                 "to": { "type": "string" },
                 "correlation_id": { "type": "string" },
