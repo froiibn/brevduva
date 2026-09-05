@@ -923,38 +923,74 @@ async fn report_unanswered(
         return;
     }
     // 이 배치의 첫 건 직전부터의 이력 — 세션이 남긴 반응이 여기 들어 있다.
-    // 조회 실패는 **침묵**으로 다룬다: 못 봤다는 이유로 거짓 실패를 보내지 않는다
-    let after = envelopes.first().and_then(|e| e.id.as_ref());
-    let history = match crate::client::fetch_history(
-        &opts.server,
-        &opts.channel,
-        &opts.token,
-        after.map(brevduva_protocol::MessageId::as_str),
-        // 서버 페이지 상한과 같은 값 (12.2) — 한 배치는 최대 20건이라 충분하다
-        100,
-    )
-    .await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(error = %e, "history lookup failed — not reporting; the sender may stay waiting");
-            return;
-        }
-    };
+    // 조회 실패는 **침묵**으로 다룬다: 못 봤다는 이유로 거짓 실패를 보내지 않는다.
+    // 페이지는 **끝까지** 읽는다 (QA-17, 2026-09-05): 한 페이지(100건)만 보면 바쁜 채널에서 실제
+    // 답이 다음 페이지에 있어도 "미응답"이 된다. 기다리는 correlation이 전부 해소되면 일찍 멈추고,
+    // 페이지 상한에 닿았는데 스트림이 안 끝났으면 **불확실**로 보고 침묵한다 — 불확실한 이력은
+    // 미응답의 증거가 아니다.
     // "응답했다"로 치는 것은 **최종** 반응뿐이다: reply·ack, 그리고 in-progress가 아닌 report.
     // 데몬 자신이 스폰 직후 낸 착수 알림(in-progress)을 응답으로 세면 실패가 영원히 가려진다
     // (2026-09-04 회귀 테스트가 처음 잡은 것). 이미 낸 failed 보고는 응답으로 친다 — 재깨움 때
     // 같은 correlation에 실패 보고가 두 번 나가지 않게 하는 멱등 장치다.
-    let answered: std::collections::HashSet<String> = history
+    const PAGE: u32 = 100;
+    const MAX_PAGES: usize = 20;
+    let wanted: std::collections::HashSet<&str> = awaited
         .iter()
-        .filter(|e| e.from.as_str() == binding.agent)
-        .filter(|e| match e.kind {
-            Kind::Reply | Kind::Ack => true,
-            Kind::Report => !e.is_in_progress_report(),
-            _ => false,
-        })
-        .filter_map(|e| e.correlation_id.as_ref().map(|c| c.as_str().to_owned()))
+        .filter_map(|e| e.id.as_ref().map(brevduva_protocol::MessageId::as_str))
         .collect();
+    let mut after: Option<String> = envelopes
+        .first()
+        .and_then(|e| e.id.as_ref())
+        .map(|id| id.as_str().to_owned());
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut exhausted = false;
+    for _ in 0..MAX_PAGES {
+        let page = match crate::client::fetch_history(
+            &opts.server,
+            &opts.channel,
+            &opts.token,
+            after.as_deref(),
+            PAGE,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "history lookup failed — not reporting; the sender may stay waiting");
+                return;
+            }
+        };
+        answered.extend(
+            page.iter()
+                .filter(|e| e.from.as_str() == binding.agent)
+                .filter(|e| match e.kind {
+                    Kind::Reply | Kind::Ack => true,
+                    Kind::Report => !e.is_in_progress_report(),
+                    _ => false,
+                })
+                .filter_map(|e| e.correlation_id.as_ref().map(|c| c.as_str().to_owned())),
+        );
+        if wanted.iter().all(|id| answered.contains(*id)) {
+            exhausted = true; // 볼 것을 다 봤다 — 더 읽을 이유가 없다
+            break;
+        }
+        if (page.len() as u32) < PAGE {
+            exhausted = true;
+            break;
+        }
+        after = page
+            .last()
+            .and_then(|e| e.id.as_ref())
+            .map(|id| id.as_str().to_owned());
+    }
+    if !exhausted {
+        tracing::warn!(
+            binding = %binding.label(),
+            "history longer than {} pages while judging the session — uncertain, not reporting",
+            MAX_PAGES
+        );
+        return;
+    }
     let (reason, detail) = match failure {
         Some(e) => ("session-failed", e.to_string()),
         None => (
