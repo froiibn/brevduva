@@ -9,7 +9,8 @@
 #
 # 진행 표시 (2026-09-05, 사용자 지적 "텍스트만 나와서 설치 중에 멈춘 것처럼 보인다"): Write-Progress
 # 막대에 단계 진척률 + 지금 하는 일을, 다운로드는 하위 막대에 받은 양/전체와 초당 속도를 보인다.
-# 콘솔이 아닌 호스트에서는 Write-Progress가 조용히 무시되고 결과 메시지만 남는다.
+# 막대를 그리지 않는 호스트(ProgressPreference=SilentlyContinue, 비대화형)에서는 install.sh의 비터미널
+# 모드와 같이 단계마다 텍스트 한 줄을 남긴다 (QA RUN-5 R5-P3-1: 종전엔 그런 호스트에서 단계가 안 보였다).
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 # 연결까지 한 줄로 (2026-09-04, 온보딩 재설계 3): `irm … | iex`는 인자를 못 받으므로 env로 —
@@ -29,10 +30,17 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 # ---- 진행 표시 ----
 $script:steps = 7
 $script:step = 0
+# 막대를 그리지 않는 호스트인가 — 진행 표시가 꺼져 있거나(SilentlyContinue) 대화형 세션이 아니면
+# Write-Progress는 보이지 않으므로 텍스트로 대신한다
+$script:plainSteps = ($ProgressPreference -eq "SilentlyContinue") -or (-not [Environment]::UserInteractive)
 function Step([string]$text) {
     $script:step++
     $pct = [int](($script:step - 1) * 100 / $script:steps)
-    Write-Progress -Id 1 -Activity "Installing brv" -Status $text -PercentComplete $pct
+    if ($script:plainSteps) {
+        Write-Host ("[{0,3}%] {1}" -f $pct, $text)
+    } else {
+        Write-Progress -Id 1 -Activity "Installing brv" -Status $text -PercentComplete $pct
+    }
 }
 function Rate([double]$bps) {
     if ($bps -ge 1MB) { return ("{0:N1} MB/s" -f ($bps / 1MB)) }
