@@ -16,7 +16,7 @@ use brevduva_protocol::{Envelope, Expects, Kind};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-use crate::client::{Client, ClientOptions, PublishSpec, RecvFilter, ReplyWait};
+use crate::client::{Client, ClientOptions, FetchQuery, PublishSpec, RecvFilter, ReplyWait};
 
 /// 도구가 기다릴 수 있는 상한 — MCP 호스트 타임아웃(9장 "60초 홀드 → 재호출 루프")과 정합.
 const MAX_WAIT_S: u64 = 120;
@@ -405,9 +405,13 @@ impl McpServer {
                 self.render_reply_wait(&correlation_id, outcome).await
             }
             "fetch_history" => {
-                let after_id = s("after_id");
-                let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
-                match client.fetch(after_id, limit, Duration::from_secs(15)).await {
+                let query = FetchQuery {
+                    after_id: s("after_id"),
+                    before_id: s("before_id"),
+                    newest_first: args["newest_first"].as_bool().unwrap_or(false),
+                    limit: args["limit"].as_u64().map(|v| v.min(100) as u32),
+                };
+                match client.fetch_query(query, Duration::from_secs(15)).await {
                     Ok(messages) => {
                         let rendered: Vec<Value> = messages
                             .iter()
@@ -529,9 +533,11 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fetch_history",
-            "description": "Read the channel's past messages (catch up after joining late or being away). Cursor: pass the last seen message id as after_id. Page ≤100.",
+            "description": "Read the channel's past messages. Default order is oldest→newest from after_id (catch up after being away). newest_first=true returns the most recent messages first — use it for \"what happened lately\" — and pages further back with before_id = the last id you received. Page ≤100.",
             "inputSchema": { "type": "object", "properties": {
-                "after_id": { "type": "string" },
+                "after_id": { "type": "string", "description": "forward cursor: messages after this id" },
+                "before_id": { "type": "string", "description": "backward cursor (with newest_first): messages before this id" },
+                "newest_first": { "type": "boolean", "description": "true = most recent first" },
                 "limit": { "type": "number" }
             } }
         },

@@ -175,6 +175,16 @@ pub enum ReplyWait {
     },
 }
 
+/// 히스토리 조회 조건 (FETCH). 기본은 과거→현재(`after_id` 커서); `newest_first`면 최신부터
+/// 역순이고 커서는 `before_id`다 (2026-09-05).
+#[derive(Debug, Clone, Default)]
+pub struct FetchQuery {
+    pub after_id: Option<String>,
+    pub before_id: Option<String>,
+    pub newest_first: bool,
+    pub limit: Option<u32>,
+}
+
 /// 수신 필터 — wait_for_message(전체)와 wait_for_reply(correlation)는 같은 큐의 다른 뷰 (9.5).
 #[derive(Debug, Clone)]
 pub enum RecvFilter {
@@ -204,8 +214,7 @@ enum Cmd {
     // recv_manual로 받은 전달의 확인 — 깨우기 성공 등 "처리 보장" 시점에 호출
     Confirm(u64),
     Fetch {
-        after_id: Option<String>,
-        limit: Option<u32>,
+        query: FetchQuery,
         resp: oneshot::Sender<Result<Vec<Envelope>, String>>,
     },
     Presence(oneshot::Sender<Result<Vec<PresenceEntry>, String>>),
@@ -374,19 +383,33 @@ impl Client {
         let _ = self.cmds.send(Cmd::Confirm(token)).await;
     }
 
+    /// 과거→현재 조회 (`after_id` 커서) — `fetch_query`의 단축형.
     pub async fn fetch(
         &self,
         after_id: Option<String>,
         limit: Option<u32>,
         wait: Duration,
     ) -> Result<Vec<Envelope>, String> {
-        let (tx, rx) = oneshot::channel();
-        self.cmds
-            .send(Cmd::Fetch {
+        self.fetch_query(
+            FetchQuery {
                 after_id,
                 limit,
-                resp: tx,
-            })
+                ..FetchQuery::default()
+            },
+            wait,
+        )
+        .await
+    }
+
+    /// 히스토리 조회 — 방향·커서를 `FetchQuery`로 (2026-09-05, 역순 조회 추가).
+    pub async fn fetch_query(
+        &self,
+        query: FetchQuery,
+        wait: Duration,
+    ) -> Result<Vec<Envelope>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Fetch { query, resp: tx })
             .await
             .map_err(|_| "client stopped".to_owned())?;
         timeout(wait, rx)
@@ -682,11 +705,7 @@ impl Actor {
             Cmd::Confirm(seq) => {
                 self.handle_confirm(ws, seq).await;
             }
-            Cmd::Fetch {
-                after_id,
-                limit,
-                resp,
-            } => {
+            Cmd::Fetch { query, resp } => {
                 let seq = self.next_seq();
                 self.pending.insert(seq, Pending::Fetch(resp));
                 let frame = ClientFrame {
@@ -694,9 +713,11 @@ impl Actor {
                     re: None,
                     op: ClientOp::Fetch {
                         topics: None,
-                        after_id: after_id.and_then(|s| MessageId::parse(&s).ok()),
+                        after_id: query.after_id.and_then(|s| MessageId::parse(&s).ok()),
                         after_ts: None,
-                        limit,
+                        before_id: query.before_id.and_then(|s| MessageId::parse(&s).ok()),
+                        newest_first: query.newest_first,
+                        limit: query.limit,
                     },
                 };
                 let _ = send_frame(ws, &frame).await;
@@ -1069,6 +1090,8 @@ pub async fn fetch_history(
         topics: None,
         after_id: after_id.and_then(|s| MessageId::parse(s).ok()),
         after_ts: None,
+        before_id: None,
+        newest_first: false,
         limit: Some(limit),
     };
     Ok(http_frame(server, channel, token, op)

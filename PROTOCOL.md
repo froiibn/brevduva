@@ -165,7 +165,7 @@ WebSocket 연결 후 JSON 프레임. GUI 어댑터용 HTTP long-poll 폴백은 �
 | `SUB` / `UNSUB` | C→S | 토픽 구독/해지 (inbox·broadcast는 자동 구독) |
 | `PUB` | C→S | 메시지 발행 (3장 엔벨로프) |
 | `DELIVER` | S→C | 메시지 전달 |
-| `FETCH` | C→S | 히스토리 조회 (채널/토픽, 시간·ID 커서 기반) |
+| `FETCH` | C→S | 히스토리 조회 (채널/토픽, 시간·ID 커서 기반). 기본은 과거→현재(`after_id`); `newest_first: true`면 최신부터 역순이고 커서는 `before_id` (2026-09-05 — "최근 무슨 일이 있었나"를 처음부터 넘기지 않게) |
 | `PING` / `PONG` | 양방향 | 하트비트 (push 모드 프레즌스 판정) |
 | `PRESENCE` | C→S | 채널 참가자들의 프레즌스 조회 (5.3) |
 | `BLOB_PUT` / `BLOB_GET` | C→S | claim-check 업로드/다운로드 (HTTP, Range 지원) |

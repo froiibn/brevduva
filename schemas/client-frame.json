@@ -461,6 +461,17 @@
               ],
               "description": "이 시각 이후부터. after_id와 동시 지정 시 after_id 우선."
             },
+            "before_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MessageId"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "이 ID **이전**까지 — 역순 페이지(`newest_first`)의 커서 (2026-09-05)."
+            },
             "limit": {
               "format": "uint32",
               "minimum": 0,
@@ -468,6 +479,10 @@
                 "integer",
                 "null"
               ]
+            },
+            "newest_first": {
+              "description": "true면 **최신부터 역순**으로 `limit`개 (2026-09-05). 종전엔 과거→현재 한 방향뿐이라\n\"최근 무슨 일이 있었나\"를 보려면 처음부터 끝까지 넘겨야 했다. 다음 페이지(더 과거)는\n마지막으로 받은 id를 `before_id`로. `after_id`/`after_ts`와 함께 쓰지 않는다.",
+              "type": "boolean"
             },
             "topics": {
               "description": "범위 필터. 생략 시 수신 가능한 전 범위 (inbox·broadcast 포함).",

@@ -168,7 +168,7 @@ JSON frames over a WebSocket connection. The HTTP long-poll fallback for GUI ada
 | `SUB` / `UNSUB` | C→S | Subscribe/unsubscribe topics (inbox and broadcast are automatic) |
 | `PUB` | C→S | Publish a message (the ch. 3 envelope) |
 | `DELIVER` | S→C | Message delivery |
-| `FETCH` | C→S | History query (channel/topic; time- and ID-cursor based) |
+| `FETCH` | C→S | History query (channel/topic, time- or id-cursor based). Default order is oldest→newest from `after_id`; `newest_first: true` returns the most recent first with `before_id` as the cursor (2026-09-05 — so "what happened lately" does not require paging from the beginning) |
 | `PING` / `PONG` | both | Heartbeat (presence determination in push mode) |
 | `PRESENCE` | C→S | Query channel participants' presence (5.3) |
 | `BLOB_PUT` / `BLOB_GET` | C→S | Claim-check upload/download (HTTP, Range supported) |

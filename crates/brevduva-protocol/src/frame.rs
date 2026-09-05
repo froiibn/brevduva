@@ -73,6 +73,14 @@ pub enum ClientOp {
         /// 이 시각 이후부터. after_id와 동시 지정 시 after_id 우선.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after_ts: Option<Timestamp>,
+        /// 이 ID **이전**까지 — 역순 페이지(`newest_first`)의 커서 (2026-09-05).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_id: Option<MessageId>,
+        /// true면 **최신부터 역순**으로 `limit`개 (2026-09-05). 종전엔 과거→현재 한 방향뿐이라
+        /// "최근 무슨 일이 있었나"를 보려면 처음부터 끝까지 넘겨야 했다. 다음 페이지(더 과거)는
+        /// 마지막으로 받은 id를 `before_id`로. `after_id`/`after_ts`와 함께 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        newest_first: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
