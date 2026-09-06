@@ -16,6 +16,7 @@ pub mod connection;
 pub mod daemon;
 pub mod desktop;
 pub mod enroll;
+mod file_lock;
 pub mod hook;
 pub mod manage;
 pub mod mcp;

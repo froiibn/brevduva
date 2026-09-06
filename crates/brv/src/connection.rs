@@ -3,7 +3,7 @@
 
 //! 사용자의 '현재 작업에 연결' 표면. 로컬 세션 식별과 실행 어댑터를 분리한다.
 //! 연결 의도는 디스크에 남기고 사용자 계정의 백그라운드 worker가 실제 수신을 맡는다.
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -107,30 +107,20 @@ fn write<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     }
     result
 }
-fn lock(path: &Path) -> anyhow::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    file.try_lock()
-        .context("another connection operation or worker is active")?;
-    Ok(file)
+fn lock(path: &Path) -> anyhow::Result<crate::file_lock::FileLock> {
+    crate::file_lock::FileLock::acquire(path).context("cannot acquire connection lock")
 }
-fn worker_alive(dir: &Path) -> bool {
-    let path = dir.join("worker.lock");
-    if !path.exists() {
-        return false;
-    }
-    lock(&path).is_err()
+fn worker_alive(dir: &Path) -> anyhow::Result<bool> {
+    crate::file_lock::FileLock::held(&dir.join("worker.lock"))
 }
-
-pub(crate) fn recovery_guard(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<File> {
+pub(crate) fn recovery_guard(
+    cfg: &BrvConfig,
+    binding: &Binding,
+) -> anyhow::Result<crate::file_lock::FileLock> {
     let dir = directory(binding)?;
     let guard = lock(&dir.join("control.lock"))?;
     anyhow::ensure!(
-        !worker_alive(&dir),
+        !worker_alive(&dir)?,
         "pause the task connection before resolving a delivery"
     );
     anyhow::ensure!(
@@ -166,7 +156,7 @@ fn show(dir: &Path, connection: Option<&Connection>) -> anyhow::Result<()> {
     let saved: Option<RuntimeState> = std::fs::read(dir.join("runtime.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
-    let alive = worker_alive(dir);
+    let alive = worker_alive(dir)?;
     let state = match connection.desired {
         Desired::Paused => "paused",
         Desired::Disconnected => "disconnected",
@@ -188,7 +178,7 @@ fn show(dir: &Path, connection: Option<&Connection>) -> anyhow::Result<()> {
 }
 async fn wait_stopped(dir: &Path) -> anyhow::Result<()> {
     for _ in 0..100 {
-        if !worker_alive(dir) {
+        if !worker_alive(dir)? {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -335,7 +325,7 @@ pub async fn command(
                 "another task is connected ({}) — ask the user whether to switch, then use --replace",
                 old.task.id
             );
-            if old.task == task && old.desired == Desired::Connected && worker_alive(&dir) {
+            if old.task == task && old.desired == Desired::Connected && worker_alive(&dir)? {
                 let state: RuntimeState =
                     serde_json::from_slice(&std::fs::read(dir.join("runtime.json"))?)?;
                 anyhow::ensure!(
@@ -346,7 +336,7 @@ pub async fn command(
                 );
                 return show(&dir, Some(old));
             }
-            if worker_alive(&dir) {
+            if worker_alive(&dir)? {
                 let mut stopped = old.clone();
                 stopped.desired = Desired::Paused;
                 write(&dir.join("connection.json"), &stopped)?;
@@ -542,14 +532,14 @@ mod tests {
         let path = dir.join("state.json");
         write(&path, &json!({"state":"connected"})).unwrap();
         let guard = lock(&dir.join("worker.lock")).unwrap();
-        assert!(worker_alive(&dir));
+        assert!(worker_alive(&dir).unwrap());
         write(&path, &json!({"state":"paused"})).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()["state"],
             "paused"
         );
         drop(guard);
-        assert!(!worker_alive(&dir));
+        assert!(!worker_alive(&dir).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

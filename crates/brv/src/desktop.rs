@@ -60,7 +60,7 @@ enum JournalEntry {
 
 /// 파일 잠금은 종료 시 해제된다. 미완성 마지막 줄 외의 손상은 오류로 처리한다.
 struct Journal {
-    _lock: File,
+    _lock: crate::file_lock::FileLock,
     file: File,
     entries: BTreeMap<String, Delivery>,
 }
@@ -90,13 +90,7 @@ fn decode(bytes: &[u8], identity: &Identity) -> anyhow::Result<BTreeMap<String, 
 impl Journal {
     fn open(path: &Path, identity: Identity) -> anyhow::Result<Self> {
         // Windows 파일 잠금은 다른 프로세스의 읽기도 막으므로 데이터 파일과 분리한다.
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.with_extension("lock"))?;
-        lock.try_lock()
+        let lock = crate::file_lock::FileLock::acquire(&path.with_extension("lock"))
             .context("another Desktop receiver owns this binding")?;
         let mut file = OpenOptions::new()
             .read(true)
