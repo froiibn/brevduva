@@ -853,8 +853,13 @@ mod tests {
         restrict_dir(&dir).expect("restrict");
         let after = acl_of(&victim);
         std::fs::remove_dir_all(&base).ok();
-        let principals = |acl: &str| acl.lines().filter(|l| l.contains(":(")).count();
-        assert_eq!(principals(&before), 1, "setup: {before:?}");
+        // CI 관리자 계정의 TEMP에는 SYSTEM/Administrators explicit ACE가 남을 수 있다.
+        // 준비 조건은 ACE 개수가 아니라 상속이 제거되어 /reset을 탐지할 수 있다는 점이다.
+        assert!(before.contains(":("), "setup has no ACE: {before:?}");
+        assert!(
+            !before.contains("(I)"),
+            "setup still inherits permissions: {before:?}"
+        );
         assert_eq!(
             before, after,
             "a file behind a planted junction must be untouched"
