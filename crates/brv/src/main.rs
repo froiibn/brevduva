@@ -134,6 +134,9 @@ enum Cmd {
     },
     /// Local MCP server (stdio) for agent runners — or `brv mcp register` to add it to the runners on this machine
     Mcp {
+        /// Experimental Claude Code Channels mode; requires Channels enabled at Claude startup
+        #[arg(long)]
+        claude_channel: bool,
         /// Binding for this session — required when multiple bindings exist (pin it in each project's .mcp.json)
         #[arg(long)]
         binding: Option<String>,
@@ -605,6 +608,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             }
         }
         Cmd::Mcp {
+            claude_channel,
             binding,
             config,
             host,
@@ -617,9 +621,13 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             }
             match action {
                 Some(McpCmd::Register { runner, dry_run }) => {
+                    anyhow::ensure!(
+                        !claude_channel,
+                        "configure --claude-channel in the session-owned MCP entry, not mcp register"
+                    );
                     mcp_register(&config::load()?, runner.as_deref(), dry_run)
                 }
-                None => mcp(binding.as_deref(), host).await,
+                None => mcp(binding.as_deref(), host, claude_channel).await,
             }
         }
         Cmd::Daemon { config, action } => match action {
@@ -1892,7 +1900,11 @@ async fn listen(binding_sel: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
-async fn mcp(binding_sel: Option<&str>, host: Option<String>) -> anyhow::Result<()> {
+async fn mcp(
+    binding_sel: Option<&str>,
+    host: Option<String>,
+    claude_channel: bool,
+) -> anyhow::Result<()> {
     // 선택자 폴백: --binding → BREVDUVA_BINDING env — 데몬이 깨운 세션의 MCP가 "누가
     // 깨웠는지"를 이어받는 통로 (2026-09-02). 바인딩이 여럿인 머신에서도 깨운 세션이
     // 올바른 정체성으로 붙는다 (플래그 없는 user-scope 등록 + 다중 바인딩 = select 불가였음)
@@ -1907,11 +1919,19 @@ async fn mcp(binding_sel: Option<&str>, host: Option<String>) -> anyhow::Result<
     };
     let binding_sel = binding_sel.or(env_sel.as_deref()).or(state_sel.as_deref());
     // lazy-JOIN: 여기서 접속하지 않는다 — 첫 도구 호출 때 McpServer가 접속 (플랩 방지)
-    let (_, binding, mut opts) = options_from_config(binding_sel)?;
+    let (cfg, binding, mut opts) = options_from_config(binding_sel)?;
     // 유휴 파킹 (2026-09-01): 도구 호출이 끊긴 세션은 자리를 내려놓는다 — 방치된 대화형
     // 세션의 버퍼로 배달돼 미소비 재전달 끝에 격리되는 유실을 원천 차단. 다음 도구 호출이
     // lazy-JOIN과 같은 경로로 자리를 되찾는다
     opts.idle_park = Some(brv::client::DEFAULT_IDLE_PARK);
     tracing::info!(binding = %binding.label(), "brv mcp server on stdio");
-    brv::mcp::run_stdio(opts, host).await
+    if claude_channel {
+        anyhow::ensure!(
+            host.as_deref().is_none_or(|h| h == "claude"),
+            "Claude channel mode requires the Claude host"
+        );
+        brv::mcp::run_claude_channel(opts, &cfg, &binding).await
+    } else {
+        brv::mcp::run_stdio(opts, host).await
+    }
 }

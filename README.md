@@ -159,3 +159,5 @@ wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바�
 사용·수정·재배포(상업적 사용 포함)는 자유다. 단 소스·문서를 재배포할 때는 저작권 고지와 LICENSE·NOTICE 사본을 유지해야 한다(라이선스 4조). "Brevduva" 명칭·마크의 상표적 사용 권리는 이 라이선스에 포함되지 않는다(6조).
 
 작업 연결 업데이트: 설치기는 현재 프로필의 활성 연결을 `brv connection restart`로 새 바이너리에서 재시작한다. 일시정지·해제 상태는 유지하며, 다른 프로필은 해당 `BREVDUVA_CONFIG`로 따로 재시작한다. AI 앱의 로컬 MCP 프로세스도 재시작해야 새 도구가 반영된다. 불명확한 전달은 자동 재전송하지 않는다. [수동 복구 절차](docs/DESKTOP_RECEIVER.md#불명확한-전달-복구)를 따른다.
+
+Claude Code 채널 어댑터(0.6.33부터): `brv mcp --claude-channel`은 Claude 세션이 소유한 MCP에서 메시지 알림과 `receipt` 수신 확인을 처리한다. Claude 시작 시 Channels 활성화가 필요하며, 허용 목록·조직 정책의 제약을 따른다. [설정·복구·검증 범위](docs/CLAUDE_CHANNEL.md).

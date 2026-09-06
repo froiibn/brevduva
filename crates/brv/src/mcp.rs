@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use brevduva_protocol::{Envelope, Expects, Kind};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 use crate::client::{Client, ClientOptions, FetchQuery, PublishSpec, RecvFilter, ReplyWait};
 
@@ -35,6 +35,7 @@ pub struct McpServer {
     client: Option<Client>,
     /// 전달한 메시지의 hops 기록 — 반응 메시지(reply/ack/report)의 hops+1 계산용 (3.3).
     hops_by_id: HashMap<String, u32>,
+    channel: Option<std::sync::Arc<tokio::sync::Mutex<crate::claude_channel::Channel>>>,
 }
 
 impl McpServer {
@@ -44,6 +45,7 @@ impl McpServer {
             host,
             client: None,
             hops_by_id: HashMap::new(),
+            channel: None,
         }
     }
 
@@ -56,27 +58,71 @@ impl McpServer {
         self.client.as_ref().expect("client just set").clone()
     }
 
-    /// stdio 루프 — 표준 입력이 닫히면 종료.
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        let stdin = BufReader::new(tokio::io::stdin());
-        let mut stdout = tokio::io::stdout();
-        let mut lines = stdin.lines();
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(request) = serde_json::from_str::<Value>(&line) else {
-                tracing::warn!("unparsable jsonrpc line");
-                continue;
-            };
-            if let Some(response) = self.dispatch(request).await {
-                stdout.write_all(format!("{response}\n").as_bytes()).await?;
-                stdout.flush().await?;
-            }
-        }
-        Ok(())
+    /// stdout은 하나의 잠금으로 직렬화한다. 도구 처리 중에도 수신 알림을 보낼 수 있다.
+    pub async fn run(self) -> anyhow::Result<()> {
+        self.run_io(BufReader::new(tokio::io::stdin()), tokio::io::stdout())
+            .await
     }
 
+    async fn run_io<R, W>(mut self, reader: R, writer: W) -> anyhow::Result<()>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+        let mut lines = reader.lines();
+        let mut pump: Option<tokio::task::JoinHandle<()>> = None;
+        let outcome = async {
+            while let Some(line) = lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    tracing::warn!("unparsable jsonrpc line");
+                    continue;
+                };
+                let initialized = request["method"] == "notifications/initialized";
+                if let Some(response) = self.dispatch(request).await {
+                    crate::claude_channel::write_json(&writer, &response).await?;
+                }
+                if initialized
+                    && pump.is_none()
+                    && let Some(channel) = self.channel.clone()
+                {
+                    let client = self.ensure_client();
+                    let writer = writer.clone();
+                    pump = Some(tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::claude_channel::pump(channel.clone(), client, writer).await
+                        {
+                            tracing::error!(%error, "Claude channel delivery stopped");
+                            channel.lock().await.error = Some(error.to_string());
+                        }
+                    }));
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Some(pump) = pump {
+            pump.abort();
+            let _ = pump.await;
+        }
+        outcome
+    }
+
+    pub(crate) fn with_channel(
+        mut self,
+        cfg: &crate::config::BrvConfig,
+        binding: &crate::config::Binding,
+    ) -> anyhow::Result<Self> {
+        self.opts.idle_park = None;
+        self.opts.takeover_standby = true;
+        self.channel = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::claude_channel::Channel::open(cfg, binding)?,
+        )));
+        Ok(self)
+    }
     async fn dispatch(&mut self, request: Value) -> Option<Value> {
         let id = request.get("id").cloned();
         let method = request["method"].as_str().unwrap_or_default().to_owned();
@@ -92,10 +138,10 @@ impl McpServer {
                     .unwrap_or("2024-11-05")
                     .to_owned();
                 respond(json!({
-                    "protocolVersion": requested,
-                    "capabilities": { "tools": {} },
+                    "protocolVersion": if self.channel.is_some() {"2025-06-18"} else {&requested},
+                    "capabilities": if self.channel.is_some() {json!({"tools":{},"experimental":{"claude/channel":{}}})} else {json!({"tools":{}})},
                     "serverInfo": { "name": "brv", "version": env!("CARGO_PKG_VERSION"), "host": self.host },
-                    "instructions": INSTRUCTIONS,
+                    "instructions": if self.channel.is_some() {crate::claude_channel::INSTRUCTIONS} else {INSTRUCTIONS},
                 }))
             }
             "notifications/initialized" | "notifications/cancelled" => None,
@@ -103,6 +149,15 @@ impl McpServer {
             "tools/list" => {
                 // 리시버 관리 도구(2026-09-04)는 유인 세션에만 보인다 — 깨어난 세션은 존재도 모른다
                 let mut tools = tool_definitions();
+                if self.channel.is_some() && let Some(list) = tools.as_array_mut() {
+                    list.retain(|tool| !matches!(tool["name"].as_str(), Some("wait_for_message" | "wait_for_reply")));
+                    for tool in list.iter_mut() {
+                        if tool["name"] == "request" {
+                            tool["description"] = json!("Ask a peer without waiting. Reply arrives as a channel notification with the original correlation_id.");
+                        }
+                    }
+                    list.extend(crate::claude_channel::tools());
+                }
                 if let crate::manage::Attendance::Attended = crate::manage::attendance()
                     && let Some(list) = tools.as_array_mut()
                 {
@@ -239,6 +294,39 @@ impl McpServer {
     }
 
     async fn call_tool(&mut self, name: &str, args: &Value) -> (Value, bool) {
+        if let Some(channel) = self.channel.clone() {
+            if name == "receipt" {
+                let result = channel.lock().await.receipt(
+                    args["message_id"].as_str().unwrap_or_default(),
+                    args["receipt_token"].as_str().unwrap_or_default(),
+                );
+                return match result {
+                    Ok(envelope) => {
+                        self.record_and_render(&envelope);
+                        (
+                            json!({"status":"accepted","message_id":envelope.id,"note":"observed, not completed"}),
+                            false,
+                        )
+                    }
+                    Err(error) => (json!({"status":"error","message":error.to_string()}), true),
+                };
+            }
+            if name == "channel_status" {
+                return (channel.lock().await.status(), false);
+            }
+            if name == "channel_resolve" {
+                return match channel.lock().await.resolve(args) {
+                    Ok(value) => (value, false),
+                    Err(error) => (json!({"status":"error","message":error.to_string()}), true),
+                };
+            }
+            if matches!(name, "wait_for_message" | "wait_for_reply") {
+                return (
+                    json!({"status":"channel_mode","message":"Messages and replies arrive through notifications. Do not start a competing receiver."}),
+                    true,
+                );
+            }
+        }
         let s = |key: &str| args[key].as_str().map(str::to_owned);
         let timeout_s = args["timeout_s"].as_u64().unwrap_or(60).min(MAX_WAIT_S);
         // 리시버 관리 (2026-09-04, 재설계 4): CLI를 자식으로 실행 — 채널에는 붙지 않는다.
@@ -338,6 +426,12 @@ impl McpServer {
                     return (sent, true);
                 }
                 let correlation = sent["id"].as_str().unwrap_or_default().to_owned();
+                if self.channel.is_some() {
+                    return (
+                        json!({"status":"sent","correlation_id":correlation,"message":"reply will arrive through a channel notification"}),
+                        false,
+                    );
+                }
                 let outcome = client
                     .recv_reply(&correlation, Duration::from_secs(timeout_s))
                     .await;
@@ -589,9 +683,180 @@ pub async fn run_stdio(opts: ClientOptions, host: Option<String>) -> anyhow::Res
     McpServer::new(opts, host).run().await
 }
 
+pub async fn run_claude_channel(
+    opts: ClientOptions,
+    cfg: &crate::config::BrvConfig,
+    binding: &crate::config::Binding,
+) -> anyhow::Result<()> {
+    McpServer::new(opts, Some("claude".into()))
+        .with_channel(cfg, binding)?
+        .run()
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    #[tokio::test]
+    async fn channel_stdio_receives_durably_and_replies_on_one_connection() {
+        tokio::time::timeout(Duration::from_secs(10), channel_roundtrip())
+            .await
+            .unwrap();
+    }
+
+    async fn channel_roundtrip() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+        let dir = std::env::temp_dir().join(format!(
+            "brv-channel-wire-{}",
+            brevduva_protocol::ClientKey::generate()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let id = brevduva_protocol::ClientKey::generate().to_string();
+        let envelope = json!({"v":1,"id":id,"client_key":brevduva_protocol::ClientKey::generate(),
+            "from":"peer","to":"agent:a","kind":"request","expects":"reply","hops":2,
+            "content_type":"text/plain","payload":"review this","meta":{}});
+        let server_path = path.clone();
+        let server_id = id.clone();
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let join: Value =
+                serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(join["op"], "JOIN");
+            ws.send(Message::Text(
+                json!({"op":"OK","re":join["seq"],"body":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({"op":"DELIVER","seq":700,"body":envelope})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let mut acknowledged = false;
+            loop {
+                let message = ws.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                match frame["op"].as_str().unwrap() {
+                    "ACK" => {
+                        assert_eq!(frame["re"], 700);
+                        assert!(
+                            std::fs::read_to_string(&server_path)
+                                .unwrap()
+                                .contains(&server_id),
+                            "receipt ACK must follow durable storage"
+                        );
+                        acknowledged = true;
+                    }
+                    "PUB" => {
+                        assert!(acknowledged);
+                        assert_eq!(frame["body"]["kind"], "reply");
+                        assert_eq!(frame["body"]["correlation_id"], server_id);
+                        assert_eq!(frame["body"]["hops"], 3);
+                        ws.send(Message::Text(json!({"op":"OK","re":frame["seq"],"body":{"id":brevduva_protocol::ClientKey::generate()}}).to_string().into())).await.unwrap();
+                        break;
+                    }
+                    "PING" => ws
+                        .send(Message::Text(
+                            json!({"op":"PONG","re":frame["seq"]}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap(),
+                    other => panic!("unexpected frame: {other}"),
+                }
+            }
+        });
+        let channel = crate::claude_channel::Channel::at(
+            &path,
+            crate::delivery::Identity {
+                server: server_url.clone(),
+                binding: "a@c".into(),
+            },
+        )
+        .unwrap();
+        let mut mcp = McpServer::new(
+            ClientOptions::new(&server_url, "c", "a", "fake-test-token"),
+            Some("claude".into()),
+        );
+        mcp.channel = Some(std::sync::Arc::new(tokio::sync::Mutex::new(channel)));
+        let (host_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, host_output) = tokio::io::duplex(4096);
+        let mut input = host_input;
+        let mut output = BufReader::new(host_output).lines();
+        let task = tokio::spawn(mcp.run_io(BufReader::new(server_input), server_output));
+        input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-06-18\"}}\n").await.unwrap();
+        let init: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        assert!(
+            init["result"]["capabilities"]["experimental"]
+                .get("claude/channel")
+                .is_some()
+        );
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        let list: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "receipt"));
+        assert!(!tools.iter().any(|t| matches!(
+            t["name"].as_str(),
+            Some("wait_for_message" | "wait_for_reply")
+        )));
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let notification: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(notification["method"], "notifications/claude/channel");
+        assert_eq!(notification["params"]["meta"]["message_id"], id);
+        let receipt = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"receipt","arguments":notification["params"]["meta"]}});
+        input
+            .write_all(format!("{receipt}\n").as_bytes())
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        let reply = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"to":"peer","correlation_id":id,"payload":"reviewed"}}});
+        input
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        drop(input);
+        task.await.unwrap().unwrap();
+        relay.await.unwrap();
+        let saved = crate::delivery::Journal::open(
+            &path,
+            crate::delivery::Identity {
+                server: server_url,
+                binding: "a@c".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            saved.entries[&id].state,
+            crate::delivery::DeliveryState::Accepted
+        );
+        drop(saved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// 2026-09-05: 호스트가 불리언을 문자열로 보내도 뜻을 잃지 않는다 — 모르는 값은 false.
     #[test]
@@ -637,6 +902,7 @@ mod tests {
         assert_eq!(init["result"]["serverInfo"]["name"], "brv");
         // 등록 시 받은 호스트를 되비친다 (2026-09-05) — 추측이 아니라 등록이 준 값
         assert_eq!(init["result"]["serverInfo"]["host"], "codex");
+        assert!(init["result"]["capabilities"].get("experimental").is_none());
 
         let list = mcp
             .dispatch(serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
