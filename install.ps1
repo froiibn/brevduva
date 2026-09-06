@@ -148,7 +148,6 @@ $ErrorActionPreference = $eap
 Step "restarting saved task connections"
 & $exe connection restart
 if ($LASTEXITCODE -ne 0) { throw "brv installed, but task connection restart failed. Inspect brv connection status before resuming." }
-Write-Host "Restart your AI app's local Brevduva MCP process to load the updated tools."
 Write-Progress -Id 1 -Activity "Installing brv" -Status "done" -PercentComplete 100
 Write-Progress -Id 1 -Activity "Installing brv" -Completed
 if ($enroll) {
@@ -164,3 +163,11 @@ if ($enroll) {
     Write-Host "  1) https://brevduva.dev dashboard → Connect agents → Connect → copy the one-line command"
     Write-Host "  2) paste it here (it runs: brv init --server $server --enroll <code>)"
 }
+
+# 앱이 관리하는 MCP는 설치기가 재시작할 수 없다. 온보딩 출력 뒤 마지막에 안내한다.
+Write-Host ""
+Write-Host "Apply the new version to running AI sessions:"
+Write-Host "  After EVERY update, restart the local Brevduva MCP in each running AI app."
+Write-Host "  Use the app's MCP restart action, or save your work and fully quit/reopen the app."
+Write-Host "  For a CLI session, exit and relaunch it with the same MCP/Channels options."
+Write-Host "  Opening a new chat alone may reuse the old MCP process. If the app was closed, just start it."

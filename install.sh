@@ -189,7 +189,6 @@ if ! "$dest/brv" connection restart; then
   echo "brv installed, but task connection restart failed. Inspect brv connection status before resuming." >&2
   exit 1
 fi
-line "Restart your AI app's local Brevduva MCP process to load the updated tools."
 draw 100 "done"
 [ "$tty" = 1 ] && printf '\n' >&2
 if [ -n "$enroll" ]; then
@@ -210,3 +209,11 @@ else
   echo "  1) https://brevduva.dev dashboard → Connect agents → Connect → copy the one-line command"
   echo "  2) paste it here (it runs: brv init --server $server --enroll <code>)"
 fi
+
+# 앱이 관리하는 MCP는 설치기가 재시작할 수 없다. 온보딩 출력 뒤 마지막에 안내한다.
+echo ""
+echo "Apply the new version to running AI sessions:"
+echo "  After EVERY update, restart the local Brevduva MCP in each running AI app."
+echo "  Use the app's MCP restart action, or save your work and fully quit/reopen the app."
+echo "  For a CLI session, exit and relaunch it with the same MCP/Channels options."
+echo "  Opening a new chat alone may reuse the old MCP process. If the app was closed, just start it."
