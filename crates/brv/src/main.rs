@@ -30,6 +30,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Connect this current task and start receiving in the background
+    Connect {
+        #[arg(long)]
+        binding: Option<String>,
+        /// Explicitly replace another connected task (pending work is never reassigned)
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Show, pause, resume or disconnect this machine's task connection
+    Connection {
+        #[command(subcommand)]
+        action: ConnectionCmd,
+    },
     /// Connect an agent — with a one-time code (--enroll, recommended) or an admin
     /// API key. Bindings are **added** to an existing config (same agent@channel updates it)
     Init {
@@ -111,6 +124,14 @@ enum Cmd {
         #[arg(long)]
         binding: Option<String>,
     },
+    /// Experimental existing Codex Desktop delivery (local user, Windows/macOS/Linux)
+    Desktop {
+        /// Config file used by this receiver
+        #[arg(long)]
+        config: Option<String>,
+        #[command(subcommand)]
+        action: DesktopCmd,
+    },
     /// Local MCP server (stdio) for agent runners — or `brv mcp register` to add it to the runners on this machine
     Mcp {
         /// Binding for this session — required when multiple bindings exist (pin it in each project's .mcp.json)
@@ -144,6 +165,75 @@ enum Cmd {
     Wake {
         #[command(subcommand)]
         action: WakeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectionCmd {
+    /// Restart saved connected workers with this binary (paused connections stay paused)
+    Restart,
+    Status {
+        #[arg(long)]
+        binding: Option<String>,
+    },
+    Pause {
+        #[arg(long)]
+        binding: Option<String>,
+    },
+    Resume {
+        #[arg(long)]
+        binding: Option<String>,
+    },
+    Disconnect {
+        #[arg(long)]
+        binding: Option<String>,
+    },
+    #[command(hide = true)]
+    Worker {
+        #[arg(long)]
+        binding: String,
+        #[arg(long)]
+        generation: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesktopCmd {
+    /// Resolve an uncertain delivery after inspecting the exact task history; pause first
+    Resolve {
+        #[arg(long)]
+        binding: Option<String>,
+        #[arg(long)]
+        id: String,
+        #[arg(long, required_unless_present = "retry", conflicts_with = "retry")]
+        accepted_turn: Option<String>,
+        #[arg(long)]
+        retry: bool,
+        #[arg(long)]
+        note: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Receive continuously into one explicitly selected existing Desktop task
+    Run {
+        #[arg(long)]
+        binding: Option<String>,
+        /// Exact existing task ID; never inferred from the latest task
+        #[arg(long)]
+        thread: String,
+        /// Stop after this many accepted inputs (acceptance is not completion)
+        #[arg(long)]
+        max_deliveries: Option<std::num::NonZeroUsize>,
+    },
+    /// Inspect durable delivery states without joining the channel
+    Status {
+        #[arg(long)]
+        binding: Option<String>,
+    },
+    /// Check the existing Desktop owner without sending input or joining
+    Check {
+        #[arg(long)]
+        thread: String,
     },
 }
 
@@ -333,6 +423,18 @@ fn changes_local_policy(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Init { .. }
+            | Cmd::Connect { .. }
+            | Cmd::Connection {
+                action: ConnectionCmd::Pause { .. }
+                    | ConnectionCmd::Restart
+                    | ConnectionCmd::Resume { .. }
+                    | ConnectionCmd::Disconnect { .. }
+                    | ConnectionCmd::Worker { .. }
+            }
+            | Cmd::Desktop {
+                action: DesktopCmd::Run { .. } | DesktopCmd::Resolve { .. },
+                ..
+            }
             | Cmd::Binding {
                 action: BindingCmd::Add { .. } | BindingCmd::Remove { .. },
             }
@@ -366,6 +468,34 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         );
     }
     match cmd {
+        Cmd::Connect { binding, replace } => {
+            crate_connection("connect", binding.as_deref(), replace).await
+        }
+        Cmd::Connection { action } => match action {
+            ConnectionCmd::Restart => {
+                if config::config_path()?.try_exists()? {
+                    brv::connection::restart_connected(&config::load()?).await
+                } else {
+                    Ok(()) // Fresh installation has no saved workers.
+                }
+            }
+            ConnectionCmd::Status { binding } => {
+                crate_connection("status", binding.as_deref(), false).await
+            }
+            ConnectionCmd::Pause { binding } => {
+                crate_connection("pause", binding.as_deref(), false).await
+            }
+            ConnectionCmd::Resume { binding } => {
+                crate_connection("resume", binding.as_deref(), false).await
+            }
+            ConnectionCmd::Disconnect { binding } => {
+                crate_connection("disconnect", binding.as_deref(), false).await
+            }
+            ConnectionCmd::Worker {
+                binding,
+                generation,
+            } => brv::connection::worker(&binding, &generation).await,
+        },
         Cmd::Init {
             server,
             enroll,
@@ -423,6 +553,57 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             binding,
         } => send(to, payload, expects_ack, reply_to, binding.as_deref()).await,
         Cmd::Listen { binding } => listen(binding.as_deref()).await,
+        Cmd::Desktop {
+            config: path,
+            action,
+        } => {
+            if let Some(path) = path {
+                let path = std::path::PathBuf::from(path);
+                anyhow::ensure!(path.is_absolute(), "--config must be an absolute path");
+                config::set_path_override(path);
+            }
+            match action {
+                DesktopCmd::Check { thread } => brv::desktop::check(&thread).await,
+                DesktopCmd::Resolve {
+                    binding,
+                    id,
+                    accepted_turn,
+                    retry: _,
+                    note,
+                    confirm,
+                } => {
+                    let cfg = config::load()?;
+                    let selected = cfg.select(binding.as_deref())?;
+                    brv::desktop::resolve(
+                        &cfg,
+                        selected,
+                        &id,
+                        accepted_turn.as_deref(),
+                        &note,
+                        confirm,
+                    )
+                }
+                DesktopCmd::Status { binding } => {
+                    let cfg = config::load()?;
+                    brv::desktop::status(&cfg, cfg.select(binding.as_deref())?)
+                }
+                DesktopCmd::Run {
+                    binding,
+                    thread,
+                    max_deliveries,
+                } => {
+                    let (cfg, binding, opts) = options_from_config(binding.as_deref())?;
+                    brv::desktop::run(
+                        &cfg,
+                        &binding,
+                        opts,
+                        &thread,
+                        max_deliveries.map(|n| n.get()),
+                    )
+                    .await
+                }
+            }
+        }
         Cmd::Mcp {
             binding,
             config,
@@ -540,6 +721,16 @@ fn options_from_config(
     let mut opts = ClientOptions::new(&cfg.server, &binding.channel, &binding.agent, token);
     opts.description = binding.description.clone();
     Ok((cfg, binding, opts))
+}
+
+async fn crate_connection(
+    action: &str,
+    selector: Option<&str>,
+    replace: bool,
+) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let binding = cfg.select(selector)?;
+    brv::connection::command(&cfg, binding, action, replace).await
 }
 
 fn connect_from_config(selector: Option<&str>) -> anyhow::Result<(Binding, Client)> {

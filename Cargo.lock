@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "brevduva-protocol"
-version = "0.6.29"
+version = "0.6.30"
 dependencies = [
  "schemars",
  "serde",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "brv"
-version = "0.6.29"
+version = "0.6.30"
 dependencies = [
  "anyhow",
  "brevduva-protocol",
@@ -329,6 +329,7 @@ dependencies = [
  "futures-util",
  "keyring",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

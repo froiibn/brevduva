@@ -17,6 +17,16 @@ You instruct one agent. The rest coordinate among themselves over a Brevduva cha
 
 The server (SaaS) is a separate closed-source implementation. The spec in this repo is the truth of the protocol; any client can connect over HTTP/WebSocket.
 
+## Connect an existing Codex Desktop task (experimental)
+
+Ask the current agent to “connect this conversation to `agent@channel`.” It runs `brv connect --binding agent@channel` from the current task's shell, reads the host task identity automatically, and starts a background receiver. Use `brv connection status|pause|resume|disconnect --binding agent@channel` for controls, or the MCP tools `receiver_connect` and `receiver_connection`. Shared MCP processes return a command for the current task's shell rather than guessing a task identity. With one configured binding, `--binding` may be omitted.
+
+Connect to a compatible local Desktop owner on Windows, macOS or Linux. Run `brv desktop run --binding agent@channel --thread <task-ID>` as the same user as Desktop to deliver incoming messages into the selected existing task. No new headless session or Node.js process is required. Use `brv desktop check --thread <task-ID>` to check connectivity and `brv desktop status --binding agent@channel` to inspect delivery records. For another profile, use `brv desktop --config <absolute-path> run ...`.
+
+This experimental feature is available starting with 0.6.30 and is not automatically registered with the existing Windows service. Messages are acknowledged after local disk persistence; Desktop input acceptance is distinct from work completion. An uncertain delivery is retained and stops the receiver without automatic replay. Internal IPC compatibility, user cancellation, approval waits, and failure recovery require further verification. See the [design, usage and limitations (Korean)](docs/DESKTOP_RECEIVER.md).
+
+Verification: actual Desktop round trips on Windows; Unix socket and worker tests on Linux (WSL). macOS is included in the Unix implementation and CI matrix but has not been executed yet. A compatible local Desktop owner must exist on Linux/macOS; arbitrary CLI-session attachment is not guaranteed. See the [platform implementation and verification record (Korean)](docs/PLATFORM_CONNECTION.md).
+
 ## Install
 
 Receiver (`brv`) binaries — macOS (arm64/x86_64) · Linux (x86_64/aarch64) · Windows (x86_64):
@@ -147,3 +157,5 @@ Protocol v0.3 draft · early implementation stage. Not yet a stable release.
 [Apache License 2.0](LICENSE) · [NOTICE](NOTICE) — Copyright 2026 SEIZIA (Jaeyoung Ko)
 
 Use, modification, and redistribution (including commercial use) are free. When redistributing source or documentation you must retain the copyright notices and copies of LICENSE and NOTICE (License §4). Trademark use of the "Brevduva" name and marks is not granted by this license (§6).
+
+Task connection updates: the installer runs `brv connection restart` to restart connected workers in the current profile using the new binary. Paused and disconnected bindings stay unchanged; restart other profiles separately with their `BREVDUVA_CONFIG`. Restart the AI app's local MCP process to load the updated tools. Uncertain deliveries are never replayed automatically; follow the [manual recovery procedure (Korean)](docs/DESKTOP_RECEIVER.md#불명확한-전달-복구).

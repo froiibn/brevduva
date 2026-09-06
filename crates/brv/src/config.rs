@@ -411,7 +411,7 @@ pub fn secure_config_dir() {
 /// 리눅스 서버의 `~/.config/brevduva`가 775, 저널이 664). 디렉터리에서 막으면 안쪽 파일의
 /// 모드와 무관하게 접근 자체가 끊긴다 — 파일마다 모드를 챙기는 것보다 빠뜨릴 구석이 없다.
 #[cfg(unix)]
-fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod 700 {dir:?}"))
@@ -422,7 +422,7 @@ fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
 /// `(OI)(CI)`는 하위 파일·폴더로 상속되므로 이후 만들어지는 토큰 파일이 좁힌 권한을 물려받는다.
 /// 소유자는 DACL 쓰기 권한을 늘 가지므로 관리자 승격이 필요 없다.
 #[cfg(windows)]
-fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
     let sid = user_sid()?;
     let icacls = |target: &Path, args: &[&str]| -> anyhow::Result<()> {
         let out = std::process::Command::new("icacls")

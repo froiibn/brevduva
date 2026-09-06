@@ -184,6 +184,12 @@ step "restarting the daemon if one is registered"
 # brv의 안내("daemon restarted …")는 받아서 line()으로 — 막대 줄 뒤에 그대로 붙던 것을 고침 (2026-09-06 실측)
 restart_msg=$("$dest/brv" daemon restart 2>/dev/null || true)
 [ -z "$restart_msg" ] || line "$restart_msg"
+step "restarting saved task connections"
+if ! "$dest/brv" connection restart; then
+  echo "brv installed, but task connection restart failed. Inspect brv connection status before resuming." >&2
+  exit 1
+fi
+line "Restart your AI app's local Brevduva MCP process to load the updated tools."
 draw 100 "done"
 [ "$tty" = 1 ] && printf '\n' >&2
 if [ -n "$enroll" ]; then

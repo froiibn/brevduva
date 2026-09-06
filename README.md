@@ -17,6 +17,16 @@
 
 서버(SaaS)는 별도 클로즈드소스 구현이다. 프로토콜은 이 리포의 스펙이 진실이며, 어떤 클라이언트든 HTTP/WebSocket으로 붙을 수 있다.
 
+## 기존 Codex Desktop 작업 연결 (실험 기능)
+
+현재 작업에서 “이 대화를 `agent@channel`에 연결해줘”라고 요청한다. 에이전트가 현재 작업의 셸에서 `brv connect --binding agent@channel`을 실행하면 작업 ID를 자동으로 읽고 수신기를 백그라운드로 시작한다. 상태 확인·일시정지·재개·해제는 `brv connection status|pause|resume|disconnect --binding agent@channel`로 제공하며, MCP에서는 `receiver_connect`·`receiver_connection` 도구로 같은 흐름을 사용할 수 있다. 공유 MCP 프로세스에서는 작업 ID를 추정하지 않고 현재 작업의 셸 실행으로 이어준다. 바인딩이 하나면 `--binding`은 생략할 수 있다.
+
+Windows·macOS·Linux의 호환되는 로컬 Desktop 실행체에 연결한다. Desktop과 같은 사용자 계정으로 `brv desktop run --binding agent@channel --thread <작업-ID>`를 실행하면, 새 헤드리스 세션을 만들지 않고 지정한 기존 작업에 수신 메시지를 전달한다. Node.js는 필요 없다. `brv desktop check --thread <작업-ID>`로 연결을 확인하고 `brv desktop status --binding agent@channel`로 전달 기록을 조회한다. 별도 프로필은 `brv desktop --config <절대경로> run ...`으로 지정한다.
+
+이 기능은 0.6.30부터 제공하는 실험 기능이며 기존 Windows 서비스에 자동 등록되지 않는다. 메시지는 로컬 디스크 기록 후 수신 확인하며, Desktop 입력 수락은 작업 완료와 구별한다. 전송 결과가 불명확하면 기록을 유지하고 자동 재실행 없이 종료한다. 내부 IPC 호환성, 사용자 취소·승인 대기, 장애 복구는 추가 검증 대상이다. [설계·사용법·제한](docs/DESKTOP_RECEIVER.md)을 참고한다.
+
+검증 범위: Windows 실제 Desktop 왕복, Linux(WSL) Unix 소켓·worker 테스트 통과. macOS는 Unix 구현과 CI 대상에 포함했지만 실행 검증은 아직 없다. Linux·macOS에 호환 Desktop 실행체가 실제로 설치돼 있어야 하며, 임의의 CLI 세션 연결을 보장하지 않는다. [OS별 구현·검증 기록](docs/PLATFORM_CONNECTION.md).
+
 ## 설치
 
 리시버(`brv`) 바이너리 — macOS(arm64/x86_64) · Linux(x86_64/aarch64) · Windows(x86_64):
@@ -147,3 +157,5 @@ wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바�
 [Apache License 2.0](LICENSE) · [NOTICE](NOTICE) — Copyright 2026 SEIZIA (Jaeyoung Ko)
 
 사용·수정·재배포(상업적 사용 포함)는 자유다. 단 소스·문서를 재배포할 때는 저작권 고지와 LICENSE·NOTICE 사본을 유지해야 한다(라이선스 4조). "Brevduva" 명칭·마크의 상표적 사용 권리는 이 라이선스에 포함되지 않는다(6조).
+
+작업 연결 업데이트: 설치기는 현재 프로필의 활성 연결을 `brv connection restart`로 새 바이너리에서 재시작한다. 일시정지·해제 상태는 유지하며, 다른 프로필은 해당 `BREVDUVA_CONFIG`로 따로 재시작한다. AI 앱의 로컬 MCP 프로세스도 재시작해야 새 도구가 반영된다. 불명확한 전달은 자동 재전송하지 않는다. [수동 복구 절차](docs/DESKTOP_RECEIVER.md#불명확한-전달-복구)를 따른다.

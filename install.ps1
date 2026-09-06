@@ -145,6 +145,10 @@ Step "restarting the daemon if one is registered"
 $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
 & $exe daemon restart 2>$null
 $ErrorActionPreference = $eap
+Step "restarting saved task connections"
+& $exe connection restart
+if ($LASTEXITCODE -ne 0) { throw "brv installed, but task connection restart failed. Inspect brv connection status before resuming." }
+Write-Host "Restart your AI app's local Brevduva MCP process to load the updated tools."
 Write-Progress -Id 1 -Activity "Installing brv" -Status "done" -PercentComplete 100
 Write-Progress -Id 1 -Activity "Installing brv" -Completed
 if ($enroll) {

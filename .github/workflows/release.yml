@@ -75,6 +75,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -87,7 +88,12 @@ jobs:
         # -R 필수: 이 잡은 checkout이 없어 gh가 리포를 git에서 추론하지 못한다.
         # 재실행 시 릴리스가 이미 있으면 자산만 갱신 (--clobber)
         run: |
+          notes="docs/RELEASE_${GITHUB_REF_NAME#v}.md"
+          if [ ! -f "$notes" ]; then
+            notes="$RUNNER_TEMP/brv-release-notes.md"
+            printf '%s\n' '설치: https://brevduva.dev/install.sh · https://brevduva.dev/install.ps1 — 자산은 SHA256SUMS로 검증하세요.' > "$notes"
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" \
             --title "brv $GITHUB_REF_NAME" \
-            --notes "설치: macOS/Linux \`curl -fsSL https://brevduva.dev/install.sh | sh\` · Windows \`irm https://brevduva.dev/install.ps1 | iex\` — 또는 아래 자산을 직접 받아 SHA256SUMS로 검증." \
+            --notes-file "$notes" \
           || gh release upload "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --clobber

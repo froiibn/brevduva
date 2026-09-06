@@ -12,7 +12,9 @@
 
 pub mod client;
 pub mod config;
+pub mod connection;
 pub mod daemon;
+pub mod desktop;
 pub mod enroll;
 pub mod hook;
 pub mod manage;

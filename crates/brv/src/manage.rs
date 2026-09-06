@@ -58,6 +58,16 @@ pub fn tool_definitions() -> Vec<Value> {
     let binding = json!({ "type": "string", "description": "binding selector (agent@channel, or org/agent@channel) — required when this machine has several bindings" });
     vec![
         json!({
+            "name": "receiver_connect",
+            "description": format!("Prepare connection of THIS task to a Brevduva binding. Returns a structured command for YOU to execute in this task's own shell, because MCP processes can be shared across tasks. Execute it without asking the user for an ID or another approval when they already requested connection. It reads host session identity and starts the background receiver. Requires a reachable compatible Codex Desktop owner: Windows named pipe or macOS/Linux Unix socket. This does not imply arbitrary CLI-session support. Never guess recent/focused task IDs. To switch another connected task, get user intent then pass confirm=true.{ATTENDED_NOTE}"),
+            "inputSchema": { "type":"object", "properties": { "binding":binding, "confirm":{"type":"boolean","description":"explicitly switch an existing connection to this task"} } }
+        }),
+        json!({
+            "name": "receiver_connection",
+            "description": format!("Show, pause, resume or disconnect the saved task connection. Pausing and disconnecting retain pending messages and do not cancel an already running model turn. Resume uses the saved task. Same as brv connection.{ATTENDED_NOTE}"),
+            "inputSchema": { "type":"object", "properties": { "binding":binding, "action":{"type":"string","enum":["status","pause","resume","disconnect"]} },"required":["action"] }
+        }),
+        json!({
             "name": "receiver_status",
             "description": format!("Show this machine's receiver: profile, bindings, detected runners (path, version), daemon state, server reachability. Same as `brv status`.{ATTENDED_NOTE}"),
             "inputSchema": { "type": "object", "properties": { "binding": binding } }
@@ -122,6 +132,31 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     let mut argv: Vec<String> = Vec::new();
     let mut push = |a: &str| argv.push(a.to_owned());
     match name {
+        "receiver_connect" => {
+            push("connect");
+            if let Some(b) = s("binding") {
+                push("--binding");
+                push(&b);
+            }
+            if confirmed {
+                push("--replace");
+            }
+        }
+        "receiver_connection" => {
+            let action = s("action").ok_or("action is required")?;
+            if !matches!(
+                action.as_str(),
+                "status" | "pause" | "resume" | "disconnect"
+            ) {
+                return Err("invalid connection action".into());
+            }
+            push("connection");
+            push(&action);
+            if let Some(b) = s("binding") {
+                push("--binding");
+                push(&b);
+            }
+        }
         "receiver_status" => {
             push("status");
             if let Some(b) = s("binding") {
@@ -268,6 +303,15 @@ pub fn run_cli(argv: &[String]) -> (Value, bool) {
             );
         }
     };
+    if argv.first().is_some_and(|s| s == "connect") {
+        // MCP 호스트는 작업 간 공유될 수 있다. 부모 환경으로 현재 작업을 추정하지 않는다.
+        return (
+            json!({"status":"run_in_current_task_shell", "executable":exe, "args":argv,
+            "environment":{"BREVDUVA_CONFIG":config},
+            "message":"Execute this command from your current task's shell using its original host session environment. Do not set or copy CODEX_THREAD_ID yourself. No user-supplied task ID is needed. If that shell has no host session identity, report this host as unsupported."}),
+            false,
+        );
+    }
     let out = std::process::Command::new(&exe)
         .args(argv)
         .env("BREVDUVA_CONFIG", &config)
@@ -328,9 +372,34 @@ mod tests {
     }
 
     #[test]
+    fn connect_from_shared_mcp_requires_current_task_shell() {
+        let (result, error) = run_cli(&["connect".into(), "--binding".into(), "a@c".into()]);
+        assert!(!error);
+        assert_eq!(result["status"], "run_in_current_task_shell");
+        assert!(result["environment"].get("CODEX_THREAD_ID").is_none());
+        assert_eq!(result["args"], json!(["connect", "--binding", "a@c"]));
+    }
+
+    #[test]
     fn tools_map_to_the_cli_one_to_one() {
         let argv = |name: &str, args: Value| argv_for(name, &args).unwrap();
         assert_eq!(argv("receiver_status", json!({})), ["status"]);
+        assert_eq!(
+            argv("receiver_connect", json!({"binding":"a@c"})),
+            ["connect", "--binding", "a@c"]
+        );
+        assert_eq!(
+            argv("receiver_connect", json!({"binding":"a@c","confirm":true})),
+            ["connect", "--binding", "a@c", "--replace"]
+        );
+        assert_eq!(
+            argv(
+                "receiver_connection",
+                json!({"binding":"a@c","action":"pause"})
+            ),
+            ["connection", "pause", "--binding", "a@c"]
+        );
+        assert!(argv_for("receiver_connection", &json!({"action":"worker"})).is_err());
         assert_eq!(
             argv(
                 "receiver_configure",
