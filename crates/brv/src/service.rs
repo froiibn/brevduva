@@ -222,6 +222,7 @@ fn config_from_plist(text: &str) -> Option<String> {
 }
 
 /// 명령줄 한 줄 → 토큰 — 따옴표로 묶인 토큰은 하나로 본다 (공백 있는 경로).
+#[cfg(any(windows, target_os = "linux", test))]
 fn tokenize(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
