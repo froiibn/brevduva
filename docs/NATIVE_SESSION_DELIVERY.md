@@ -80,10 +80,14 @@ python crates/brv/tests/tools/probe_claude_native.py --brv target/debug/brv.exe
 ```
 
 `--codex`/`--claude`로 설치된 네이티브 실행 파일, `--deps`로 Python 의존성 경로를 지정할 수
-있다. Codex 시험은 실제 TUI의 고정 수신 안내·원래 문맥·화면 출력을 검사하고 receipt/reply는
-모의 MCP 호스트가 수행한다. Claude 시험은 모의 모델이 실제 MCP 도구와 Monitor를 호출해
-전체 전달 경로를 거친다. 모의 API에는 기능 플래그 서비스가 없으므로 Claude fixture에
-Monitor 제공 상태를 명시한다. 제품 코드가 사용자 기능 플래그를 변경하는 것은 아니다.
+있다. 두 시험 모두 모의 모델이 실제 호스트의 MCP 도구를 호출해 활성화·receipt·reply를
+수행한다. 원래 문맥 유지, 단일 JOIN, ACK와 상관 ID/hops를 검증한다. Codex fixture는
+모의 MCP의 세 도구에 대해 호스트의 일반 “현재 세션 허용” 확인을 처리한다. 실제 환경의
+도구 승인은 사용자가 정한 정책을 따른다. `approval_policy=never`로 미승인 MCP 도구를
+차단한 환경에서 이를 우회하지 않는다.
+
+Claude 모의 API에는 기능 플래그 서비스가 없으므로 fixture에 Monitor 제공 상태를
+명시한다. 제품 코드가 사용자 기능 플래그를 변경하는 것은 아니다.
 
 Claude Monitor의 공개 계약: [도구 참조](https://code.claude.com/docs/en/tools-reference),
 [SDK 도구 스키마](https://code.claude.com/docs/en/agent-sdk/python).

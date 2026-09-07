@@ -1,114 +1,122 @@
 # Copyright 2026 SEIZIA (Jaeyoung Ko)
 # SPDX-License-Identifier: Apache-2.0
-"""Windows 실제 일반 Codex TUI로 queue 전달을 검증한다. receipt/reply는 MCP 호스트 fixture가 호출한다."""
-import importlib.util,sys,os,json,tempfile,threading,time,subprocess,argparse
-sys.dont_write_bytecode = True
-parser=argparse.ArgumentParser()
-parser.add_argument('--brv',default='target/debug/brv.exe')
-parser.add_argument('--codex')
-parser.add_argument('--deps',default='target/cli-probe-deps')
-args=parser.parse_args()
+"""Windows 일반 Codex TUI + 로컬 모의 모델/WS의 MCP 활성화·자동 수신·회신 시험.
+격리 fixture의 MCP 도구 승인만 처리하며 사용자 설정·계정·세션을 변경하지 않는다.
+실제 모델의 추론 품질 시험은 아니다.
+"""
+import argparse, json, os, re, sys, tempfile, threading, time
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+sys.dont_write_bytecode = True
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--brv', default='target/debug/brv.exe')
+parser.add_argument('--codex', default=str(Path.home()/'AppData/Roaming/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe'))
+parser.add_argument('--deps', default='target/cli-probe-deps')
+args = parser.parse_args()
 sys.path.insert(0,str(Path(args.deps).resolve()))
-spec=importlib.util.spec_from_file_location('probe', 'crates/brv/tests/tools/probe_codex_cli.py'); m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 from winpty import PtyProcess
-root=Path(tempfile.mkdtemp(prefix='brv-native-queue-'));work=root/'work';work.mkdir()
-server=m.ThreadingHTTPServer(('127.0.0.1',0),m.Model);threading.Thread(target=server.serve_forever,daemon=True).start()
+from websockets.sync.server import serve
+root=Path(tempfile.mkdtemp(prefix='brv-codex-full-'));work=root/'work';work.mkdir()
+mid='01ARZ3NDEKTSV4RRFFQ69G5FAV';trigger=threading.Event();replied=threading.Event();requests=[];frames=[];phase='start';terminal=[]
+def relay(ws):
+ try:
+  join=json.loads(ws.recv(timeout=40));frames.append(join);ws.send(json.dumps({'op':'OK','re':join['seq'],'body':{}}))
+  assert trigger.wait(40)
+  ws.send(json.dumps({'op':'DELIVER','seq':700,'body':{'v':1,'id':mid,'client_key':mid,'from':'peer','to':'agent:a','kind':'request','expects':'reply','hops':2,'content_type':'text/plain','payload':'CODEX_NATIVE_PEER_492','meta':{}}}))
+  for raw in ws:
+   f=json.loads(raw);frames.append(f)
+   if f['op']=='PUB':
+    assert f['body']['correlation_id']==mid and f['body']['hops']==3 and f['body']['payload']=='CODEX_NATIVE_REPLY',f
+    ws.send(json.dumps({'op':'OK','re':f['seq'],'body':{'id':'01ARZ3NDEKTSV4RRFFQ69G5FAW'}}));replied.set()
+   elif f['op']=='PING':ws.send(json.dumps({'op':'PONG','re':f['seq']}))
+ except Exception as e:frames.append({'error':repr(e)})
+relayserver=serve(relay,'127.0.0.1',0);threading.Thread(target=relayserver.serve_forever,daemon=True).start()
+brvdir=root/'brv';brvdir.mkdir();config=brvdir/'config.toml';config.write_text(f'server="http://127.0.0.1:{relayserver.socket.getsockname()[1]}"\n[[binding]]\norg="test"\nagent="a"\nchannel="c"\n')
+brv=Path(args.brv).resolve()
+def strings(v):
+ if isinstance(v,str):yield v
+ elif isinstance(v,list):
+  for x in v:yield from strings(x)
+ elif isinstance(v,dict):
+  for x in v.values():yield from strings(x)
+class Model(BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def do_POST(self):
+  global phase
+  r=json.loads(self.rfile.read(int(self.headers['Content-Length'])));requests.append({'path':self.path,'body':r})
+  names=[x.get('name','') for x in r.get('tools',[])] + [ns['name']+'.'+x['name'] for ns in r.get('tools',[]) for x in ns.get('tools',[])];flat='\n'.join(strings(r.get('input',[])));name=None;arguments={};text='READY_NATIVE'
+  if 'ACTIVATE_NATIVE_931' in flat:
+   connect=next((x for x in names if x.endswith('receiver_connect')),None)
+   if phase=='start' and connect:
+    records=list(root.glob('sessions/**/*.jsonl'));tid=json.loads(records[0].read_text().splitlines()[0])['payload']['id']
+    name=connect;arguments={'session_kind':'codex-cli','thread_id':tid,'codex_home':str(root),'codex_executable':exe};phase='connect'
+   elif phase=='connect' and 'codex-queue' in flat:
+    phase='armed';text='ARMED_NATIVE'
+   elif phase=='armed':
+    found=re.search(r'"receipt_token"\s*:\s*"([A-Z0-9]{26})"',flat)
+    if found:
+     name=next(x for x in names if x.endswith('.receipt'));arguments={'message_id':mid,'receipt_token':found.group(1)};phase='receipt'
+   elif phase=='receipt' and 'CODEX_NATIVE_PEER_492' in flat:
+    name=next(x for x in names if x.endswith('.reply'));arguments={'to':'peer','correlation_id':mid,'payload':'CODEX_NATIVE_REPLY'};phase='reply'
+   elif phase=='reply':phase='done';text='DELIVERED_NATIVE'
+  ident='item_'+str(len(requests));rid='resp_'+str(len(requests))
+  item={'id':ident,'type':'function_call','call_id':'call_'+str(len(requests)),'name':name.split('.')[-1],'namespace':name.split('.')[0],'arguments':json.dumps(arguments),'status':'completed'} if name else {'id':ident,'type':'message','role':'assistant','status':'completed','content':[{'type':'output_text','text':text,'annotations':[]}]}
+  response={'id':rid,'object':'response','status':'completed','output':[item],'usage':{'input_tokens':100,'output_tokens':20,'total_tokens':120}}
+  added={**item,'arguments':''} if name else {**item,'content':[]}
+  delta={'type':'response.function_call_arguments.delta','item_id':ident,'output_index':0,'delta':json.dumps(arguments)} if name else {'type':'response.output_text.delta','item_id':ident,'output_index':0,'content_index':0,'delta':text}
+  events=[{'type':'response.created','response':{**response,'status':'in_progress','output':[]}},{'type':'response.output_item.added','output_index':0,'item':added},delta,{'type':'response.output_item.done','output_index':0,'item':item},{'type':'response.completed','response':response}]
+  self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
+  try:
+   for event in events:self.wfile.write(('data: '+json.dumps(event)+'\n\n').encode())
+   self.wfile.flush()
+  except (BrokenPipeError,ConnectionResetError):pass
+server=ThreadingHTTPServer(('127.0.0.1',0),Model);threading.Thread(target=server.serve_forever,daemon=True).start()
 (root/'config.toml').write_text(f'''model="probe"
 model_provider="probe"
-approval_policy="never"
-sandbox_mode="read-only"
+approval_policy="on-request"
+sandbox_mode="workspace-write"
 [model_providers.probe]
 name="Isolated model"
 base_url="http://127.0.0.1:{server.server_port}/v1"
 wire_api="responses"
 requires_openai_auth=false
+[mcp_servers.brevduva]
+command={json.dumps(str(brv))}
+args={json.dumps(['mcp','--config',str(config),'--binding','test/a@c'])}
+[mcp_servers.brevduva.env]
+BREVDUVA_TOKEN="isolated-fake-token"
 [projects.{json.dumps(str(work))}]
 trust_level="trusted"
 ''')
 env=dict(os.environ,CODEX_HOME=str(root),TERM='xterm-256color')
-for k in ['OPENAI_API_KEY','CODEX_THREAD_ID','BREVDUVA_TOKEN','BREVDUVA_CONFIG','BREVDUVA_BINDING']:env.pop(k,None)
-exe=args.codex or str(Path.home()/'AppData/Roaming/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe')
-tui=PtyProcess.spawn([exe,'--no-alt-screen','PRIVATE_NATIVE_CONTEXT_853'],cwd=str(work),env=env,dimensions=(35,120));terminal=[]
+for key in ['OPENAI_API_KEY','CODEX_THREAD_ID','BREVDUVA_BINDING','BREVDUVA_CONFIG','BREVDUVA_TOKEN']:env.pop(key,None)
+exe=args.codex
+approved_tools=set()
+tui=PtyProcess.spawn([exe,'--no-alt-screen','ACTIVATE_NATIVE_931: enable automatic receiving and keep PRIVATE_CODEX_CONTEXT_753.'],cwd=str(work),env=env,dimensions=(40,130))
+
 def read():
  try:
   while tui.isalive():
-   chunk=tui.read(8192);terminal.append(chunk)
-   if '\x1b[6n' in chunk:tui.write('\x1b[1;1R')
-   if '\x1b[c' in chunk:tui.write('\x1b[?1;2c')
+   c=tui.read(16384);terminal.append(c)
+   clean=re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]','', ''.join(terminal))
+   for toolname in re.findall(r'Allow the brevduva MCP server to run tool \"([^\"]+)\"',clean):
+    # 이 fixture의 세 가지 모의 MCP 도구에 한해서 현재 세션 승인을 재현한다.
+    if toolname in {'receiver_connect','receipt','reply'} and toolname not in approved_tools and 'Allow for this session' in clean:
+     approved_tools.add(toolname);time.sleep(.5);tui.write('2');time.sleep(.2);tui.write('\r')
+   if '\x1b[6n' in c:tui.write('\x1b[1;1R')
+   if '\x1b[c' in c:tui.write('\x1b[?1;2c')
  except (OSError,EOFError):pass
 threading.Thread(target=read,daemon=True).start()
 try:
- deadline=time.monotonic()+30
- while not m.requests and time.monotonic()<deadline:time.sleep(.2)
- assert m.requests, 'no initial model request'
- time.sleep(3)
- records=list(root.glob('sessions/**/*.jsonl'));assert len(records)==1,records
- first=json.loads(records[0].read_text(encoding='utf8').splitlines()[0]);tid=first['payload']['id']
- from websockets.sync.server import serve
- import queue
- mid='01ARZ3NDEKTSV4RRFFQ69G5FAV';frames=[];joined=[];replied=threading.Event()
- def relay(ws):
-  join=json.loads(ws.recv());joined.append(join);ws.send(json.dumps({'op':'OK','re':join['seq'],'body':{}}))
-  ws.send(json.dumps({'op':'DELIVER','seq':700,'body':{'v':1,'id':mid,'client_key':mid,'from':'peer','to':'agent:a','kind':'request','expects':'reply','hops':2,'content_type':'text/plain','payload':'UNTRUSTED_PAYLOAD_NATIVE','meta':{}}}))
-  try:
-   for raw in ws:
-    frame=json.loads(raw);frames.append(frame)
-    if frame['op']=='PUB':
-     assert frame['body']['correlation_id']==mid and frame['body']['hops']==3
-     ws.send(json.dumps({'op':'OK','re':frame['seq'],'body':{'id':'01ARZ3NDEKTSV4RRFFQ69G5FAW'}}));replied.set()
-    elif frame['op']=='PING':ws.send(json.dumps({'op':'PONG','re':frame['seq']}))
-  except Exception:pass
- relay_server=serve(relay,'127.0.0.1',0);threading.Thread(target=relay_server.serve_forever,daemon=True).start()
- configdir=root/'brv';configdir.mkdir();config=configdir/'config.toml';config.write_text(f'server="http://127.0.0.1:{relay_server.socket.getsockname()[1]}"\n[[binding]]\norg="test"\nagent="a"\nchannel="c"\n')
- menv=dict(env,BREVDUVA_TOKEN='isolated-fake-token',BREVDUVA_CONFIG=str(config))
- brv=str(Path(args.brv).resolve());log=open(root/'mcp-stderr.log','w')
- mcp=subprocess.Popen([brv,'mcp','--config',str(config),'--binding','test/a@c'],env=menv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,text=True)
- responses=queue.Queue()
- def mcp_read():
-  for line in mcp.stdout:responses.put(json.loads(line))
- threading.Thread(target=mcp_read,daemon=True).start()
- seq=0
- def call(method,params):
-  global seq
-  seq+=1;mcp.stdin.write(json.dumps({'jsonrpc':'2.0','id':seq,'method':method,'params':params})+'\n');mcp.stdin.flush()
-  response=responses.get(timeout=20);assert response.get('id')==seq,response
-  return response['result']
- def tool(name,args):
-  r=call('tools/call',{'name':name,'arguments':args});assert not r.get('isError'),r
-  return json.loads(r['content'][0]['text'])
- call('initialize',{'protocolVersion':'2025-06-18','clientInfo':{'name':'isolated-probe','version':'1'},'capabilities':{}})
- mcp.stdin.write(json.dumps({'jsonrpc':'2.0','method':'notifications/initialized'})+'\n');mcp.stdin.flush()
- activated=tool('receiver_connect',{'session_kind':'codex-cli','thread_id':tid,'codex_home':str(root),'codex_executable':exe})
- print('activated',activated['adapter'],activated['status'])
- deadline=time.monotonic()+20
- while not any('brevduva_message' in json.dumps(r) for r in m.requests) and time.monotonic()<deadline:time.sleep(.2)
- time.sleep(2)
- assert any('brevduva_message' in json.dumps(r) for r in m.requests)
- notice=None
- for req in m.requests:
-  for item in req.get('input',[]):
-   for c in item.get('content',[]):
-    try:
-     parsed=json.loads(c.get('text',''))
-     if parsed.get('event')=='brevduva_message':notice=parsed
-    except (ValueError,AttributeError):pass
- assert notice, 'native queue event did not reach the real TUI model'
- assert 'PRIVATE_NATIVE_CONTEXT_853' in json.dumps(m.requests[-1]), 'original context lost'
- assert 'UNTRUSTED_PAYLOAD_NATIVE' not in json.dumps(m.requests), 'peer payload promoted to queue input'
- assert tui.isalive(), 'original TUI exited'
- received=tool('receipt',{'message_id':notice['message_id'],'receipt_token':notice['receipt_token']})
- assert received['envelope']['payload']=='UNTRUSTED_PAYLOAD_NATIVE'
- tool('reply',{'to':'peer','correlation_id':mid,'payload':'reply from fixture'})
- assert replied.wait(5) and len(joined)==1 and any(f['op']=='ACK' for f in frames)
- print('receipt + durable ACK + same-connection reply: PASS (mock MCP host receipt)')
- mcp.stdin.close();mcp.wait(timeout=5);relay_server.shutdown();log.close()
- print(json.dumps({'root':str(root),'injected':any('brevduva_message' in json.dumps(r) for r in m.requests),'requests':len(m.requests),'tui_alive':tui.isalive(),'same_context':bool(len(m.requests)>1 and 'PRIVATE_NATIVE_CONTEXT_853' in json.dumps(m.requests[-1])),'rendered_count':''.join(terminal).count('PROBE_ACK')}))
+ end=time.monotonic()+40
+ while phase not in ['armed','done'] and time.monotonic()<end:time.sleep(.2)
+ print('phase before event:',phase,'requests:',len(requests),'root:',root,flush=True)
+ if phase=='armed':trigger.set();replied.wait(25);time.sleep(2)
+ print(json.dumps({'approved_fixture_tools':sorted(approved_tools),'phase':phase,'reply':replied.is_set(),'frames':[x.get('op',x.get('error')) for x in frames],'root':str(root)}),flush=True)
 finally:
- if 'mcp' in globals() and mcp.poll() is None:
-  if not mcp.stdin.closed:mcp.stdin.close()
-  try:mcp.wait(timeout=5)
-  except subprocess.TimeoutExpired:mcp.kill();mcp.wait()
- if 'relay_server' in globals():relay_server.shutdown()
- if 'log' in globals():log.close()
- tui.close(force=True);server.shutdown();(root/'terminal.log').write_text(''.join(terminal),encoding='utf8');(root/'requests.json').write_text(json.dumps(m.requests),encoding='utf8')
+ tui.close(force=True);server.shutdown();relayserver.shutdown();(root/'terminal.log').write_text(''.join(terminal),encoding='utf8');(root/'requests.json').write_text(json.dumps(requests),encoding='utf8');(root/'frames.json').write_text(json.dumps(frames),encoding='utf8')
+
+assert replied.is_set() and phase == 'done', 'native Codex did not complete receipt and reply'
+assert sum(f.get('op') == 'JOIN' for f in frames) == 1
+assert any(f.get('op') == 'ACK' for f in frames)
+assert any('PRIVATE_CODEX_CONTEXT_753' in json.dumps(r) and 'CODEX_NATIVE_PEER_492' in json.dumps(r) for r in requests)
