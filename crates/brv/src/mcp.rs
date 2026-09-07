@@ -23,6 +23,13 @@ const MAX_WAIT_S: u64 = 120;
 /// 어댑터 정직성 규약 (13.4): 발행 확인을 이 시간까지만 기다린다.
 const PUBLISH_CONFIRM_S: u64 = 10;
 
+struct CodexSetup {
+    endpoint: String,
+    token_env: Option<String>,
+    path: std::path::PathBuf,
+    identity: crate::delivery::Identity,
+}
+
 pub struct McpServer {
     opts: ClientOptions,
     /// 이 MCP 프로세스를 띄운 러너 id — 등록 시 `--host`로 받은 값 (2026-09-05, 1단계). 추측하지
@@ -36,6 +43,8 @@ pub struct McpServer {
     /// 전달한 메시지의 hops 기록 — 반응 메시지(reply/ack/report)의 hops+1 계산용 (3.3).
     hops_by_id: HashMap<String, u32>,
     channel: Option<std::sync::Arc<tokio::sync::Mutex<crate::claude_channel::Channel>>>,
+    codex_target: Option<crate::codex_cli::Target>,
+    codex_setup: Option<CodexSetup>,
 }
 
 impl McpServer {
@@ -46,6 +55,8 @@ impl McpServer {
             client: None,
             hops_by_id: HashMap::new(),
             channel: None,
+            codex_target: None,
+            codex_setup: None,
         }
     }
 
@@ -72,6 +83,7 @@ impl McpServer {
         let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
         let mut lines = reader.lines();
         let mut pump: Option<tokio::task::JoinHandle<()>> = None;
+        let mut initialized = false;
         let outcome = async {
             while let Some(line) = lines.next_line().await? {
                 if line.trim().is_empty() {
@@ -81,7 +93,7 @@ impl McpServer {
                     tracing::warn!("unparsable jsonrpc line");
                     continue;
                 };
-                let initialized = request["method"] == "notifications/initialized";
+                initialized |= request["method"] == "notifications/initialized";
                 if let Some(response) = self.dispatch(request).await {
                     crate::claude_channel::write_json(&writer, &response).await?;
                 }
@@ -91,11 +103,17 @@ impl McpServer {
                 {
                     let client = self.ensure_client();
                     let writer = writer.clone();
+                    let target = self.codex_target.clone();
                     pump = Some(tokio::spawn(async move {
-                        if let Err(error) =
+                        let connection = client.clone();
+                        let result = if let Some(target) = target {
+                            crate::codex_cli::pump(channel.clone(), client, target).await
+                        } else {
                             crate::claude_channel::pump(channel.clone(), client, writer).await
-                        {
-                            tracing::error!(%error, "Claude channel delivery stopped");
+                        };
+                        if let Err(error) = result {
+                            connection.stop();
+                            tracing::error!(%error, "session delivery stopped");
                             channel.lock().await.error = Some(error.to_string());
                         }
                     }));
@@ -139,9 +157,9 @@ impl McpServer {
                     .to_owned();
                 respond(json!({
                     "protocolVersion": if self.channel.is_some() {"2025-06-18"} else {&requested},
-                    "capabilities": if self.channel.is_some() {json!({"tools":{},"experimental":{"claude/channel":{}}})} else {json!({"tools":{}})},
+                    "capabilities": if self.channel.is_some() && self.codex_target.is_none() {json!({"tools":{},"experimental":{"claude/channel":{}}})} else {json!({"tools":{}})},
                     "serverInfo": { "name": "brv", "version": env!("CARGO_PKG_VERSION"), "host": self.host },
-                    "instructions": if self.channel.is_some() {crate::claude_channel::INSTRUCTIONS} else {INSTRUCTIONS},
+                    "instructions": if self.codex_setup.is_some() {crate::codex_cli::INSTRUCTIONS} else if self.channel.is_some() {crate::claude_channel::INSTRUCTIONS} else {INSTRUCTIONS},
                 }))
             }
             "notifications/initialized" | "notifications/cancelled" => None,
@@ -149,11 +167,11 @@ impl McpServer {
             "tools/list" => {
                 // 리시버 관리 도구(2026-09-04)는 유인 세션에만 보인다 — 깨어난 세션은 존재도 모른다
                 let mut tools = tool_definitions();
-                if self.channel.is_some() && let Some(list) = tools.as_array_mut() {
+                if (self.channel.is_some() || self.codex_setup.is_some()) && let Some(list) = tools.as_array_mut() {
                     list.retain(|tool| !matches!(tool["name"].as_str(), Some("wait_for_message" | "wait_for_reply")));
                     for tool in list.iter_mut() {
                         if tool["name"] == "request" {
-                            tool["description"] = json!("Ask a peer without waiting. Reply arrives as a channel notification with the original correlation_id.");
+                            tool["description"] = json!("Ask a peer without waiting. Reply arrives through this session's delivery adapter with the original correlation_id.");
                         }
                     }
                     list.extend(crate::claude_channel::tools());
@@ -162,6 +180,12 @@ impl McpServer {
                     && let Some(list) = tools.as_array_mut()
                 {
                     list.extend(crate::manage::tool_definitions());
+                    if self.channel.is_some() || self.codex_setup.is_some() {
+                        list.retain(|tool| !matches!(tool["name"].as_str(), Some("receiver_connect" | "receiver_connection")));
+                    }
+                    if self.codex_setup.is_some() {
+                        list.push(json!({"name":"receiver_connect","description":"Connect THIS CLI task to the configured shared app-server. Read CODEX_THREAD_ID from this task's own shell and pass it as thread_id. Never use MCP environment, a recent task, or a guessed ID. No Desktop worker or new task is created. Requires the user to have requested connection.","inputSchema":{"type":"object","properties":{"thread_id":{"type":"string"}},"required":["thread_id"]}}));
+                    }
                 }
                 respond(json!({ "tools": tools }))
             }
@@ -294,7 +318,75 @@ impl McpServer {
     }
 
     async fn call_tool(&mut self, name: &str, args: &Value) -> (Value, bool) {
+        if name == "receiver_connect" && self.codex_setup.is_some() {
+            if !matches!(
+                crate::manage::attendance(),
+                crate::manage::Attendance::Attended
+            ) {
+                return (
+                    json!({"status":"refused","message":"CLI binding requires an attended session"}),
+                    true,
+                );
+            }
+            return match self
+                .activate_codex(args["thread_id"].as_str().unwrap_or_default())
+                .await
+            {
+                Ok(()) => (
+                    self.channel
+                        .as_ref()
+                        .expect("activated")
+                        .lock()
+                        .await
+                        .status(),
+                    false,
+                ),
+                Err(error) => (json!({"status":"error","message":error.to_string()}), true),
+            };
+        }
+        if name == "receiver_session_status" {
+            let delivery = if let Some(channel) = &self.channel {
+                channel.lock().await.status()
+            } else {
+                json!({"adapter":if self.codex_setup.is_some() {"codex-cli-awaiting-target"} else {"tool-calls"},"automatic_delivery":false,"host_activation":"unverified",
+                    "note":"MCP tools are available; this does not start idle CLI turns. Saved Desktop worker state is separate. Claude requires Channels startup; Codex CLI requires a configured shared app-server target."})
+            };
+            return (
+                json!({"mcp":"ready","transport":"stdio","server_connection":"not_checked","agent":self.opts.agent,"channel":self.opts.channel,"delivery":delivery}),
+                false,
+            );
+        }
+        if self.codex_setup.is_some() && self.channel.is_none() {
+            return (
+                json!({"status":"awaiting_target","message":"Use receiver_session_status and receiver_connect with this task's shell CODEX_THREAD_ID first"}),
+                true,
+            );
+        }
         if let Some(channel) = self.channel.clone() {
+            if name == "channel_pause" {
+                if !matches!(
+                    crate::manage::attendance(),
+                    crate::manage::Attendance::Attended
+                ) {
+                    return (
+                        json!({"status":"refused","message":"pause/resume requires an attended operator"}),
+                        true,
+                    );
+                }
+                return match args["paused"].as_bool() {
+                    Some(paused) => (channel.lock().await.pause(paused), false),
+                    None => (
+                        json!({"status":"error","message":"paused must be a boolean"}),
+                        true,
+                    ),
+                };
+            }
+            if matches!(name, "receiver_connect" | "receiver_connection") {
+                return (
+                    json!({"status":"refused","message":"This session owns its delivery adapter. Use receiver_session_status/channel_status; do not connect or control a Desktop worker."}),
+                    true,
+                );
+            }
             if name == "receipt" {
                 let result = channel.lock().await.receipt(
                     args["message_id"].as_str().unwrap_or_default(),
@@ -586,6 +678,11 @@ pub fn bool_arg(args: &Value, key: &str) -> bool {
 fn tool_definitions() -> Value {
     json!([
         {
+            "name":"receiver_session_status",
+            "description":"Inspect THIS MCP mode and selected identity without joining or consuming messages. Distinguishes tool access from automatic delivery; saved Desktop connections are separate.",
+            "inputSchema":{"type":"object","properties":{}}
+        },
+        {
             "name": "list_channels",
             "description": "List the channels this agent is granted access to, plus the current session channel. Read-only discovery (does not join anything). Peers in other listed channels are reachable only after switching the configured channel — tools always operate on the current channel.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -679,6 +776,59 @@ fn tool_definitions() -> Value {
 }
 
 /// 진입점 — 설정된 정체성으로 접속해 stdio MCP를 돌린다.
+pub fn session_setup(
+    runner: &str,
+    executable: &std::path::Path,
+    config: &std::path::Path,
+    binding: &str,
+    endpoint: Option<&str>,
+) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        executable.is_absolute() && config.is_absolute(),
+        "absolute executable and config paths required"
+    );
+    let mut args = vec![
+        "mcp".to_owned(),
+        "--config".into(),
+        config.to_string_lossy().into_owned(),
+        "--binding".into(),
+        binding.into(),
+    ];
+    let startup = match runner {
+        "claude" => {
+            anyhow::ensure!(
+                endpoint.is_none(),
+                "Claude Channels does not use a Codex endpoint"
+            );
+            args.push("--claude-channel".into());
+            json!([[
+                "claude",
+                "--dangerously-load-development-channels",
+                "server:brevduva"
+            ]])
+        }
+        "codex" => {
+            let endpoint = endpoint.ok_or_else(|| {
+                anyhow::anyhow!("--endpoint is required for Codex shared-runtime setup")
+            })?;
+            crate::codex_cli::Target::new(endpoint, "00000000-0000-0000-0000-000000000001", None)?;
+            args.extend(["--codex-cli-endpoint".into(), endpoint.into()]);
+            json!([
+                ["codex", "app-server", "--listen", endpoint],
+                ["codex", "--remote", endpoint]
+            ])
+        }
+        _ => anyhow::bail!("unsupported session runner"),
+    };
+    let entry = json!({"command":executable,"args":args});
+    let toml = toml::to_string(&json!({"mcp_servers":{"brevduva":entry}}))?;
+    Ok(
+        json!({"runner":runner,"binding":binding,"mcp_json":{"mcpServers":{"brevduva":entry}},"codex_toml":if runner == "codex" {Some(toml)} else {None},"startup_argv":startup,
+        "notes":["Merge only the intended MCP entry into an explicit test profile; existing remote MCP entries are not changed by this command.","Stop competing receivers on this binding before starting. MCP transport authentication is local; Brevduva uses its stored token.",if runner == "codex" {"Start the app-server with this configuration, then the TUI with --remote. In that TUI ask receiver_connect to use CODEX_THREAD_ID read from its own shell. Plain codex does not attach to this endpoint."} else {"Claude must accept the Channels startup settings. Development confirmation and organization policy remain with the user. Ordinary MCP startup alone does not enable Channels."}]}),
+    )
+}
+
+/// 진입점 — 설정된 정체성으로 접속해 stdio MCP를 돌린다.
 pub async fn run_stdio(opts: ClientOptions, host: Option<String>) -> anyhow::Result<()> {
     McpServer::new(opts, host).run().await
 }
@@ -694,19 +844,147 @@ pub async fn run_claude_channel(
         .await
 }
 
+impl McpServer {
+    async fn activate_codex(&mut self, thread: &str) -> anyhow::Result<()> {
+        if let Some(target) = &self.codex_target {
+            anyhow::ensure!(
+                target.thread() == thread,
+                "MCP already belongs to another task; restart with an explicitly selected target rather than replacing it"
+            );
+            return Ok(());
+        }
+        let setup = self
+            .codex_setup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Codex endpoint not configured"))?;
+        let target =
+            crate::codex_cli::Target::new(&setup.endpoint, thread, setup.token_env.clone())?;
+        target.check().await?;
+        let parent = setup
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("journal directory missing"))?;
+        std::fs::create_dir_all(parent)?;
+        crate::config::restrict_dir(parent)?;
+        let channel =
+            crate::claude_channel::Channel::for_codex(&setup.path, setup.identity.clone(), thread)?;
+        self.channel = Some(std::sync::Arc::new(tokio::sync::Mutex::new(channel)));
+        self.codex_target = Some(target);
+        Ok(())
+    }
+}
+
+/// 준비 시에는 작업을 추정하지 않는다. receiver_connect로 실제 호스트를 확인한 뒤 수신한다.
+pub async fn run_codex_cli(
+    mut opts: ClientOptions,
+    cfg: &crate::config::BrvConfig,
+    binding: &crate::config::Binding,
+    endpoint: &str,
+    thread: Option<&str>,
+    token_env: Option<String>,
+) -> anyhow::Result<()> {
+    opts.idle_park = None;
+    opts.takeover_standby = true;
+    let mut server = McpServer::new(opts, Some("codex".into()));
+    server.codex_setup = Some(CodexSetup {
+        endpoint: endpoint.into(),
+        token_env,
+        path: crate::delivery::journal_path(binding, "codex-cli")?,
+        identity: crate::delivery::Identity {
+            server: cfg.server.clone(),
+            binding: binding.full_label(),
+        },
+    });
+    if let Some(thread) = thread {
+        server.activate_codex(thread).await?;
+    }
+    server.run().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
 
     #[tokio::test]
+    async fn session_status_does_not_join_or_claim_automatic_readiness() {
+        let mut server = McpServer::new(
+            ClientOptions::new("http://127.0.0.1:1", "c", "a", "fake"),
+            Some("codex".into()),
+        );
+        let (status, error) = server
+            .call_tool("receiver_session_status", &json!({}))
+            .await;
+        assert!(!error);
+        assert_eq!(status["delivery"]["automatic_delivery"], false);
+        assert!(server.client.is_none());
+        server.codex_setup = Some(CodexSetup {
+            endpoint: "ws://127.0.0.1:1".into(),
+            token_env: None,
+            path: std::env::temp_dir().join("unused-brv-status-journal"),
+            identity: crate::delivery::Identity {
+                server: "test".into(),
+                binding: "a@c".into(),
+            },
+        });
+        let (status, error) = server
+            .call_tool("receiver_session_status", &json!({}))
+            .await;
+        assert!(!error);
+        assert_eq!(status["delivery"]["adapter"], "codex-cli-awaiting-target");
+        assert!(
+            server
+                .call_tool("send", &json!({"to":"peer","payload":"do not send"}))
+                .await
+                .1
+        );
+        assert!(server.client.is_none());
+        assert!(server.channel.is_none());
+    }
+
+    #[test]
+    fn session_setup_pins_mode_and_emits_parseable_configuration() {
+        let executable = std::env::current_exe().unwrap();
+        let config = std::env::temp_dir().join("test config.toml");
+        let claude = session_setup("claude", &executable, &config, "org/a@c", None).unwrap();
+        assert!(
+            claude["mcp_json"]["mcpServers"]["brevduva"]["args"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("--claude-channel"))
+        );
+        assert!(session_setup("codex", &executable, &config, "org/a@c", None).is_err());
+        let codex = session_setup(
+            "codex",
+            &executable,
+            &config,
+            "org/a@c",
+            Some("ws://127.0.0.1:12345"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(codex["codex_toml"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["brevduva"]["command"].as_str(),
+            executable.to_str()
+        );
+        assert_eq!(codex["startup_argv"][1][1], "--remote");
+    }
+
+    #[tokio::test]
     async fn channel_stdio_receives_durably_and_replies_on_one_connection() {
-        tokio::time::timeout(Duration::from_secs(10), channel_roundtrip())
+        tokio::time::timeout(Duration::from_secs(10), channel_roundtrip(false))
             .await
             .unwrap();
     }
 
-    async fn channel_roundtrip() {
+    #[tokio::test]
+    async fn codex_cli_stdio_delivers_tool_output_and_replies_on_one_connection() {
+        tokio::time::timeout(Duration::from_secs(10), channel_roundtrip(true))
+            .await
+            .unwrap();
+    }
+
+    async fn channel_roundtrip(codex: bool) {
         use futures_util::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::Message;
         let dir = std::env::temp_dir().join(format!(
@@ -776,19 +1054,72 @@ mod tests {
                 }
             }
         });
-        let channel = crate::claude_channel::Channel::at(
-            &path,
-            crate::delivery::Identity {
-                server: server_url.clone(),
-                binding: "a@c".into(),
-            },
-        )
-        .unwrap();
+        const THREAD: &str = "00000000-0000-0000-0000-000000000001";
+        let identity = crate::delivery::Identity {
+            server: server_url.clone(),
+            binding: "a@c".into(),
+        };
+        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let mut rpc_task = None;
         let mut mcp = McpServer::new(
             ClientOptions::new(&server_url, "c", "a", "fake-test-token"),
-            Some("claude".into()),
+            Some(if codex { "codex" } else { "claude" }.into()),
         );
-        mcp.channel = Some(std::sync::Arc::new(tokio::sync::Mutex::new(channel)));
+        if codex {
+            let endpoint = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", endpoint.local_addr().unwrap());
+            mcp.codex_setup = Some(CodexSetup {
+                endpoint: url,
+                token_env: None,
+                path: path.clone(),
+                identity,
+            });
+            rpc_task = Some(tokio::spawn(async move {
+                // 연결 확인용 접속과 pump 전달용 접속을 각각 검증한다.
+                for _ in 0..2 {
+                    let (stream, _) = endpoint.accept().await.unwrap();
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let result = match request["method"].as_str().unwrap() {
+                            "initialized" => continue,
+                            "initialize" => json!({}),
+                            "thread/loaded/list" => json!({"data":[THREAD],"nextCursor":null}),
+                            "thread/read" => {
+                                json!({"thread":{"id":THREAD,"status":{"type":"idle"}}})
+                            }
+                            "turn/start" => {
+                                assert_eq!(request["params"]["threadId"], THREAD);
+                                assert_eq!(request["params"]["input"], json!([]));
+                                assert!(request["params"].get("approvalPolicy").is_none());
+                                let delivered: Value = serde_json::from_str(
+                                    request["params"]["toolOutput"]["output"].as_str().unwrap(),
+                                )
+                                .unwrap();
+                                delivered_tx.send(delivered).unwrap();
+                                json!({"turn":{"id":"turn-test"}})
+                            }
+                            other => panic!("unexpected mutation: {other}"),
+                        };
+                        if ws
+                            .send(Message::Text(
+                                json!({"id":request["id"],"result":result})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }));
+        } else {
+            mcp.channel = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::claude_channel::Channel::at(&path, identity).unwrap(),
+            )));
+        }
         let (host_input, server_input) = tokio::io::duplex(4096);
         let (server_output, host_output) = tokio::io::duplex(4096);
         let mut input = host_input;
@@ -797,11 +1128,15 @@ mod tests {
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-06-18\"}}\n").await.unwrap();
         let init: Value =
             serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
-        assert!(
+        assert_eq!(
+            init["result"]["protocolVersion"],
+            if codex { "2026-06-18" } else { "2025-06-18" }
+        );
+        assert_eq!(
             init["result"]["capabilities"]["experimental"]
                 .get("claude/channel")
-                .is_some()
+                .is_some(),
+            !codex
         );
         input
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/list\"}\n")
@@ -819,11 +1154,24 @@ mod tests {
             .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
             .await
             .unwrap();
-        let notification: Value =
-            serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(notification["method"], "notifications/claude/channel");
-        assert_eq!(notification["params"]["meta"]["message_id"], id);
-        let receipt = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"receipt","arguments":notification["params"]["meta"]}});
+        let meta = if codex {
+            let connect = json!({"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"receiver_connect","arguments":{"thread_id":THREAD}}});
+            input
+                .write_all(format!("{connect}\n").as_bytes())
+                .await
+                .unwrap();
+            let connected: Value =
+                serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(connected["result"]["isError"], false, "{connected}");
+            delivered_rx.recv().await.unwrap()["meta"].clone()
+        } else {
+            let notification: Value =
+                serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(notification["method"], "notifications/claude/channel");
+            notification["params"]["meta"].clone()
+        };
+        assert_eq!(meta["message_id"], id);
+        let receipt = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"receipt","arguments":meta}});
         input
             .write_all(format!("{receipt}\n").as_bytes())
             .await
@@ -842,6 +1190,9 @@ mod tests {
         drop(input);
         task.await.unwrap().unwrap();
         relay.await.unwrap();
+        if let Some(task) = rpc_task {
+            task.await.unwrap();
+        }
         let saved = crate::delivery::Journal::open(
             &path,
             crate::delivery::Identity {

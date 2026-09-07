@@ -13,6 +13,11 @@ macOS 실행은 아직 미검증이다.
 
 ## 에이전트의 실행 흐름
 
+아래 `brv connect` 흐름은 **Codex Desktop**에 적용한다. v0.6.34의 Codex CLI는
+공유 app-server를 명시한 MCP에서 `receiver_connect(thread_id=...)`를 사용한다.
+일반 CLI에서는 Desktop worker를 시작하지 않는다. [CLI 준비 절차](CODEX_CLI.md).
+Claude는 [Channels 시작 설정](CLAUDE_CHANNEL.md)을 사용하며 connect를 실행하지 않는다.
+
 1. 사용자가 수신 주소를 지정했으면 그대로 사용한다. 바인딩이 하나면 자동 선택,
    여러 개이고 지정하지 않았다면 주소를 고른다. 작업 ID를 사용자에게 요구하지 않는다.
 2. 현재 작업의 셸에서 `brv connect --binding agent@channel`을 실행한다.
@@ -66,8 +71,8 @@ Desktop이 닫히면 수신 자리를 반납하고, 미확정 전송이 없으�
 불명확한 전송·디스크 오류는 자동 복구로 숨기지 않고 주의가 필요한 상태로 보인다.
 
 연결 설정은 유지되지만 OS 로그인 시 worker 자동 시작은 아직 포함하지 않는다.
-재부팅·worker 강제 종료 후에는 `connect` 또는 `resume`가 필요하다. CLI·Claude
-기존 실행체 연결, 대화 제목 조회, 작업 선택 UI, 취소 정책의 정교화도 후속 범위다.
+재부팅·worker 강제 종료 후에는 `connect` 또는 `resume`가 필요하다. 임의의 일반 CLI·Claude
+실행체 attach, 대화 제목 조회, 작업 선택 UI, 취소 정책의 정교화는 후속 범위다.
 
 Unix worker는 시작 시 `setsid`로 터미널에서 분리된다. macOS·Linux의 소켓 경로와
 사용자 소유권 검사 및 플랫폼 검증 범위는 [OS별 기록](PLATFORM_CONNECTION.md)에 정리했다.

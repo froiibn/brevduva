@@ -137,6 +137,15 @@ enum Cmd {
         /// Experimental Claude Code Channels mode; requires Channels enabled at Claude startup
         #[arg(long)]
         claude_channel: bool,
+        /// Experimental shared app-server delivery; requires the TUI to use this loopback endpoint
+        #[arg(long, conflicts_with = "claude_channel")]
+        codex_cli_endpoint: Option<String>,
+        /// Optional exact loaded thread UUID; otherwise connect using the session MCP tool
+        #[arg(long, requires = "codex_cli_endpoint")]
+        codex_cli_thread: Option<String>,
+        /// Environment variable containing the shared app-server bearer token (optional)
+        #[arg(long, requires = "codex_cli_endpoint")]
+        codex_cli_token_env: Option<String>,
         /// Binding for this session — required when multiple bindings exist (pin it in each project's .mcp.json)
         #[arg(long)]
         binding: Option<String>,
@@ -307,6 +316,14 @@ enum WakeCmd {
 /// 별개다(그건 바인딩당 하나, `brv wake set --runner`).
 #[derive(Subcommand)]
 enum McpCmd {
+    /// Print session-owned MCP configuration and startup instructions; never changes runner settings
+    Setup {
+        #[arg(long, value_parser = ["codex", "claude"])]
+        runner: String,
+        /// Shared local Codex app-server endpoint (required for Codex)
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
     /// Register the local `brv mcp` server in every agent runner detected on this machine
     Register {
         /// Only this runner (codex, claude, gemini, …) — default: all detected
@@ -609,6 +626,9 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Mcp {
             claude_channel,
+            codex_cli_endpoint,
+            codex_cli_thread,
+            codex_cli_token_env,
             binding,
             config,
             host,
@@ -620,14 +640,39 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
                 config::set_path_override(p);
             }
             match action {
+                Some(McpCmd::Setup { runner, endpoint }) => {
+                    let cfg = config::load()?;
+                    let selected = cfg.select(binding.as_deref())?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&brv::mcp::session_setup(
+                            &runner,
+                            &std::env::current_exe()?,
+                            &config::config_path()?,
+                            &selected.full_label(),
+                            endpoint.as_deref()
+                        )?)?
+                    );
+                    Ok(())
+                }
                 Some(McpCmd::Register { runner, dry_run }) => {
                     anyhow::ensure!(
-                        !claude_channel,
-                        "configure --claude-channel in the session-owned MCP entry, not mcp register"
+                        !claude_channel && codex_cli_endpoint.is_none(),
+                        "configure session delivery in the session-owned MCP entry, not mcp register"
                     );
                     mcp_register(&config::load()?, runner.as_deref(), dry_run)
                 }
-                None => mcp(binding.as_deref(), host, claude_channel).await,
+                None => {
+                    mcp(
+                        binding.as_deref(),
+                        host,
+                        claude_channel,
+                        codex_cli_endpoint,
+                        codex_cli_thread,
+                        codex_cli_token_env,
+                    )
+                    .await
+                }
             }
         }
         Cmd::Daemon { config, action } => match action {
@@ -1904,6 +1949,9 @@ async fn mcp(
     binding_sel: Option<&str>,
     host: Option<String>,
     claude_channel: bool,
+    codex_cli_endpoint: Option<String>,
+    codex_cli_thread: Option<String>,
+    codex_cli_token_env: Option<String>,
 ) -> anyhow::Result<()> {
     // 선택자 폴백: --binding → BREVDUVA_BINDING env — 데몬이 깨운 세션의 MCP가 "누가
     // 깨웠는지"를 이어받는 통로 (2026-09-02). 바인딩이 여럿인 머신에서도 깨운 세션이
@@ -1925,7 +1973,21 @@ async fn mcp(
     // lazy-JOIN과 같은 경로로 자리를 되찾는다
     opts.idle_park = Some(brv::client::DEFAULT_IDLE_PARK);
     tracing::info!(binding = %binding.label(), "brv mcp server on stdio");
-    if claude_channel {
+    if let Some(endpoint) = codex_cli_endpoint {
+        anyhow::ensure!(
+            host.as_deref().is_none_or(|h| h == "codex"),
+            "Codex CLI delivery requires the Codex host"
+        );
+        brv::mcp::run_codex_cli(
+            opts,
+            &cfg,
+            &binding,
+            &endpoint,
+            codex_cli_thread.as_deref(),
+            codex_cli_token_env,
+        )
+        .await
+    } else if claude_channel {
         anyhow::ensure!(
             host.as_deref().is_none_or(|h| h == "claude"),
             "Claude channel mode requires the Claude host"

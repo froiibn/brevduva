@@ -12,6 +12,7 @@
 
 mod claude_channel;
 pub mod client;
+mod codex_cli;
 pub mod config;
 pub mod connection;
 pub mod daemon;

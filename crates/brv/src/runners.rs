@@ -43,19 +43,15 @@ pub struct WakeProfile {
 /// 권한 수준(respond/edit/full) → 덧붙일 인자.
 pub type AllowFn = fn(&str) -> Option<Vec<&'static str>>;
 
-/// **이미 떠 있는 대화형 세션**에 메시지를 어떻게 전달할 수 있는가 (2026-09-05, "대화형 세션
-/// 우선 전달" 설계안 1단계 — 구조만, 동작 변경 없음). 깨우기 프로필(`WakeProfile`)이 "새 실행체를
-/// 띄우는 법"이라면 이것은 "떠 있는 실행체를 다시 움직이는 법"이다 — 둘을 한 플래그로 합치면
-/// "`codex exec`가 된다"가 "기존 Codex 세션에 넣을 수 있다"로 잘못 읽힌다.
-///
-/// `Direct`(세션에 즉시 새 턴 삽입)는 변형조차 두지 않았다: 어느 러너도 그런 인터페이스를 코드로
-/// 확인하지 못했고, 확인 전에 자리를 만들면 추측이 구현으로 굳는다. 실측된 러너가 생길 때 추가한다.
+/// 일반 실행 모드의 유인 전달 분류. 새 headless 실행(`WakeProfile`)과 구분한다.
+/// Desktop·Claude Channels·Codex 공유 app-server는 별도 연결 조건을 가진 어댑터다.
+/// 그 준비 상태는 러너 이름만으로 판단하지 않고 receiver_session_status에서 확인한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttendedDelivery {
     /// 턴이 끝날 때 러너의 훅이 큐를 살펴 같은 세션이 이어서 처리한다 (`brv hook stop`).
     /// 데몬이 밀어 넣는 것이 아니라 세션이 스스로 가져가는 경로 — 이미 코드에 있다.
     TurnEndHook,
-    /// 떠 있는 세션에 넣을 확인된 경로가 없다. 메시지는 서버 큐에 남고 데몬의 깨우기가 맡는다.
+    /// 일반 실행만으로 자동 전달되지 않는다. 별도 어댑터를 활성화하거나 수신 도구를 호출한다.
     Passive,
 }
 
@@ -982,7 +978,7 @@ mod tests {
     }
 
     /// 2026-09-05 (대화형 세션 우선 전달 1단계): 깨우기 실측과 유인 전달 능력은 별개다.
-    /// 코드로 확인된 유인 경로는 Claude Code의 Stop 훅뿐 — 나머지는 전부 passive여야 한다.
+    /// 별도 endpoint/Channels 준비를 일반 실행의 기본 능력으로 표시하지 않는다.
     #[test]
     fn attended_delivery_is_separate_from_wake_measurement() {
         for r in RUNNERS {

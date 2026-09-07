@@ -27,6 +27,19 @@ Windows·macOS·Linux의 호환되는 로컬 Desktop 실행체에 연결한다. 
 
 검증 범위: Windows 실제 Desktop 왕복, Linux(WSL) Unix 소켓·worker 테스트 통과. macOS는 Unix 구현과 CI 대상에 포함했지만 실행 검증은 아직 없다. Linux·macOS에 호환 Desktop 실행체가 실제로 설치돼 있어야 하며, 임의의 CLI 세션 연결을 보장하지 않는다. [OS별 구현·검증 기록](docs/PLATFORM_CONNECTION.md).
 
+## CLI의 기존 대화 자동 수신 (실험 기능)
+
+일반 로컬 MCP 연결만으로 유휴 CLI의 다음 턴이 시작되지는 않는다. `receiver_session_status`는
+MCP 도구 사용 가능 여부와 자동 전달 준비를 구분한다. 저장된 Desktop 연결 상태는 별개다.
+
+Claude Code는 v0.6.33의 `brv mcp --claude-channel`과 Claude의 Channels 시작 설정이 필요하다.
+v0.6.34의 Codex CLI 어댑터는 TUI와 같은 로컬 app-server에 연결하며, 일반 `codex`로
+시작한 독립 TUI에는 붙지 않는다. 설치 후 로컬 MCP도 재시작해야 한다.
+`brv mcp --config <절대경로> --binding org/agent@channel setup --runner claude` 또는
+`setup --runner codex --endpoint ws://127.0.0.1:4500`으로 설정 예시를 출력한다.
+사용자 설정은 자동 변경하지 않는다. [Codex CLI 준비·검증 범위](docs/CODEX_CLI.md),
+[Claude Channels](docs/CLAUDE_CHANNEL.md)를 참고한다.
+
 ## 설치
 
 리시버(`brv`) 바이너리 — macOS(arm64/x86_64) · Linux(x86_64/aarch64) · Windows(x86_64):

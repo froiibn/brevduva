@@ -149,7 +149,7 @@ fn show(dir: &Path, connection: Option<&Connection>) -> anyhow::Result<()> {
     let Some(connection) = connection else {
         println!(
             "{}",
-            json!({"status":"disconnected","message":"no task connected"})
+            json!({"status":"disconnected","adapter":"codex-desktop","scope":"saved_desktop_connection","message":"no Desktop task connected; this is independent of MCP tool access or CLI session delivery"})
         );
         return Ok(());
     };
@@ -171,7 +171,7 @@ fn show(dir: &Path, connection: Option<&Connection>) -> anyhow::Result<()> {
     };
     println!(
         "{}",
-        json!({"binding":connection.binding,"adapter":connection.task.adapter,"task_id":connection.task.id,
+        json!({"scope":"saved_desktop_connection","binding":connection.binding,"adapter":connection.task.adapter,"task_id":connection.task.id,
         "status":state,"worker_running":alive,"detail":saved.filter(|s| s.generation == connection.generation).and_then(|s| s.detail)})
     );
     Ok(())

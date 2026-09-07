@@ -15,6 +15,15 @@ Code/Cowork, VS Code 확장, 다른 OS에서의 실제 Claude 동작을 이 구�
 
 ## 로컬 개발 검증용 설정
 
+v0.6.34부터 다음 설정 출력 명령을 제공한다.
+
+```sh
+brv mcp --config <절대경로> --binding org/agent@channel setup --runner claude
+```
+
+출력의 `mcp_json`을 시험 프로젝트의 `.mcp.json`에 반영하고 `startup_argv`에 안내된
+Channels 옵션으로 시작한다. 명령은 설정 파일을 자동 변경하거나 OAuth 로그인을 실행하지 않는다.
+
 먼저 0.6.33 이상을 설치하거나 현재 소스를 `cargo build -p brv`로 빌드한다. 테스트용 에이전트·채널을 선택하고,
 그 정체성을 수신하는 daemon/다른 MCP/desktop 연결은 중지한다. 한 정체성의 수신을
 동시에 여러 프로세스가 소유하도록 설정하지 않는다.
@@ -72,6 +81,16 @@ claude --dangerously-load-development-channels server:brevduva
   단건만 현재 세션에 다시 전달한다. 판단이 틀리면 중복 작업이 가능하므로 자동 호출하지 않는다.
 
 ## 검증 범위와 남은 확인
+
+v0.6.34의 `receiver_session_status`는 일반 MCP 준비와 Channels 모드를 구분한다.
+`channel_status.host_delivery_observed`는 현재 세션의 실제 receipt가 있어야 true이며,
+이전 세션의 수동 복구를 새 세션 수신의 증거로 표시하지 않는다. Channels 모드에서는
+Desktop용 `receiver_connect`/`receiver_connection`을 숨기고 직접 호출도 거부한다.
+
+`channel_pause(paused=true)`는 모델 제출만 일시정지한다. 영속 수신은 계속하며,
+`false`로 재개해도 오류·불명확 상태는 지우지 않는다. 프로세스 재시작 시 pause는 유지되지 않는다.
+unknown/이전 세션의 미처리 기록으로 제출이 막힌 동안에도 새 메시지는 영속 보관한다.
+수신 pump 자체가 실패하면 접속도 종료하고 오류를 표시한다. 원인을 확인한 뒤 MCP를 재시작한다.
 
 Windows 로컬 테스트로 저널 보존·중복 방지·잘못된 receipt 거부·재시작 세션 구분·수동
 복구·timeout과 늦은 receipt·stdout 동시 쓰기를 확인했다. 모의 WebSocket 서버와 MCP

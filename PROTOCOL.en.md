@@ -399,6 +399,9 @@ Premise (5.4): all delivery is at-least-once and queue-based, so a dropped conne
 - Every PUB envelope carries a client-issued ULID `client_key`, required
 - A PUB that got no OK/ERR is republished after reconnect **with the same client_key** — if it is a duplicate within the 10-minute window, the server returns OK with the existing `id` without storing (idempotent success)
 - This makes the publish direction (C→S) symmetric with receiving: "at-least-once, without duplicates"
+- Receive-side symmetry: an adapter that triggers follow-up work ACKs after confirming that work has started. An adapter satisfying the durable-handoff contract below may instead ACK after handoff. Failed starts or handoffs remain unacknowledged.
+- **Durable-handoff contract** (2026-09-07): persist the original message ID, receiving binding, target task/session, and recoverable body in a locked, deduplicated local journal and synchronize it to disk before ACK. The adapter then owns further delivery. The server ACK confirms handoff, not model acceptance or completed work. Record submission before dispatch; preserve lost responses as uncertain. Never resolve uncertainty by automatic resubmission, moving to another task, or deleting records. Provide restart-visible status and evidence-based, single-message manual recovery. Surface stopped delivery and storage errors as needs-attention, not success. After handoff, recovery must not depend on server redelivery.
+- If an acknowledged, spawned execution exits without a reply or final report, the adapter reports failure to the requester only after checking server history for an existing final response. If history cannot be checked, it must not infer failure; prior final failure reports also prevent duplicate reports. This does not classify a still-running attended session or uncertain input delivery as failed work.
 
 ### 13.4 Adapter honesty convention
 

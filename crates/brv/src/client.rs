@@ -228,6 +228,7 @@ const INLINE_LIMIT: usize = 262_144;
 #[derive(Clone)]
 pub struct Client {
     cmds: mpsc::Sender<Cmd>,
+    actor: tokio::task::AbortHandle,
     /// 투명 claim-check(페이즈 17)의 HTTP 업로드용 접속 정보 — 액터 밖에서 업로드해야
     /// 대용량 전송이 WS 루프(PING·전달)를 막지 않는다.
     server: String,
@@ -245,9 +246,10 @@ impl Client {
             opts.channel.clone(),
             opts.token.clone(),
         );
-        tokio::spawn(actor(opts, rx, state_tx));
+        let actor = tokio::spawn(actor(opts, rx, state_tx)).abort_handle();
         Self {
             cmds: tx,
+            actor,
             server,
             channel,
             token,
@@ -264,6 +266,11 @@ impl Client {
     /// (데몬 루프)가 이걸로 구분한다 — 2026-09-02 맥북 실사고: 구분 못 해 죽은 채 무한 재대기.
     pub fn is_alive(&self) -> bool {
         !self.cmds.is_closed()
+    }
+
+    /// 전달 어댑터가 중단되면 접속 자리도 반납한다. 미확인 PUB/수신은 성공으로 바꾸지 않는다.
+    pub(crate) fn stop(&self) {
+        self.actor.abort();
     }
 
     /// 발행 — 단절 중이면 재연결 후 같은 client_key로 재시도된다 (13.3).
@@ -1400,6 +1407,30 @@ async fn run_connection(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stopped_adapter_releases_socket_despite_other_client_handles() {
+        use super::*;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::connect(ClientOptions::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "c",
+            "a",
+            "fake",
+        ));
+        let retained = client.clone();
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        assert!(ws.next().await.unwrap().is_ok()); // JOIN 중 종료해도 접속이 남지 않는다.
+        client.stop();
+        let closed = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap();
+        assert!(closed.is_none() || closed.unwrap().is_err());
+        assert!(!retained.is_alive());
+    }
     use super::*;
 
     /// 2026-09-03 (lucadm 실측): 핸들이 전부 드롭된 액터는 standby 프로브 주기를 기다리지 않고
