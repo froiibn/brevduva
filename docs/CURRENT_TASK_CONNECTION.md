@@ -13,10 +13,11 @@ macOS 실행은 아직 미검증이다.
 
 ## 에이전트의 실행 흐름
 
-아래 `brv connect` 흐름은 **Codex Desktop**에 적용한다. v0.6.34의 Codex CLI는
-공유 app-server를 명시한 MCP에서 `receiver_connect(thread_id=...)`를 사용한다.
-일반 CLI에서는 Desktop worker를 시작하지 않는다. [CLI 준비 절차](CODEX_CLI.md).
-Claude는 [Channels 시작 설정](CLAUDE_CHANNEL.md)을 사용하며 connect를 실행하지 않는다.
+아래 `brv connect` 흐름은 **Codex Desktop**에 적용한다. v0.6.36의 일반 Codex CLI는
+로컬 MCP의 `receiver_connect(session_kind="codex-cli", thread_id=...)`로 고유 queue를
+사용한다. Claude Code는 현재 대화의 고유 Monitor를 연결한다. 두 경로 모두 전용 시작
+옵션 없이 활성화하며 [현재 세션 자동 수신 설계](NATIVE_SESSION_DELIVERY.md)를 따른다.
+원격 MCP만 있는 환경과 임의의 GUI/웹 입력 연동은 별도의 범위다.
 
 1. 사용자가 수신 주소를 지정했으면 그대로 사용한다. 바인딩이 하나면 자동 선택,
    여러 개이고 지정하지 않았다면 주소를 고른다. 작업 ID를 사용자에게 요구하지 않는다.
