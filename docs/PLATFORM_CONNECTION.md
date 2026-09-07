@@ -4,10 +4,9 @@ Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
 
 ## 공통 사용자 흐름
 
-이 문서의 IPC와 worker는 Desktop 경로다. v0.6.34의 Codex CLI 공유 app-server
-어댑터는 [별도 준비·검증 범위](CODEX_CLI.md)를 따른다. Windows의 실제 TUI와 모의 모델
-통합을 확인했으며 macOS/Linux TUI 실기는 아직 미검증이다. Claude CLI는
-[Channels](CLAUDE_CHANNEL.md) 경로를 사용한다.
+이 문서의 IPC와 worker는 Desktop 경로다. v0.6.36의 일반 Codex/Claude CLI는
+[고유 queue/Monitor 경로](NATIVE_SESSION_DELIVERY.md)를 사용한다. Windows 실제 일반
+TUI와 모의 모델 통합을 확인했으며 macOS/Linux TUI 실기는 별도다.
 
 사용자는 현재 에이전트에게 연결을 요청한다. `brv connect`가 현재 작업의 호스트
 식별자를 읽고 실제 소유 실행체를 확인한다. 상태·일시정지·재개·해제와 메시지

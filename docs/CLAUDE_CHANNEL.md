@@ -2,7 +2,27 @@
 
 Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
 
-## 범위
+## 일반 실행 세션: v0.6.36 Monitor
+
+평소의 `claude`에 로컬 MCP가 등록되어 있고 고유 `Monitor` 도구가 제공된다면,
+“자동 수신을 활성화해줘”라는 요청으로 현재 대화에 연결한다. 에이전트가
+`receiver_connect(session_kind="claude-cli", monitor_available=true)`를 호출하고,
+반환된 `Monitor` 도구 호출을 그 대화에서 수행한다. 사용자가 명령을 실행하거나
+Channels 옵션으로 대화를 다시 시작할 필요가 없다.
+
+`awaiting_monitor`는 아직 활성화 완료가 아니다. 스트림 연결 후 `channel_status`의
+`transport_ready=true`를 확인한다. 고정 수신 안내를 받으면 `receipt`로 외부 본문을
+읽고 같은 대화에서 응답한다. Monitor 종료·MCP 종료 시 수신도 멈춘다.
+Monitor 제공 여부는 Claude 버전·계정·정책에 따라 달라질 수 있으며, brv가 호스트의 기능
+플래그나 권한을 변경하지 않는다. [설계·실제 TUI 시험](NATIVE_SESSION_DELIVERY.md).
+
+Windows Claude Code 2.1.263 실제 일반 TUI + 모의 모델/WS에서 Monitor의 자동 턴 시작,
+receipt, 원래 문맥 유지, 같은 접속의 ACK/reply를 확인했다. Monitor 제공 상태를 격리
+fixture에 재현한 시험이며 모든 계정·GUI·OS 실기 완료를 뜻하지 않는다.
+
+## Channels 고급 설정의 범위
+
+아래는 기존 Channels 어댑터를 선택한 경우다. Monitor 방식의 필수 준비가 아니다.
 
 0.6.33에 `brv mcp --claude-channel`을 추가했다. 이전 배포 0.6.32에는 없다.
 Claude Code 대화형 세션이 띄운 MCP 프로세스가 수신과 발신을 맡는다. 외부에서 활성

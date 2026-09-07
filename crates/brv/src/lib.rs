@@ -25,5 +25,6 @@ pub mod manage;
 pub mod mcp;
 pub mod runners;
 pub mod service;
+pub mod session_delivery;
 #[cfg(windows)]
 pub mod winspawn;

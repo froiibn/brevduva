@@ -2,6 +2,27 @@
 
 Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
 
+## 일반 실행 세션: v0.6.36
+
+로컬 MCP를 등록한 평소의 `codex` 대화에서 “자동 수신을 활성화해줘”라고 요청한다.
+에이전트가 현재 작업 셸의 `CODEX_THREAD_ID`를 읽어
+`receiver_connect(session_kind="codex-cli", thread_id=...)`를 호출한다.
+MCP와 다른 설정 경로/설치본을 쓰는 세션이면 현재 셸의 `codex_home`·`codex_executable`도 전달한다.
+사용자가 UUID를 복사하거나 app-server를 따로 시작할 필요가 없다.
+
+실행 중인 정확한 작업의 OS writer lock과 설치본의 `queue` 명령을 확인한 후 연결한다.
+queue에는 외부 본문 대신 고정 수신 안내·receipt 식별자만 넣는다. 본문은 `receipt`의
+도구 결과로 읽으므로 외부 메시지를 사용자 지시로 승격하지 않는다. 큐 ID는 턴 ID나 처리
+완료가 아니다. 실행 중인 작업이 종료되면 주입을 멈추며 다른 작업을 만들거나 재개하지 않는다.
+
+Windows Codex 0.153.4의 실제 일반 TUI에서 유휴 턴 시작·원래 문맥 유지·화면 출력 확인.
+receipt/reply는 모의 MCP 호스트가 호출한 통합 시험이며 실제 모델 추론 시험은 아니다.
+전체 [설계와 시험 방법](NATIVE_SESSION_DELIVERY.md)을 참고한다.
+
+## 공유 app-server 고급 설정 (v0.6.34부터)
+
+아래는 기존 공유 app-server 전달 방식을 선택한 경우에만 적용된다. 일반 CLI 자동 수신의 필수 준비가 아니다.
+
 Codex CLI 어댑터와 설정 출력 명령은 v0.6.34부터 제공한다. 설치 후 로컬 MCP를 재시작한다.
 소스 빌드 바이너리는 `cargo build -p brv`로 만든다. Windows에서는 `target/debug/brv.exe`다.
 
@@ -12,8 +33,7 @@ Codex CLI 어댑터와 설정 출력 명령은 v0.6.34부터 제공한다. 설�
 현재 확인한 조합은 Windows, codex-cli 0.153.4, 공유 loopback WebSocket이다.
 다른 OS/버전은 실제 시험 전까지 지원 검증 완료로 표시하지 않는다.
 
-Codex의 `queue`도 조사했지만 사용자 입력으로 전달된다. 제품은 `turn/start.toolOutput`으로
-외부 메시지를 도구 결과로 구분한다. 어댑터는 작업을 생성하거나 resume하지 않는다.
+이 고급 어댑터는 `turn/start.toolOutput`으로 외부 메시지를 도구 결과로 구분한다. 어댑터는 작업을 생성하거나 resume하지 않는다.
 현재 작업의 정확한 UUID가 지정 endpoint에 로드돼 있는지 확인하며, 환경의 최근 작업·
 MCP 부모의 세션 ID·대화 제목을 추정하지 않는다.
 

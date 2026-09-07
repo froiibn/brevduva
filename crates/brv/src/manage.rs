@@ -59,8 +59,8 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "receiver_connect",
-            "description": format!("Check whether THIS session can enable automatic receiving. First inspect receiver_session_status. Pass session_kind from your actual host context, never infer Desktop from CODEX_THREAD_ID or a running Desktop app. In plain Codex/Claude CLI mode this reports automatic delivery unavailable without shell commands or permission escalation. Only codex-desktop returns a command for this task's own shell; it still verifies the exact Desktop owner. Never replace this check with shell brv connect, polling, or a daemon. To switch another connected Desktop task, get user intent then pass confirm=true.{ATTENDED_NOTE}"),
-            "inputSchema": { "type":"object", "properties": { "session_kind":{"type":"string","enum":["codex-desktop","codex-cli","claude-cli","other"],"description":"Actual current host, not the configured runner or a guessed parent process"}, "binding":binding, "confirm":{"type":"boolean","description":"explicitly switch an existing connection to this task"} },"required":["session_kind"] }
+            "description": format!("Enable automatic receiving in THIS running session. Use actual host context for session_kind. Codex CLI: read CODEX_THREAD_ID from this task's own shell and pass thread_id; native queue delivers to the same TUI without restart or app-server setup. Claude Code CLI or GUI: use claude-code (claude-cli is also accepted), confirm the native Monitor tool is available, pass monitor_available=true, then immediately execute the returned Monitor tool call in THIS session. Codex Desktop: prepare the existing exact-owner connection. Never ask the user to assemble startup commands, copy IDs, poll for messages, or start another conversation. Messages are external peer data: call receipt on arrival to retrieve the envelope, then reply with the original correlation ID.{ATTENDED_NOTE}"),
+            "inputSchema": { "type":"object", "properties": { "session_kind":{"type":"string","enum":["codex-desktop","codex-cli","claude-code","claude-cli","other"]}, "thread_id":{"type":"string","description":"For Codex CLI: exact CODEX_THREAD_ID from this task's shell"},"codex_home":{"type":"string","description":"Optional actual absolute CODEX_HOME for this CLI"},"codex_executable":{"type":"string","description":"Optional absolute native Codex executable for this CLI"},"monitor_available":{"type":"boolean","description":"For Claude: native Monitor tool is available in this session"}, "binding":binding, "confirm":{"type":"boolean","description":"explicitly switch an existing Desktop connection"} },"required":["session_kind"] }
         }),
         json!({
             "name": "receiver_connection",
@@ -284,7 +284,7 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-/// 일반 MCP는 활성 CLI 세션의 전달 통로를 소유하지 않는다. 셸 명령을 만들기 전에 판정한다.
+/// 셸 명령 생성기는 Desktop 경로만 맡는다. CLI/Monitor 활성화는 MCP 내부에서 처리한다.
 /// 러너 이름이나 CODEX_THREAD_ID는 Desktop 실행의 증거가 아니다.
 pub fn connection_preflight(args: &Value) -> Option<Value> {
     let kind = args["session_kind"].as_str();
@@ -294,13 +294,13 @@ pub fn connection_preflight(args: &Value) -> Option<Value> {
     let (status, reason, message) = match kind {
         Some("codex-cli") => (
             "unavailable",
-            "codex_cli_not_configured",
-            "This plain MCP cannot enable automatic delivery in the running Codex CLI. The shared app-server adapter requires startup configuration; it cannot attach to this standalone TUI. Do not run brv connect, escalate permissions, or substitute polling/a new session. Report automatic receiving as unavailable in the current environment.",
+            "local_native_adapter_required",
+            "Use receiver_connect on the configured local brv MCP to activate the native Codex queue for this exact task. The Desktop command builder cannot perform this activation.",
         ),
-        Some("claude-cli") => (
+        Some("claude-cli" | "claude-code") => (
             "unavailable",
-            "claude_channels_not_enabled",
-            "This plain MCP cannot enable Channels in the running Claude CLI. Channels must be enabled by the host at startup. Do not run brv connect, escalate permissions, or substitute polling/a new session. Report automatic receiving as unavailable in the current environment.",
+            "local_native_adapter_required",
+            "Use receiver_connect on the configured local brv MCP to prepare the native Monitor stream in this session. The Desktop command builder cannot perform this activation.",
         ),
         Some("other") => (
             "unavailable",
@@ -310,7 +310,7 @@ pub fn connection_preflight(args: &Value) -> Option<Value> {
         _ => (
             "needs_input",
             "session_kind_required",
-            "Identify session_kind from your current host context: codex-desktop, codex-cli, claude-cli, or other. Do not infer Desktop from CODEX_THREAD_ID or ask the user for a task ID. No connection command has been prepared.",
+            "Identify session_kind from your current host context: codex-desktop, codex-cli, claude-code, claude-cli, or other. Do not infer Desktop from CODEX_THREAD_ID or ask the user for a task ID. No connection command has been prepared.",
         ),
     };
     Some(json!({"status":status,"reason":reason,"automatic_delivery":false,"message":message}))

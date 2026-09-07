@@ -27,21 +27,26 @@ This experimental feature is available starting with 0.6.30 and is not automatic
 
 Verification: actual Desktop round trips on Windows; Unix socket and worker tests on Linux (WSL). macOS is included in the Unix implementation and CI matrix but has not been executed yet. A compatible local Desktop owner must exist on Linux/macOS; arbitrary CLI-session attachment is not guaranteed. See the [platform implementation and verification record (Korean)](docs/PLATFORM_CONNECTION.md).
 
-## Automatic delivery to existing CLI conversations (experimental)
+## Automatic receiving in the current session (v0.6.36, experimental)
 
-A normal local MCP connection does not itself start an idle CLI turn. `receiver_session_status`
-distinguishes MCP tool availability from automatic delivery readiness. Saved Desktop connections are separate.
+In an ordinary conversation with the local `brv mcp` registered, ask to enable automatic
+receiving. The agent calls `receiver_connect` for its actual host. Codex CLI uses native
+`queue` to wake the current task; Claude Code CLI attaches a receiving stream through the
+current conversation's native `Monitor`. No special CLI startup options are required.
+Codex Desktop uses the existing task connection described above.
 
-Claude Code requires v0.6.33's `brv mcp --claude-channel` and Claude's Channels startup settings.
-The Codex CLI adapter in v0.6.34 connects to the same local app-server as the TUI;
-it does not attach to an independent TUI started with plain `codex`. Restart the local MCP process after updating.
-Print configuration examples with `brv mcp --config <absolute-path> --binding org/agent@channel setup --runner claude`
-or `setup --runner codex --endpoint ws://127.0.0.1:4500`. These commands do not change user settings.
-See [Codex CLI setup and validation scope](docs/CODEX_CLI.md) and [Claude Channels](docs/CLAUDE_CHANNEL.md).
+The notification contains only a message ID and receipt token. Calling `receipt` returns
+the external envelope as an MCP tool result, handled with the current context and permissions.
+`channel_status.transport_ready` means the transport is prepared;
+`host_delivery_observed` means a receipt was actually observed. Completion requires a reply.
 
-### Current automatic delivery limitation in plain CLI sessions (v0.6.35)
-
-Ordinary `codex` or `claude` sessions with a plain MCP registration cannot enable automatic delivery into the current conversation. v0.6.35 fixes incorrect routing to Desktop connections and config-file access diagnostics; it does not complete automatic injection in the ordinary launch environment. `receiver_connect` requires the actual `session_kind` and returns an unavailable result for plain CLI sessions without preparing a shell command.
+Actual ordinary Windows Codex 0.153.4 and Claude Code 2.1.263 TUIs were tested against local
+mock model/WS endpoints. Claude requires a host that provides `Monitor`. macOS and Linux
+share the implementation and are CI targets; actual app tests on those systems and arbitrary
+GUI/web products are separate. A web chat with only remote MCP does not gain local session
+injection. See the [design and validation scope (Korean)](docs/NATIVE_SESSION_DELIVERY.md),
+[Codex CLI](docs/CODEX_CLI.md), and [Claude Code](docs/CLAUDE_CHANNEL.md).
+Restart the app's local MCP after updating to load the new code.
 
 ## Install
 

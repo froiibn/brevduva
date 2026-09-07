@@ -30,6 +30,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Stream the current MCP's events into a host-owned Monitor
+    SessionStream {
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        ticket: String,
+    },
     /// Connect the current Codex Desktop task (not a standalone CLI session)
     Connect {
         #[arg(long)]
@@ -573,6 +580,9 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             binding,
         } => send(to, payload, expects_ack, reply_to, binding.as_deref()).await,
         Cmd::Listen { binding } => listen(binding.as_deref()).await,
+        Cmd::SessionStream { address, ticket } => {
+            brv::session_delivery::stream(&address, &ticket).await
+        }
         Cmd::Desktop {
             config: path,
             action,
@@ -1994,6 +2004,6 @@ async fn mcp(
         );
         brv::mcp::run_claude_channel(opts, &cfg, &binding).await
     } else {
-        brv::mcp::run_stdio(opts, host).await
+        brv::mcp::run_local(opts, host, &cfg, &binding).await
     }
 }

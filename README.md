@@ -27,22 +27,25 @@ Windows·macOS·Linux의 호환되는 로컬 Desktop 실행체에 연결한다. 
 
 검증 범위: Windows 실제 Desktop 왕복, Linux(WSL) Unix 소켓·worker 테스트 통과. macOS는 Unix 구현과 CI 대상에 포함했지만 실행 검증은 아직 없다. Linux·macOS에 호환 Desktop 실행체가 실제로 설치돼 있어야 하며, 임의의 CLI 세션 연결을 보장하지 않는다. [OS별 구현·검증 기록](docs/PLATFORM_CONNECTION.md).
 
-## CLI의 기존 대화 자동 수신 (실험 기능)
+## 현재 세션의 자동 수신 (v0.6.36, 실험 기능)
 
-일반 로컬 MCP 연결만으로 유휴 CLI의 다음 턴이 시작되지는 않는다. `receiver_session_status`는
-MCP 도구 사용 가능 여부와 자동 전달 준비를 구분한다. 저장된 Desktop 연결 상태는 별개다.
+등록된 로컬 `brv mcp`가 있는 평소의 대화에서 “자동 수신을 활성화해줘”라고 요청한다.
+에이전트가 현재 실행 환경에 맞는 `receiver_connect`를 호출한다. Codex CLI는 고유
+`queue`로 현재 작업을 깨우고, Claude Code CLI는 현재 대화의 고유 `Monitor`에 수신
+스트림을 연결한다. 일반 CLI를 전용 옵션으로 다시 실행할 필요가 없다.
+Codex Desktop은 위의 기존 작업 연결을 사용한다.
 
-Claude Code는 v0.6.33의 `brv mcp --claude-channel`과 Claude의 Channels 시작 설정이 필요하다.
-v0.6.34의 Codex CLI 어댑터는 TUI와 같은 로컬 app-server에 연결하며, 일반 `codex`로
-시작한 독립 TUI에는 붙지 않는다. 설치 후 로컬 MCP도 재시작해야 한다.
-`brv mcp --config <절대경로> --binding org/agent@channel setup --runner claude` 또는
-`setup --runner codex --endpoint ws://127.0.0.1:4500`으로 설정 예시를 출력한다.
-사용자 설정은 자동 변경하지 않는다. [Codex CLI 준비·검증 범위](docs/CODEX_CLI.md),
-[Claude Channels](docs/CLAUDE_CHANNEL.md)를 참고한다.
+수신 안내에는 메시지 ID와 receipt 토큰만 들어간다. 에이전트가 `receipt`를 호출하면
+외부 메시지 본문이 MCP 도구 결과로 들어오고, 기존 대화의 문맥·권한으로 처리한다.
+`channel_status`의 `transport_ready`는 전달 경로 준비, `host_delivery_observed`는
+실제 receipt 관측을 뜻한다. 업무 완료는 별도의 회신으로 확인한다.
 
-### 일반 CLI 자동 수신의 현재 제한 (v0.6.35)
-
-평소처럼 실행한 `codex`·`claude`에 일반 MCP만 등록한 상태에서는 현재 대화의 자동 수신을 활성화하지 못합니다. v0.6.35는 CLI 요청이 Desktop 연결로 잘못 진행되는 경로와 설정 파일 접근 오류 안내를 수정합니다. 일반 실행 환경의 자동 주입 기능을 완성한 릴리스가 아닙니다. `receiver_connect`는 실제 `session_kind`를 요구하며, 일반 CLI에서는 명령 실행 없이 미지원 상태를 반환합니다.
+Windows의 실제 Codex 0.153.4·Claude Code 2.1.263 일반 TUI를 로컬 모의 모델/WS와
+연결해 전달을 확인했다. Claude는 `Monitor`가 제공되는 환경이 필요하다. macOS·Linux는
+동일 구현과 CI 대상이며, 이 두 OS의 실제 앱 시험과 임의의 GUI/웹 제품 지원은 별개다.
+원격 MCP만 연결한 웹 채팅에 로컬 세션 주입 기능이 생기는 것은 아니다.
+[설계·검증 범위](docs/NATIVE_SESSION_DELIVERY.md), [Codex CLI](docs/CODEX_CLI.md),
+[Claude Code](docs/CLAUDE_CHANNEL.md)를 참고한다. 업데이트 후 앱의 로컬 MCP를 재시작해야 새 코드가 적용된다.
 
 ## 설치
 

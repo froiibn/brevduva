@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! 세션 소유 MCP의 영속 receipt·복구 계약과 Claude Channels 알림.
-//! Codex CLI도 같은 저널 상태를 사용하되 app-server의 도구 결과로 전달한다.
+//! Codex app-server·고유 queue와 Claude Monitor도 같은 저널 상태를 사용한다.
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +23,7 @@ pub(crate) struct Channel {
     adapter: &'static str,
     target: Option<String>,
     paused: bool,
+    pub(crate) transport_ready: bool,
     journal: Journal,
     session: String,
     inflight: Option<(String, Instant)>,
@@ -48,6 +49,7 @@ impl Channel {
             adapter: "claude-channel",
             target: None,
             paused: false,
+            transport_ready: true,
             journal: Journal::open(path, identity)?,
             session: format!("claude-channel-{}", ClientKey::generate()),
             inflight: None,
@@ -61,6 +63,25 @@ impl Channel {
         channel.adapter = "codex-cli";
         channel.target = Some(thread.to_owned());
         channel.session = format!("codex-cli-{thread}-{}", ClientKey::generate());
+        Ok(channel)
+    }
+
+    pub(crate) fn native(
+        path: &Path,
+        identity: Identity,
+        thread: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut channel = if let Some(thread) = thread {
+            Self::for_codex(path, identity, thread)?
+        } else {
+            Self::at(path, identity)?
+        };
+        channel.adapter = if thread.is_some() {
+            "codex-queue"
+        } else {
+            "claude-monitor"
+        };
+        channel.transport_ready = thread.is_some();
         Ok(channel)
     }
 
@@ -168,10 +189,11 @@ impl Channel {
                     .is_some_and(|detail| detail.get("receipt_token").is_some())
         });
         json!({"adapter":self.adapter, "session":self.session,"target_thread":self.target,
+            "transport_ready":self.transport_ready,"automatic_delivery":self.transport_ready && self.error.is_none() && !self.paused && !self.blocked(),
             "host_delivery_observed":observed,"host_activation":if observed {"observed"} else {"unverified"},
-            "status": if self.error.is_some() {"needs_attention"} else if self.paused {"paused"} else if self.blocked() {"needs_attention"} else if self.inflight.is_some() {"awaiting_receipt"} else {"ready"},
+            "status": if self.error.is_some() {"needs_attention"} else if !self.transport_ready {"awaiting_monitor"} else if self.paused {"paused"} else if self.blocked() {"needs_attention"} else if self.inflight.is_some() {"awaiting_receipt"} else {"ready"},
             "error":self.error, "note":"ready means adapter ready, not proof of host activation; accepted means receipt, not completed work",
-            "deliveries":self.journal.entries.iter().map(|(id,d)| json!({"id":id,"session":d.thread,"state":d.state,"turn_id":d.detail.as_ref().and_then(|text| serde_json::from_str::<Value>(text).ok()).and_then(|v| v.get("turn_id").cloned())})).collect::<Vec<_>>()})
+            "deliveries":self.journal.entries.iter().map(|(id,d)| json!({"id":id,"session":d.thread,"state":d.state,"turn_id":d.detail.as_ref().and_then(|text| serde_json::from_str::<Value>(text).ok()).and_then(|v| v.get("turn_id").cloned()),"queue_id":d.detail.as_ref().and_then(|text| serde_json::from_str::<Value>(text).ok()).and_then(|v| v.get("queue_id").cloned())})).collect::<Vec<_>>()})
     }
 
     pub(crate) fn pause(&mut self, paused: bool) -> Value {
@@ -179,7 +201,25 @@ impl Channel {
         self.status()
     }
 
+    pub(crate) fn fail(&mut self, error: String) -> anyhow::Result<()> {
+        self.error = Some(error);
+        if let Some((id, _)) = self.inflight.take() {
+            let mut delivery = self.journal.entries[&id].clone();
+            delivery.state = DeliveryState::Unknown;
+            self.journal.store(delivery)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn submitted_turn(&mut self, id: &str, turn: &str) -> anyhow::Result<()> {
+        self.submitted_id(id, "turn_id", turn)
+    }
+
+    pub(crate) fn submitted_queue(&mut self, id: &str, queue: &str) -> anyhow::Result<()> {
+        self.submitted_id(id, "queue_id", queue)
+    }
+
+    fn submitted_id(&mut self, id: &str, key: &str, value: &str) -> anyhow::Result<()> {
         let mut delivery = self
             .journal
             .entries
@@ -192,7 +232,7 @@ impl Channel {
                 .as_deref()
                 .context("submission detail missing")?,
         )?;
-        detail["turn_id"] = json!(turn);
+        detail[key] = json!(value);
         delivery.detail = Some(detail.to_string());
         self.journal.store(delivery)
     }
@@ -358,6 +398,29 @@ mod tests {
         assert_eq!(channel.receipt(&id, token).unwrap().hops, 2);
         channel.receipt(&id, token).unwrap();
         assert!(channel.next().unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_submission_is_recoverable_and_queue_id_is_not_a_turn_id() {
+        let fixture = Fixture::new();
+        let mut channel = fixture.open();
+        let message = envelope();
+        let id = envelope_id(&message).unwrap().to_owned();
+        channel.ingest(message).unwrap();
+        let notice = channel.next().unwrap().unwrap();
+        channel.submitted_queue(&id, "queue-id").unwrap();
+        assert_eq!(channel.status()["deliveries"][0]["queue_id"], "queue-id");
+        assert!(channel.status()["deliveries"][0]["turn_id"].is_null());
+        channel.fail("transport exited".into()).unwrap();
+        assert_eq!(channel.journal.entries[&id].state, DeliveryState::Unknown);
+        assert!(!channel.status()["automatic_delivery"].as_bool().unwrap());
+        channel
+            .receipt(
+                &id,
+                notice["params"]["meta"]["receipt_token"].as_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(channel.journal.entries[&id].state, DeliveryState::Accepted);
     }
 
     #[test]
