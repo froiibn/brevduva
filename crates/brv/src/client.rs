@@ -52,6 +52,8 @@ pub enum ClientState {
     Connected,
     Reconnecting {
         attempt: u32,
+        #[serde(default)]
+        reason: String,
     },
     /// 다른 세션이 자리를 가져가 대기 중 (2.2).
     Standby,
@@ -89,8 +91,10 @@ pub struct ClientOptions {
     pub token: String,
     pub description: String,
     /// 테이크오버(`agent/session-conflict`)를 받으면 재접속 대신 standby로 —
-    /// 데몬용 (2.2). 대화형 어댑터는 false(즉시 재접속 = 기존 세션 탈환).
+    /// 데몬용 (2.2). false이면 충돌을 명시하고 종료하며 자동 탈환하지 않는다.
     pub takeover_standby: bool,
+    /// 백그라운드 데몬은 시작·재접속 때도 기존 수신자를 축출하지 않는다.
+    pub prefer_existing: bool,
     /// standby 중 자리 확인 주기 — long-poll PRESENCE 프로브 (세션·큐를 건드리지 않음).
     pub standby_probe: Duration,
     /// **유휴 파킹** (2026-09-01, 방치 실측의 근본 수정): 명령·대기자·미해결 작업이 전부 없는
@@ -120,6 +124,7 @@ impl ClientOptions {
             token: token.into(),
             description: String::new(),
             takeover_standby: false,
+            prefer_existing: false,
             standby_probe: Duration::from_secs(30),
             idle_park: None,
             token_reload: None,
@@ -213,6 +218,7 @@ enum Cmd {
     Recv(RecvFilter, bool, oneshot::Sender<(Envelope, u64)>),
     // recv_manual로 받은 전달의 확인 — 깨우기 성공 등 "처리 보장" 시점에 호출
     Confirm(u64),
+    Validate(Vec<u64>, oneshot::Sender<Result<(), String>>),
     Fetch {
         query: FetchQuery,
         resp: oneshot::Sender<Result<Vec<Envelope>, String>>,
@@ -235,18 +241,20 @@ pub struct Client {
     channel: String,
     token: String,
     state_rx: tokio::sync::watch::Receiver<ClientState>,
+    receiver_rx: tokio::sync::watch::Receiver<Option<Value>>,
 }
 
 impl Client {
     pub fn connect(opts: ClientOptions) -> Self {
         let (tx, rx) = mpsc::channel(64);
         let (state_tx, state_rx) = tokio::sync::watch::channel(ClientState::Connecting);
+        let (receiver_tx, receiver_rx) = tokio::sync::watch::channel(None);
         let (server, channel, token) = (
             opts.server.clone(),
             opts.channel.clone(),
             opts.token.clone(),
         );
-        let actor = tokio::spawn(actor(opts, rx, state_tx)).abort_handle();
+        let actor = tokio::spawn(actor(opts, rx, state_tx, receiver_tx)).abort_handle();
         Self {
             cmds: tx,
             actor,
@@ -254,6 +262,7 @@ impl Client {
             channel,
             token,
             state_rx,
+            receiver_rx,
         }
     }
 
@@ -262,10 +271,70 @@ impl Client {
         self.state_rx.clone()
     }
 
+    /// 서버가 발급한 현재 연결의 진단 ID. 인증 자격 증명으로 사용할 수 없다.
+    pub fn receiver_descriptor(&self) -> Option<Value> {
+        self.receiver_rx.borrow().clone()
+    }
+
     /// 액터 생존 여부. 죽은 클라이언트의 recv는 시간 초과와 같은 None을 돌려주므로 호출자
     /// (데몬 루프)가 이걸로 구분한다 — 2026-09-02 맥북 실사고: 구분 못 해 죽은 채 무한 재대기.
     pub fn is_alive(&self) -> bool {
         !self.cmds.is_closed()
+    }
+
+    /// 대기 실패를 빈 큐와 구분하는 진단. 점유 충돌을 정상 타임아웃으로 바꾸지 않는다.
+    pub fn receive_error(&self) -> Option<String> {
+        match &*self.state_rx.borrow() {
+            ClientState::Standby => {
+                Some("agent/session-conflict: another receiver owns this identity".into())
+            }
+            ClientState::Stopped { reason } | ClientState::Suspended { reason, .. } => {
+                Some(reason.clone())
+            }
+            ClientState::Reconnecting { reason, .. } => {
+                Some(format!("connection-closed: {reason}"))
+            }
+            _ if !self.is_alive() => Some("connection-closed: receiver process stopped".into()),
+            _ => None,
+        }
+    }
+
+    pub async fn recv_checked(
+        &self,
+        filter: RecvFilter,
+        wait: Duration,
+    ) -> Result<Option<Envelope>, String> {
+        if let Some(error) = self.receive_error() {
+            return Err(error);
+        }
+        let mut state = self.state();
+        let receive = self.recv(filter, wait);
+        tokio::pin!(receive);
+        loop {
+            tokio::select! {
+                result = &mut receive => return match self.receive_error() { Some(error) => Err(error), None => Ok(result) },
+                changed = state.changed() => {
+                    if let Some(error) = self.receive_error() { return Err(error); }
+                    if changed.is_err() { return Err("connection-closed: receiver stopped".into()); }
+                }
+            }
+        }
+    }
+
+    /// 같은 연결의 PING/PONG 장벽 뒤에도 확인 유보 토큰이 유효해야 wake할 수 있다.
+    pub async fn validate_delivery(&self, tokens: Vec<u64>) -> Result<(), String> {
+        if let Some(error) = self.receive_error() {
+            return Err(error);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Validate(tokens, tx))
+            .await
+            .map_err(|_| "connection-closed".to_owned())?;
+        timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "receiver ownership check timed out".to_owned())?
+            .map_err(|_| "connection-closed: ownership check interrupted".to_owned())?
     }
 
     /// 전달 어댑터가 중단되면 접속 자리도 반납한다. 미확인 PUB/수신은 성공으로 바꾸지 않는다.
@@ -456,6 +525,7 @@ struct OutboxEntry {
 }
 
 enum Pending {
+    Validate(Vec<u64>, oneshot::Sender<Result<(), String>>),
     Pub(ClientKey),
     Fetch(oneshot::Sender<Result<Vec<Envelope>, String>>),
     Presence(oneshot::Sender<Result<Vec<PresenceEntry>, String>>),
@@ -480,12 +550,14 @@ struct Actor {
     consumed: VecDeque<String>,
     consumed_set: HashSet<String>,
     waiters: Vec<RecvWaiter>,
-    /// 확인 유보 전달 (페이즈 20): server_seq → 메시지 id. 연결마다 seq 공간이 새로 시작하므로
+    /// 확인 유보 전달: 로컬 확인 토큰 → (server_seq, 메시지 id). 연결마다 seq 공간이 새로 시작하므로
     /// 재접속 시 비운다 — 미확인분은 ack_wait 재전달이 다시 가져온다 (유실 없음).
-    unacked: HashMap<u64, String>,
+    unacked: HashMap<u64, (u64, String)>,
+    delivery_token: u64,
     last_pong: Instant,
     /// 접속 상태 발행 (2026-09-02) — `Client::state()`가 구독.
     state_tx: tokio::sync::watch::Sender<ClientState>,
+    receiver_tx: tokio::sync::watch::Sender<Option<Value>>,
 }
 
 impl Actor {
@@ -552,7 +624,9 @@ impl Actor {
             let item = self.inbox.remove(pos).expect("position valid");
             let (_, auto_ack, tx) = self.waiters.remove(w);
             let id = item.envelope.id.as_ref().map(|i| i.as_str().to_owned());
-            if tx.send((item.envelope.clone(), item.server_seq)).is_ok() {
+            self.delivery_token += 1;
+            let token = self.delivery_token;
+            if tx.send((item.envelope.clone(), token)).is_ok() {
                 if auto_ack {
                     let _ = send_frame(
                         ws,
@@ -572,7 +646,7 @@ impl Actor {
                     // 확인이 안 오면 ack_wait 후 재전달 (처리 실패 = 자동 재시도의 재료)
                     if let Some(id) = id {
                         self.queued_ids.remove(&id);
-                        self.unacked.insert(item.server_seq, id);
+                        self.unacked.insert(token, (item.server_seq, id));
                     }
                 }
                 // 같은 인덱스에서 계속 (다음 대기자)
@@ -584,8 +658,8 @@ impl Actor {
     }
 
     /// recv_manual 전달의 확인 (페이즈 20) — ACK + 소비 표시 + 그 사이 도착한 중복 재전달 정리.
-    async fn handle_confirm(&mut self, ws: &mut Ws, seq: u64) {
-        let Some(id) = self.unacked.remove(&seq) else {
+    async fn handle_confirm(&mut self, ws: &mut Ws, token: u64) {
+        let Some((seq, id)) = self.unacked.remove(&token) else {
             return; // 재접속으로 이미 무효 — 재전달이 새로 온다 (at-least-once)
         };
         let _ = send_frame(
@@ -677,6 +751,23 @@ impl Actor {
 
     async fn handle_cmd(&mut self, ws: &mut Ws, cmd: Cmd) {
         match cmd {
+            Cmd::Validate(tokens, resp) => {
+                if tokens.is_empty() || tokens.iter().any(|t| !self.unacked.contains_key(t)) {
+                    let _ = resp.send(Err("agent/session-conflict: delivery tokens no longer belong to this connection".into()));
+                } else {
+                    let seq = self.next_seq();
+                    self.pending.insert(seq, Pending::Validate(tokens, resp));
+                    let _ = send_frame(
+                        ws,
+                        &ClientFrame {
+                            seq: Some(seq),
+                            re: None,
+                            op: ClientOp::Ping,
+                        },
+                    )
+                    .await;
+                }
+            }
             Cmd::Publish(spec, resp) => {
                 let key = ClientKey::generate();
                 match self.build_envelope(&spec, &key) {
@@ -744,6 +835,14 @@ impl Actor {
 
     fn resolve_ok(&mut self, re: u64, body: OkBody) {
         match self.pending.remove(&re) {
+            Some(Pending::Validate(tokens, resp)) => {
+                let valid = tokens.iter().all(|t| self.unacked.contains_key(t));
+                let _ = resp.send(if valid {
+                    Ok(())
+                } else {
+                    Err("agent/session-conflict: receiver generation changed".into())
+                });
+            }
             Some(Pending::Pub(key)) => {
                 if let Some(pos) = self.outbox.iter().position(|e| e.client_key == key) {
                     let mut entry = self.outbox.remove(pos);
@@ -764,6 +863,9 @@ impl Actor {
 
     fn resolve_err(&mut self, re: u64, body: ErrBody) {
         match self.pending.remove(&re) {
+            Some(Pending::Validate(_, resp)) => {
+                let _ = resp.send(Err(format!("{}: {}", body.code, body.message)));
+            }
             Some(Pending::Pub(key)) => {
                 // 서버가 명시적으로 거부 — 정직하게 호출자에게 (13.4). 재시도 판단은 에이전트 몫
                 if let Some(pos) = self.outbox.iter().position(|e| e.client_key == key) {
@@ -785,10 +887,17 @@ impl Actor {
 
     /// 연결 유실 시: 응답 없는 PUB는 outbox에 남아 재발행되고, 조회성 요청은 오류로 해소.
     fn on_disconnect(&mut self) {
+        self.receiver_tx.send_replace(None);
         // 확인 유보분은 이 연결의 seq에 묶여 있었다 — 재전달이 새 seq로 다시 온다
         self.unacked.clear();
+        self.inbox.clear();
+        self.queued_ids.clear();
+        self.waiters.clear();
         for (_, pending) in self.pending.drain() {
             match pending {
+                Pending::Validate(_, resp) => {
+                    let _ = resp.send(Err("connection-closed: ownership check interrupted".into()));
+                }
                 Pending::Pub(_) => {} // outbox가 진실 — 재발행된다
                 Pending::Fetch(resp) => {
                     let _ = resp.send(Err("connection lost; retry".to_owned()));
@@ -834,6 +943,7 @@ async fn actor(
     opts: ClientOptions,
     mut cmds: mpsc::Receiver<Cmd>,
     state_tx: tokio::sync::watch::Sender<ClientState>,
+    receiver_tx: tokio::sync::watch::Sender<Option<Value>>,
 ) {
     let mut state = Actor {
         opts,
@@ -846,8 +956,10 @@ async fn actor(
         consumed_set: HashSet::new(),
         waiters: Vec::new(),
         unacked: HashMap::new(),
+        delivery_token: 0,
         last_pong: Instant::now(),
         state_tx,
+        receiver_tx,
     };
     let mut attempt: u32 = 0;
     let mut fatal_attempt: u32 = 0;
@@ -862,7 +974,10 @@ async fn actor(
                 fatal_attempt = 0;
                 state.set_state(ClientState::Connected);
                 match run_connection(&mut state, ws, backlog, resume_cmd.take(), &mut cmds).await {
-                    ConnEnd::Reconnect => state.on_disconnect(),
+                    ConnEnd::Reconnect(reason) => {
+                        state.on_disconnect();
+                        state.set_state(ClientState::Reconnecting { attempt, reason });
+                    }
                     ConnEnd::TakenOver => {
                         state.on_disconnect();
                         if state.opts.takeover_standby {
@@ -874,8 +989,10 @@ async fn actor(
                                 return;
                             }
                             tracing::info!("agent slot free — resuming");
+                        } else {
+                            state.set_state(ClientState::Stopped { reason: "agent/session-conflict: another receiver took ownership; explicitly reconnect to reclaim".into() });
+                            return;
                         }
-                        // 대화형(기본): 즉시 재접속 = 최신 연결이 자리를 가진다
                     }
                     ConnEnd::Park => {
                         // 유휴 파킹 (2026-09-01): 미소비 버퍼는 서버 큐에 반납한다 —
@@ -903,8 +1020,19 @@ async fn actor(
                 }
             }
             Err(e) => {
-                let msg = e.to_string();
-                if let Some(reason) = msg.strip_prefix("FATAL: ") {
+                if let Some(rejected) = e.downcast_ref::<JoinRejected>() {
+                    let reason = rejected.to_string();
+                    if rejected.0.code == ErrorCode::AgentSessionConflict
+                        && state.opts.takeover_standby
+                    {
+                        state.on_disconnect();
+                        state.set_state(ClientState::Standby);
+                        if !standby_until_free(&state.opts, &cmds).await {
+                            state.set_state(dropped);
+                            return;
+                        }
+                        continue;
+                    }
                     // JOIN이 비재시도 오류로 거부됨 (무효 토큰·grant 없음 등)
                     let Some(reload) = state.opts.token_reload.clone() else {
                         // 대화형 어댑터: 재시도 무의미 — 호출자에게 오류로 정직하게, 종료
@@ -912,7 +1040,7 @@ async fn actor(
                         for entry in state.outbox.drain(..) {
                             if let Some(resp) = entry.resp {
                                 let _ = resp.send(Err(ErrBody {
-                                    code: ErrorCode::AuthInvalidToken,
+                                    code: rejected.0.code.clone(),
                                     message: reason.to_owned(),
                                     retryable: false,
                                     retry_after_ms: None,
@@ -960,7 +1088,10 @@ async fn actor(
                     continue;
                 }
                 tracing::warn!(error = %e, attempt, "connect failed");
-                state.set_state(ClientState::Reconnecting { attempt });
+                state.set_state(ClientState::Reconnecting {
+                    attempt,
+                    reason: format!("{e:#}"),
+                });
             }
         }
         attempt += 1;
@@ -974,9 +1105,18 @@ fn fatal_backoff(base: Duration, attempt: u32) -> Duration {
     base * STEPS[(attempt.saturating_sub(1) as usize).min(STEPS.len() - 1)]
 }
 
-// 치명(JOIN 비재시도 거부)은 connect_and_join의 "FATAL: " 오류 경로가 담당한다
+#[derive(Debug)]
+struct JoinRejected(ErrBody);
+impl std::fmt::Display for JoinRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0.code, self.0.message)
+    }
+}
+impl std::error::Error for JoinRejected {}
+
+// JOIN 거부는 코드와 원인을 가진 JoinRejected로 보존한다.
 enum ConnEnd {
-    Reconnect,
+    Reconnect(String),
     /// 다른 세션이 자리를 가져감 (`agent/session-conflict` 수신, 2.2).
     TakenOver,
     /// 유휴 파킹 (idle_park 초과) — 접속을 내려놓고 다음 명령까지 대기 (2026-09-01).
@@ -1178,7 +1318,7 @@ pub async fn discover_channels(
 }
 
 /// standby: long-poll PRESENCE 프로브(세션·큐 무접촉)로 자리가 빌 때까지 대기.
-/// 오류(서버 불가 등)는 "자리 비어 있음"으로 간주 — 재접속 경로의 백오프가 뒷일을 맡는다.
+/// 점유 조회 실패는 빈 자리의 증거가 아니다. 확인될 때까지 양보한다.
 /// standby 대기 — true = 자리가 비었다(재JOIN), false = 핸들이 전부 드롭됐다(종료).
 async fn standby_until_free(opts: &ClientOptions, cmds: &mpsc::Receiver<Cmd>) -> bool {
     let http = reqwest::Client::new();
@@ -1219,14 +1359,25 @@ async fn standby_until_free(opts: &ClientOptions, cmds: &mpsc::Receiver<Cmd>) ->
             let ServerOp::Ok(body) = resp.op else {
                 return None;
             };
+            if let Some(occupied) = body
+                .extra
+                .get("receiver")
+                .and_then(|v| v["occupied"].as_bool())
+            {
+                return Some(occupied);
+            }
             let mine = body
                 .presence?
                 .into_iter()
                 .find(|e| e.agent.as_str() == opts.agent)?;
-            Some(mine.state == brevduva_protocol::PresenceState::Online)
+            Some(matches!(
+                mine.state,
+                brevduva_protocol::PresenceState::Online
+                    | brevduva_protocol::PresenceState::Waiting
+            ))
         }
         .await;
-        if !occupied.unwrap_or(false) {
+        if occupied == Some(false) {
             return true;
         }
     }
@@ -1245,7 +1396,13 @@ async fn connect_and_join(state: &mut Actor) -> anyhow::Result<(Ws, Vec<ServerFr
         content_types: vec!["text/*".into(), "application/json".into()],
         encodings: vec!["json".into()],
         modes: vec![brevduva_protocol::ReceiveMode::Push],
-        meta: Map::new(),
+        meta: if state.opts.prefer_existing {
+            [("receiver_policy".into(), Value::String("standby".into()))]
+                .into_iter()
+                .collect()
+        } else {
+            Map::new()
+        },
     };
     send_frame(
         &mut ws,
@@ -1273,7 +1430,10 @@ async fn connect_and_join(state: &mut Actor) -> anyhow::Result<(Ws, Vec<ServerFr
         };
         let frame: ServerFrame = serde_json::from_str(text.as_str()).context("bad server frame")?;
         match &frame.op {
-            ServerOp::Ok(_) if frame.re == Some(join_seq) => {
+            ServerOp::Ok(body) if frame.re == Some(join_seq) => {
+                state
+                    .receiver_tx
+                    .send_replace(body.extra.get("receiver").cloned());
                 state.last_pong = Instant::now();
                 // 미확인 PUB 재발행 (13.3 — 같은 client_key)
                 let mut frames = Vec::new();
@@ -1301,7 +1461,7 @@ async fn connect_and_join(state: &mut Actor) -> anyhow::Result<(Ws, Vec<ServerFr
                     anyhow::bail!("join rejected (retryable): {}", body.message);
                 }
                 // 치명 — 상위에서 Fatal 처리하도록 특수 문자열로 구분하지 않고 오류 타입화
-                return Err(anyhow::anyhow!("FATAL: {}", body.message));
+                return Err(JoinRejected(body.clone()).into());
             }
             _ => backlog.push(frame),
         }
@@ -1363,15 +1523,20 @@ async fn run_connection(
                 // 13.1: 2회 연속 무응답(≈45s) 판정
                 if state.last_pong.elapsed() > Duration::from_secs(45) {
                     tracing::warn!("heartbeat lost; reconnecting");
-                    return ConnEnd::Reconnect;
+                    return ConnEnd::Reconnect("heartbeat timed out after 45 seconds".into());
                 }
                 let seq = state.next_seq();
-                if send_frame(&mut ws, &ClientFrame { seq: Some(seq), re: None, op: ClientOp::Ping }).await.is_err() {
-                    return ConnEnd::Reconnect;
+                if let Err(e) = send_frame(&mut ws, &ClientFrame { seq: Some(seq), re: None, op: ClientOp::Ping }).await {
+                    return ConnEnd::Reconnect(format!("heartbeat send failed: {e:#}"));
                 }
             },
             incoming = ws.next() => {
-                let Some(Ok(msg)) = incoming else { return ConnEnd::Reconnect };
+                let msg = match incoming {
+                    Some(Ok(WsMessage::Close(frame))) => return ConnEnd::Reconnect(format!("server closed WebSocket: {frame:?}")),
+                    Some(Ok(msg)) => msg,
+                    Some(Err(e)) => return ConnEnd::Reconnect(format!("WebSocket receive failed: {e}")),
+                    None => return ConnEnd::Reconnect("WebSocket stream ended".into()),
+                };
                 let WsMessage::Text(text) = msg else { continue };
                 let Ok(frame) = serde_json::from_str::<ServerFrame>(text.as_str()) else {
                     tracing::warn!("unparsable server frame; ignoring");
@@ -1398,7 +1563,7 @@ async fn run_connection(
                     ServerOp::Ping => {
                         let _ = send_frame(&mut ws, &ClientFrame { seq: None, re: frame.seq, op: ClientOp::Pong }).await;
                     }
-                    ServerOp::Pong => {}
+                    ServerOp::Pong => { if let Some(re) = frame.re { state.resolve_ok(re, OkBody::default()); } }
                 }
             }
         }
@@ -1457,6 +1622,70 @@ mod tests {
         assert_eq!(fatal_backoff(base, 0).as_secs(), 30);
     }
 
+    #[tokio::test]
+    async fn takeover_clears_buffer_rejects_wake_and_surfaces_conflict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let join = ws.next().await.unwrap().unwrap();
+            let join: Value = serde_json::from_str(join.to_text().unwrap()).unwrap();
+            ws.send(WsMessage::Text(
+                serde_json::json!({"op":"OK","re":join["seq"],"body":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            for (seq, id) in [
+                (1, "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                (2, "01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+            ] {
+                ws.send(WsMessage::Text(serde_json::json!({"op":"DELIVER","seq":seq,"body":{"v":1,"id":id,"client_key":id,"from":"b","to":"agent:a","kind":"message","hops":0,"content_type":"text/plain","payload":"pending","meta":{}}}).to_string().into())).await.unwrap();
+            }
+            release_rx.await.unwrap();
+            ws.send(WsMessage::Text(serde_json::json!({"op":"ERR","body":{"code":"agent/session-conflict","message":"replaced","retryable":false}}).to_string().into())).await.unwrap();
+            let _ = ws.close(None).await;
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "displaced interactive client must not reclaim automatically"
+            );
+        });
+        let client = Client::connect(ClientOptions::new(&url, "c", "a", "fake"));
+        let (_, token) = client
+            .recv_manual(RecvFilter::Any, Duration::from_secs(5))
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let mut state = client.state();
+        timeout(Duration::from_secs(5), async {
+            while !matches!(*state.borrow(), ClientState::Stopped { .. }) {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            client
+                .validate_delivery(vec![token])
+                .await
+                .unwrap_err()
+                .contains("agent/session-conflict")
+        );
+        assert!(
+            client
+                .recv_checked(RecvFilter::Any, Duration::from_secs(5))
+                .await
+                .unwrap_err()
+                .contains("agent/session-conflict")
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn ws_url_derivation() {
         assert_eq!(ws_url("http://1.2.3.4:8080"), "ws://1.2.3.4:8080/v1/ws");
@@ -1464,6 +1693,76 @@ mod tests {
             ws_url("https://brv.example.com/"),
             "wss://brv.example.com/v1/ws"
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_reusing_server_sequence_does_not_revalidate_old_delivery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut disconnect_rx = Some(disconnect_rx);
+            for (index, id) in ["01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW"]
+                .into_iter()
+                .enumerate()
+            {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let join = ws.next().await.unwrap().unwrap();
+                let join: Value = serde_json::from_str(join.to_text().unwrap()).unwrap();
+                ws.send(WsMessage::Text(serde_json::json!({"op":"OK","re":join["seq"],"body":{"receiver":{"occupied":true,"session_id":id,"transport":"ws"}}}).to_string().into())).await.unwrap();
+                ws.send(WsMessage::Text(serde_json::json!({"op":"DELIVER","seq":1,"body":{"v":1,"id":id,"client_key":id,"from":"b","to":"agent:a","kind":"message","hops":0,"content_type":"text/plain","payload":"test","meta":{}}}).to_string().into())).await.unwrap();
+                if index == 0 {
+                    disconnect_rx.take().unwrap().await.unwrap();
+                    ws.close(None).await.unwrap();
+                } else {
+                    while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["op"] == "PING" {
+                            ws.send(WsMessage::Text(
+                                serde_json::json!({"op":"PONG","re":frame["seq"]})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                    }
+                }
+            }
+        });
+        let client = Client::connect(ClientOptions::new(url, "c", "a", "fake"));
+        let (_, old) = client
+            .recv_manual(RecvFilter::Any, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let old_receiver = client.receiver_descriptor().unwrap();
+        let mut state = client.state();
+        disconnect_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                state.changed().await.unwrap();
+                if *state.borrow_and_update() == ClientState::Connected
+                    && client
+                        .receiver_descriptor()
+                        .is_some_and(|r| r != old_receiver)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (_, new) = client
+            .recv_manual(RecvFilter::Any, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_ne!(old, new);
+        assert_ne!(old_receiver, client.receiver_descriptor().unwrap());
+        assert!(client.validate_delivery(vec![old]).await.is_err());
+        client.validate_delivery(vec![new]).await.unwrap();
+        client.stop();
+        server.await.unwrap();
     }
 
     #[test]

@@ -279,7 +279,13 @@ pub(crate) async fn pump(
                 stream.flush().await?;
             }
         }
-        anyhow::ensure!(client.is_alive(), "session receiver stopped");
+        anyhow::ensure!(
+            client.is_alive(),
+            "{}",
+            client
+                .receive_error()
+                .unwrap_or_else(|| "session receiver stopped".into())
+        );
     }
 }
 

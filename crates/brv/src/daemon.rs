@@ -162,7 +162,9 @@ impl BindingStatus {
         match &self.state {
             ClientState::Connecting => "connecting".to_owned(),
             ClientState::Connected => "connected".to_owned(),
-            ClientState::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
+            ClientState::Reconnecting { attempt, reason } => {
+                format!("reconnecting (attempt {attempt}): {reason}")
+            }
             ClientState::Standby => "standby (another session holds the slot)".to_owned(),
             ClientState::Parked => "parked (idle — messages queue server-side)".to_owned(),
             ClientState::Suspended { reason, retry_in_s } => {
@@ -500,6 +502,7 @@ async fn binding_loop(
     let wake = effective_wake(&wake, &binding);
     let mut opts = ClientOptions::new(&server, &binding.channel, &binding.agent, &token);
     opts.description = binding.description.clone();
+    opts.prefer_existing = true;
     opts.takeover_standby = true; // 데몬의 핵심 매너 — 대화형 세션에 자리를 양보
     // 토큰 거부 시 정지·재읽기·재시도 (2026-09-02, 맥북 실사고) — 상세는 client::TokenReload
     opts.token_reload = rt.reload.clone();
@@ -683,6 +686,13 @@ async fn binding_loop(
             // 중복 폭주를 피하기 위함. 스폰 뒤 세션이 응답 없이 죽는 경우는 **발신자에게 보이게**
             // 한다 (2026-09-04, 아래 report_unanswered — 저널·로그는 수신 머신에만 남는다).
             // 깨우기 표식은 스폰 **전에** 켠다 — 깨어난 세션의 MCP가 뜨는 시점에 이미 보여야 한다
+            if let Err(error) = client
+                .validate_delivery(batch.iter().map(|(_, token)| *token).collect())
+                .await
+            {
+                tracing::warn!(binding = %binding.label(), %error, "wake cancelled: receiver ownership is no longer confirmed");
+                continue 'recv;
+            }
             set_waking(&rt, &binding.full_label(), true).await;
             match spawn_wake(&wake, dir, &binding.full_label(), &prompt, &rt.wake_spawn).await {
                 Ok(child) => {

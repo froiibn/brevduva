@@ -221,6 +221,25 @@ impl McpServer {
         }
     }
 
+    fn receiver_status(&self, mut status: Value) -> Value {
+        if let Some(client) = &self.client {
+            status["receiver"] = client.receiver_descriptor().unwrap_or(Value::Null);
+            status["server_state"] =
+                serde_json::to_value(client.state().borrow().clone()).expect("client state");
+            if let Some(error) = client.receive_error() {
+                status["automatic_delivery"] = json!(false);
+                status["status"] = json!("needs_attention");
+                status["connection_error"] = json!(error);
+            } else if !matches!(
+                *client.state().borrow(),
+                crate::client::ClientState::Connected
+            ) {
+                status["automatic_delivery"] = json!(false);
+            }
+        }
+        status
+    }
+
     /// `request`·`wait_for_reply`의 공통 응답 — 최종 답만 `replied`, 진행 알림은 `progress`로 (9장).
     async fn render_reply_wait(&mut self, correlation: &str, outcome: ReplyWait) -> (Value, bool) {
         match outcome {
@@ -233,6 +252,12 @@ impl McpServer {
                 (v, false)
             }
             ReplyWait::Pending { progress } => {
+                if let Some(error) = self.client.as_ref().and_then(Client::receive_error) {
+                    return (
+                        json!({"status":"error","code":if error.contains("agent/session-conflict") {"agent/session-conflict"} else {"connection-closed"},"message":error,"correlation_id":correlation}),
+                        true,
+                    );
+                }
                 let mut v = json!({ "status": "pending", "correlation_id": correlation,
                         "message": "no final reply yet — the peer may be idle. Call wait_for_reply with this correlation_id to keep waiting, or proceed and check later." });
                 if let Some(p) = progress {
@@ -387,7 +412,7 @@ impl McpServer {
         }
         if name == "receiver_session_status" {
             let delivery = if let Some(channel) = &self.channel {
-                channel.lock().await.status()
+                self.receiver_status(channel.lock().await.status())
             } else {
                 json!({"adapter":if self.codex_setup.is_some() {"codex-cli-awaiting-target"} else {"tool-calls"},"automatic_delivery":false,"host_activation":"unverified",
                     "note":"MCP tools are available; this does not start idle CLI turns. Saved Desktop worker state is separate. Call receiver_connect to activate Codex native queue or Claude native Monitor in this session. Existing Channels and shared app-server adapters are also available."})
@@ -456,7 +481,7 @@ impl McpServer {
                 };
             }
             if name == "channel_status" {
-                return (channel.lock().await.status(), false);
+                return (self.receiver_status(channel.lock().await.status()), false);
             }
             if name == "channel_resolve" {
                 return match channel.lock().await.resolve(args) {
@@ -639,14 +664,18 @@ impl McpServer {
                 Self::publish(&client, spec).await
             }
             "wait_for_message" => match client
-                .recv(RecvFilter::Any, Duration::from_secs(timeout_s))
+                .recv_checked(RecvFilter::Any, Duration::from_secs(timeout_s))
                 .await
             {
-                Some(env) => (
+                Ok(Some(env)) => (
                     json!({ "status": "message", "message": self.record_and_resolve(&env).await }),
                     false,
                 ),
-                None => (
+                Err(message) => (
+                    json!({"status":"error","code":if message.contains("agent/session-conflict") {"agent/session-conflict"} else {"connection-closed"},"message":message}),
+                    true,
+                ),
+                Ok(None) => (
                     json!({ "status": "timeout",
                             "message": "no message within the window. Call wait_for_message again to keep listening (60s hold loop), or proceed with your own work." }),
                     false,
