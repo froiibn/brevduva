@@ -59,8 +59,8 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "receiver_connect",
-            "description": format!("Prepare connection of THIS task to a Brevduva binding. Returns a structured command for YOU to execute in this task's own shell, because MCP processes can be shared across tasks. Execute it without asking the user for an ID or another approval when they already requested connection. It reads host session identity and starts the background receiver. Requires a reachable compatible Codex Desktop owner: Windows named pipe or macOS/Linux Unix socket. This does not imply arbitrary CLI-session support. Never guess recent/focused task IDs. To switch another connected task, get user intent then pass confirm=true.{ATTENDED_NOTE}"),
-            "inputSchema": { "type":"object", "properties": { "binding":binding, "confirm":{"type":"boolean","description":"explicitly switch an existing connection to this task"} } }
+            "description": format!("Check whether THIS session can enable automatic receiving. First inspect receiver_session_status. Pass session_kind from your actual host context, never infer Desktop from CODEX_THREAD_ID or a running Desktop app. In plain Codex/Claude CLI mode this reports automatic delivery unavailable without shell commands or permission escalation. Only codex-desktop returns a command for this task's own shell; it still verifies the exact Desktop owner. Never replace this check with shell brv connect, polling, or a daemon. To switch another connected Desktop task, get user intent then pass confirm=true.{ATTENDED_NOTE}"),
+            "inputSchema": { "type":"object", "properties": { "session_kind":{"type":"string","enum":["codex-desktop","codex-cli","claude-cli","other"],"description":"Actual current host, not the configured runner or a guessed parent process"}, "binding":binding, "confirm":{"type":"boolean","description":"explicitly switch an existing connection to this task"} },"required":["session_kind"] }
         }),
         json!({
             "name": "receiver_connection",
@@ -133,6 +133,9 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     let mut push = |a: &str| argv.push(a.to_owned());
     match name {
         "receiver_connect" => {
+            if let Some(result) = connection_preflight(args) {
+                return Err(result["message"].as_str().unwrap_or_default().into());
+            }
             push("connect");
             if let Some(b) = s("binding") {
                 push("--binding");
@@ -281,6 +284,38 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// 일반 MCP는 활성 CLI 세션의 전달 통로를 소유하지 않는다. 셸 명령을 만들기 전에 판정한다.
+/// 러너 이름이나 CODEX_THREAD_ID는 Desktop 실행의 증거가 아니다.
+pub fn connection_preflight(args: &Value) -> Option<Value> {
+    let kind = args["session_kind"].as_str();
+    if kind == Some("codex-desktop") {
+        return None;
+    }
+    let (status, reason, message) = match kind {
+        Some("codex-cli") => (
+            "unavailable",
+            "codex_cli_not_configured",
+            "This plain MCP cannot enable automatic delivery in the running Codex CLI. The shared app-server adapter requires startup configuration; it cannot attach to this standalone TUI. Do not run brv connect, escalate permissions, or substitute polling/a new session. Report automatic receiving as unavailable in the current environment.",
+        ),
+        Some("claude-cli") => (
+            "unavailable",
+            "claude_channels_not_enabled",
+            "This plain MCP cannot enable Channels in the running Claude CLI. Channels must be enabled by the host at startup. Do not run brv connect, escalate permissions, or substitute polling/a new session. Report automatic receiving as unavailable in the current environment.",
+        ),
+        Some("other") => (
+            "unavailable",
+            "unsupported_host",
+            "No automatic delivery adapter is configured for this host. Do not run the Desktop-only brv connect or escalate permissions.",
+        ),
+        _ => (
+            "needs_input",
+            "session_kind_required",
+            "Identify session_kind from your current host context: codex-desktop, codex-cli, claude-cli, or other. Do not infer Desktop from CODEX_THREAD_ID or ask the user for a task ID. No connection command has been prepared.",
+        ),
+    };
+    Some(json!({"status":status,"reason":reason,"automatic_delivery":false,"message":message}))
+}
+
 /// CLI를 자식으로 실행하고 출력을 돌려준다. 설정 프로필은 이 MCP 세션의 것을 못 박는다
 /// (`BREVDUVA_CONFIG`) — 러너가 어떤 env를 넘기든 같은 리시버를 조작하게. stdin은 NUL:
 /// 묻는 명령(init)은 플래그로 답을 받는다.
@@ -381,15 +416,40 @@ mod tests {
     }
 
     #[test]
+    fn desktop_command_requires_explicit_desktop_context() {
+        for kind in [
+            json!("codex-cli"),
+            json!("claude-cli"),
+            json!("other"),
+            json!("codex"),
+            Value::Null,
+        ] {
+            let args = json!({"session_kind":kind});
+            assert!(connection_preflight(&args).is_some());
+            assert!(argv_for("receiver_connect", &args).is_err());
+        }
+        assert_eq!(
+            argv_for("receiver_connect", &json!({"session_kind":"codex-desktop"})).unwrap(),
+            ["connect"]
+        );
+    }
+
+    #[test]
     fn tools_map_to_the_cli_one_to_one() {
         let argv = |name: &str, args: Value| argv_for(name, &args).unwrap();
         assert_eq!(argv("receiver_status", json!({})), ["status"]);
         assert_eq!(
-            argv("receiver_connect", json!({"binding":"a@c"})),
+            argv(
+                "receiver_connect",
+                json!({"binding":"a@c","session_kind":"codex-desktop"})
+            ),
             ["connect", "--binding", "a@c"]
         );
         assert_eq!(
-            argv("receiver_connect", json!({"binding":"a@c","confirm":true})),
+            argv(
+                "receiver_connect",
+                json!({"binding":"a@c","confirm":true,"session_kind":"codex-desktop"})
+            ),
             ["connect", "--binding", "a@c", "--replace"]
         );
         assert_eq!(

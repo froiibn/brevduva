@@ -116,3 +116,9 @@ Windows 0.153.4에서 같은 TUI의 자동 모델 턴·도구 결과 입력·이
 
 공식 근거: [app-server](https://learn.chatgpt.com/docs/app-server),
 [remote TUI](https://learn.chatgpt.com/docs/cli/reference).
+
+## 일반 실행 환경의 활성화 실패 수정 (v0.6.35)
+
+일반 MCP의 `receiver_connect`는 `session_kind`로 실제 호스트를 구분한다. `codex-cli`이면 Desktop용 셸 명령을 반환하지 않고 `automatic_delivery=false`, `reason=codex_cli_not_configured`로 종료한다. 인자가 없으면 호스트 문맥을 먼저 확인하도록 한다. `--host codex`나 `CODEX_THREAD_ID`만으로 Desktop 여부를 추정하지 않는다. 공유 app-server 모드의 `receiver_connect(thread_id)` 계약은 유지한다.
+
+이 수정은 잘못된 연결 시도 방지다. 평소 실행한 독립 TUI의 자동 주입 요구는 미충족 상태다. 별도 시작 옵션·수신 조회·다른 세션 생성으로 사용자 환경 시험을 통과 처리하지 않는다.

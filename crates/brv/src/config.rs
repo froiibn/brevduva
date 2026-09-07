@@ -337,9 +337,21 @@ impl RawConfig {
 
 pub fn load() -> anyhow::Result<BrvConfig> {
     let path = config_path()?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("config not found at {path:?} — run `brv init` first"))?;
+    let text = std::fs::read_to_string(&path).map_err(|error| config_read_error(&path, error))?;
     parse(&text)
+}
+
+fn config_read_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    let message = match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("config not found at {path:?} — run `brv init` first")
+        }
+        std::io::ErrorKind::PermissionDenied => format!(
+            "permission denied reading config at {path:?}; check this process's file access or sandbox permissions. Do not run `brv init` or replace the existing config"
+        ),
+        _ => format!("could not read config at {path:?}"),
+    };
+    anyhow::Error::new(error).context(message)
 }
 
 /// 파싱+정규화 — load와 테스트가 공유하는 단일 경로.
@@ -751,6 +763,42 @@ pub fn load_tokens(cfg: &BrvConfig) -> anyhow::Result<std::collections::HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_read_errors_preserve_cause_and_only_missing_files_suggest_init() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+        ] {
+            let error = config_read_error(
+                Path::new("existing-config.toml"),
+                std::io::Error::from(kind),
+            );
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                kind
+            );
+            let message = error.to_string();
+            assert_eq!(
+                message.contains("config not found"),
+                kind == ErrorKind::NotFound
+            );
+            assert_eq!(
+                message.contains("run `brv init` first"),
+                kind == ErrorKind::NotFound
+            );
+            if kind == ErrorKind::PermissionDenied {
+                assert!(message.contains("permission denied"));
+                assert!(message.contains("Do not run"));
+            }
+        }
+    }
 
     /// 2026-09-03 (사용자 지시 "토큰 파일은 암호화 되는건가?"): 윈도우 설정 디렉터리는
     /// 소유자·SYSTEM·관리자만 접근할 수 있어야 한다 — 종전에는 상위 폴더의 `Users` 읽기·

@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Connect this current task and start receiving in the background
+    /// Connect the current Codex Desktop task (not a standalone CLI session)
     Connect {
         #[arg(long)]
         binding: Option<String>,

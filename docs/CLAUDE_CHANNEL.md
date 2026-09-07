@@ -101,3 +101,7 @@ Windows 로컬 테스트로 저널 보존·중복 방지·잘못된 receipt 거�
 설정 통과, 유휴 새 턴과 실제 receipt 호출, 사람 입력·승인 대기·두 메시지의 실제 모델
 처리 순서, 강제 종료와 OS별 실제 Claude 시험은 별도로 수행해야 한다.
 저널 용량 정책도 별도 후속 범위다.
+
+## 일반 실행 환경의 활성화 실패 수정 (v0.6.35)
+
+일반 MCP에서 `receiver_connect(session_kind="claude-cli")`를 호출하면 Desktop 셸 명령을 반환하지 않고 `automatic_delivery=false`, `reason=claude_channels_not_enabled`를 반환한다. Channels는 호스트의 시작 설정을 필요로 하므로 일반 실행 중인 세션에서 자동 활성화가 완료됐다고 보고하지 않는다. Channels 모드의 기존 전달 경로는 유지한다.

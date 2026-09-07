@@ -40,6 +40,10 @@ v0.6.34의 Codex CLI 어댑터는 TUI와 같은 로컬 app-server에 연결하�
 사용자 설정은 자동 변경하지 않는다. [Codex CLI 준비·검증 범위](docs/CODEX_CLI.md),
 [Claude Channels](docs/CLAUDE_CHANNEL.md)를 참고한다.
 
+### 일반 CLI 자동 수신의 현재 제한 (v0.6.35)
+
+평소처럼 실행한 `codex`·`claude`에 일반 MCP만 등록한 상태에서는 현재 대화의 자동 수신을 활성화하지 못합니다. v0.6.35는 CLI 요청이 Desktop 연결로 잘못 진행되는 경로와 설정 파일 접근 오류 안내를 수정합니다. 일반 실행 환경의 자동 주입 기능을 완성한 릴리스가 아닙니다. `receiver_connect`는 실제 `session_kind`를 요구하며, 일반 CLI에서는 명령 실행 없이 미지원 상태를 반환합니다.
+
 ## 설치
 
 리시버(`brv`) 바이너리 — macOS(arm64/x86_64) · Linux(x86_64/aarch64) · Windows(x86_64):

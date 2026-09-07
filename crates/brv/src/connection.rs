@@ -318,7 +318,7 @@ pub async fn command(
                 .clone()
         };
         // CODEX_THREAD_ID가 있어도 별도 CLI 실행체일 수 있다. 실제 owner 검증이 필수다.
-        crate::desktop::probe(&task.id).await.context("this task has no reachable supported Desktop owner; CLI/other-runner delivery is not yet supported")?;
+        crate::desktop::probe(&task.id).await.context("Desktop connection unavailable: `brv connect` only connects Codex Desktop tasks. It cannot activate automatic delivery in a standalone Codex or Claude CLI session. This is not a config-file permission error; do not retry with broader sandbox permissions. Inspect receiver_session_status in the CLI's MCP")?;
         if let Some(old) = &previous {
             anyhow::ensure!(
                 old.task == task || old.desired == Desired::Disconnected || replace,

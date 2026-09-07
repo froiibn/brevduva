@@ -39,6 +39,10 @@ Print configuration examples with `brv mcp --config <absolute-path> --binding or
 or `setup --runner codex --endpoint ws://127.0.0.1:4500`. These commands do not change user settings.
 See [Codex CLI setup and validation scope](docs/CODEX_CLI.md) and [Claude Channels](docs/CLAUDE_CHANNEL.md).
 
+### Current automatic delivery limitation in plain CLI sessions (v0.6.35)
+
+Ordinary `codex` or `claude` sessions with a plain MCP registration cannot enable automatic delivery into the current conversation. v0.6.35 fixes incorrect routing to Desktop connections and config-file access diagnostics; it does not complete automatic injection in the ordinary launch environment. `receiver_connect` requires the actual `session_kind` and returns an unavailable result for plain CLI sessions without preparing a shell command.
+
 ## Install
 
 Receiver (`brv`) binaries — macOS (arm64/x86_64) · Linux (x86_64/aarch64) · Windows (x86_64):

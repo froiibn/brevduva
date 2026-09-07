@@ -87,3 +87,9 @@ disconnect에서 종료와 설정 상태 변경을 확인했다. 검증 후 연�
 paused/disconnected 차단, 잠금 중 설정 원자 교체, MCP의 현재 작업 셸 전달,
 MCP 명령 매핑을 포함한다. 연결 자체는 Desktop probe로 검증하며 이전
 [실제 메시지 전달 시험](DESKTOP_RECEIVER.md)의 수신·자동 턴 경로를 재사용한다.
+
+## CLI 오연결 방지 (v0.6.35)
+
+일반 MCP의 `receiver_connect`는 `session_kind`를 필수로 받는다. 실제 Codex Desktop 문맥인 `codex-desktop`에서만 셸 명령을 준비하고, 실행 시 기존 exact-owner 검증을 유지한다. 일반 CLI·미확인 호스트는 셸 실행과 권한 승인 유도 없이 종료한다. CLI 전용 app-server 어댑터의 도구는 기존 `thread_id` 계약을 유지한다. 파일 접근 거부는 파일 없음과 분리해 원인을 보존하며, 접근 거부에 초기화를 권하지 않는다.
+
+회귀: 일반 CLI·미확인 환경에서 명령 미생성/미접속, Desktop 명령 유지, 파일 오류 원인별 안내, 기존 자동 전달 어댑터 테스트를 수행한다. 일반 CLI에서 추가 시작 설정 없는 자동 수신은 미충족이며 이번 진단 수정의 성공과 구분한다.
