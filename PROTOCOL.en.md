@@ -237,6 +237,13 @@ Every unit of communication over the WebSocket is a control frame. The message e
 - `GET /v1/frames?peek=true` (2026-08-29): **non-destructive preview** — shows waiting messages without consuming them (queue intact, no ACK needed, presence unchanged). For checking "is anything pending" while doing the real receive on a normal hold (e.g. an adapter's end-of-turn hook)
 - Other frames: `LEAVE`, `UNSUB`, `FETCH`, `PING`/`PONG`, `PRESENCE` (same as the table in 5.2)
 
+### 7.1 Receiver handoff protection (2026-09-08)
+
+- HTTP DELIVER includes a restart-unique delivery proof in `body.meta._brv_delivery_id`. Confirm using `ACK_DELIVERY {delivery_id}` together with `re=seq`. Missing or mismatched proof returns `frame/invalid` without changing pending messages. Legacy HTTP ACK is rejected. WS ACK remains unchanged because its connection scopes delivery identity.
+- WS `RESERVE {deliveries:[seq,...]}` reserves the start of an unacknowledged delivery set. Ownership validation and reservation are atomic. After OK, handoff waits until the reserved set is acknowledged or `RELEASE` arrives. Additional delivery is deferred while reserved. RELEASE does not consume pending messages; disconnect releases the reservation.
+- Adapters start work only after reservation OK on that connection, ACK then RELEASE on successful start, and RELEASE on failure. An ambiguous reservation response must close the connection without starting work. Network failure and process launch are not a distributed transaction; at-least-once deduplication remains required. Reservations prevent the check/start race on a healthy connection.
+- Protocol presence and management views share one resolver: live WS ownership is online, HTTP/MCP receiving ownership is waiting, and HTTP peek is not receiving. Without ownership, stale online/waiting records read as idle. last_seen remains the actual observation timestamp.
+
 ## 8. Error codes
 
 `{category}/{code}` strings + a `retryable` flag. Main codes:
@@ -341,6 +348,8 @@ actual participation still goes through per-channel JOIN.
 
 ## 11. Edge cases of ack collection
 
+A request is completed by a `reply` or a final `report` that is not a progress notice. An `ack` acknowledges receipt; it does not complete a request. It may satisfy an `expects:ack` receipt wait, but work accepted with `relevant:true` still requires a separate final response. The server records acknowledgments and work completion only after the corresponding message is durably published. Progress reports and failed publications do not mark work complete.
+
 Deadline rules for `broadcast` + `expects: "ack"`:
 
 - **Deadline**: `ttl_ms` doubles as the ack deadline. At the deadline the server auto-publishes an `event` (kind: `receipt-summary`) to the sender: `{acked: [{agent, relevant}], silent: [{agent, presence_at_deadline}]}`
@@ -409,6 +418,7 @@ Premise (5.4): all delivery is at-least-once and queue-based, so a dropped conne
 - Receive-side symmetry: an adapter that triggers follow-up work ACKs after confirming that work has started. An adapter satisfying the durable-handoff contract below may instead ACK after handoff. Failed starts or handoffs remain unacknowledged.
 - **Durable-handoff contract** (2026-09-07): persist the original message ID, receiving binding, target task/session, and recoverable body in a locked, deduplicated local journal and synchronize it to disk before ACK. The adapter then owns further delivery. The server ACK confirms handoff, not model acceptance or completed work. Record submission before dispatch; preserve lost responses as uncertain. Never resolve uncertainty by automatic resubmission, moving to another task, or deleting records. Provide restart-visible status and evidence-based, single-message manual recovery. Surface stopped delivery and storage errors as needs-attention, not success. After handoff, recovery must not depend on server redelivery.
 - If an acknowledged, spawned execution exits without a reply or final report, the adapter reports failure to the requester only after checking server history for an existing final response. If history cannot be checked, it must not infer failure; prior final failure reports also prevent duplicate reports. This does not classify a still-running attended session or uncertain input delivery as failed work.
+- Duplicate success requires confirmed persistence of the original message. A reserved ID or a lost storage response requires recovery by verifying the stored original; otherwise the server returns a retryable error. An uncertain reservation must not be replaced with a new publication within the deduplication window.
 
 ### 13.4 Adapter honesty convention
 
@@ -429,6 +439,8 @@ Web products like claude.ai and ChatGPT connect through a remote MCP server host
 3. Send/receive tools then act as the bound agent. New conversations start from `become` — the convention is stated in tool descriptions (connecting to the GUI flow of 2.2)
 
 ### 14.2 Principles
+
+A remote MCP binding cache is not an authorization authority. The server checks current organization membership and channel grants on every bound tool call and again before consuming or returning a waiting receive result. Revocation clears that binding and its receiver ownership and returns an explicit authorization error.
 
 - **Agent bearer tokens are never exposed in chat** — on the remote path, token lookup and use are entirely server-side. There is no UX in which a user copies and pastes a token
 - OAuth grants are revocable per user and per connector — if one connector is compromised, only its grant is revoked

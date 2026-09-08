@@ -128,6 +128,11 @@ pub fn report_payload_is_progress(payload: Option<&str>) -> bool {
     }
 }
 
+/// 요청의 최종 응답 판정 (3.1·9·11장). ACK는 수신 확인이며 업무 완료가 아니다.
+pub fn is_final_reply(kind: Kind, payload: Option<&str>) -> bool {
+    kind == Kind::Reply || (kind == Kind::Report && !report_payload_is_progress(payload))
+}
+
 /// 어댑터의 `report` 도구가 본문을 발행 전에 어휘에 맞춘다 (3.1): JSON이 아니거나 `status`가 없는
 /// 본문은 `{"status":"in-progress","note":본문}`으로 감싼다. 감쌀 필요가 없으면 None.
 /// 읽는 쪽 규칙(위)과 뜻은 같고, 옛 읽는 쪽(감싸기 이전 버전)도 올바로 읽게 하는 것이 목적이다.
@@ -144,6 +149,15 @@ pub fn coerce_report_payload(payload: &str) -> Option<String> {
 }
 
 impl Envelope {
+    /// ACK 대기만 ACK로 해소한다. 업무 답변 대기는 최종 응답이 필요하다.
+    pub fn satisfies_expectation(&self, expects: Expects) -> bool {
+        self.is_final_reply() || (expects == Expects::Ack && self.kind == Kind::Ack)
+    }
+
+    pub fn is_final_reply(&self) -> bool {
+        is_final_reply(self.kind, self.payload.as_deref())
+    }
+
     /// 진행 알림인가 — `report`이면서 본문이 [`report_payload_is_progress`] (3.1). 응답을 기다리는 쪽은
     /// 이것을 **최종 답으로 세지 않는다** — 진행 정보로 넘기고 계속 기다린다 (9장 6항).
     pub fn is_progress_report(&self) -> bool {
@@ -285,6 +299,24 @@ mod tests {
             !e.is_progress_report(),
             "only reports can be progress notices"
         );
+    }
+
+    #[test]
+    fn receipt_and_progress_do_not_complete_a_request() {
+        let mut ack = base();
+        ack.kind = Kind::Ack;
+        assert!(ack.satisfies_expectation(Expects::Ack));
+        assert!(!ack.satisfies_expectation(Expects::Reply));
+
+        assert!(!is_final_reply(Kind::Ack, Some(r#"{"relevant":true}"#)));
+        assert!(!is_final_reply(
+            Kind::Report,
+            Some(r#"{"status":"in-progress"}"#)
+        ));
+        assert!(!is_final_reply(Kind::Report, Some("착수했다")));
+        assert!(is_final_reply(Kind::Reply, Some("답변")));
+        assert!(is_final_reply(Kind::Report, Some(r#"{"status":"done"}"#)));
+        assert!(is_final_reply(Kind::Report, Some(r#"{"status":"failed"}"#)));
     }
 
     /// 어댑터 `report` 도구의 본문 정규화: JSON 아님·status 없음 → in-progress로 감쌈(본문은 note에 보존),

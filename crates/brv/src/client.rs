@@ -218,7 +218,8 @@ enum Cmd {
     Recv(RecvFilter, bool, oneshot::Sender<(Envelope, u64)>),
     // recv_manual로 받은 전달의 확인 — 깨우기 성공 등 "처리 보장" 시점에 호출
     Confirm(u64),
-    Validate(Vec<u64>, oneshot::Sender<Result<(), String>>),
+    Reserve(Vec<u64>, oneshot::Sender<Result<(), String>>),
+    ReleaseReservation,
     Fetch {
         query: FetchQuery,
         resp: oneshot::Sender<Result<Vec<Envelope>, String>>,
@@ -321,20 +322,28 @@ impl Client {
         }
     }
 
-    /// 같은 연결의 PING/PONG 장벽 뒤에도 확인 유보 토큰이 유효해야 wake할 수 있다.
-    pub async fn validate_delivery(&self, tokens: Vec<u64>) -> Result<(), String> {
+    /// 서버의 착수 예약을 얻는다. 성공 후 ACK 또는 release_reservation으로 반드시 해제한다.
+    pub async fn reserve_delivery(&self, tokens: Vec<u64>) -> Result<(), String> {
         if let Some(error) = self.receive_error() {
             return Err(error);
         }
         let (tx, rx) = oneshot::channel();
         self.cmds
-            .send(Cmd::Validate(tokens, tx))
+            .send(Cmd::Reserve(tokens, tx))
             .await
             .map_err(|_| "connection-closed".to_owned())?;
-        timeout(Duration::from_secs(5), rx)
-            .await
-            .map_err(|_| "receiver ownership check timed out".to_owned())?
-            .map_err(|_| "connection-closed: ownership check interrupted".to_owned())?
+        match timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(result)) => result,
+            _ => {
+                // 예약 응답 유실은 허가가 아니다. 서버 예약도 연결 종료로 회수한다.
+                self.stop();
+                Err("connection-closed: reservation outcome unknown; receiver stopped".into())
+            }
+        }
+    }
+
+    pub async fn release_reservation(&self) {
+        let _ = self.cmds.send(Cmd::ReleaseReservation).await;
     }
 
     /// 전달 어댑터가 중단되면 접속 자리도 반납한다. 미확인 PUB/수신은 성공으로 바꾸지 않는다.
@@ -427,12 +436,13 @@ impl Client {
                 .await
             {
                 Some(env) if env.is_progress_report() => progress = Some(env),
-                Some(reply) => {
+                Some(reply) if reply.is_final_reply() => {
                     return ReplyWait::Replied {
                         reply: Box::new(reply),
                         progress,
                     };
                 }
+                Some(_) => {} // ACK는 소비하되 최종 답변 대기를 끝내지 않는다.
                 None => return ReplyWait::Pending { progress },
             }
         }
@@ -525,7 +535,7 @@ struct OutboxEntry {
 }
 
 enum Pending {
-    Validate(Vec<u64>, oneshot::Sender<Result<(), String>>),
+    Reserve(Vec<u64>, oneshot::Sender<Result<(), String>>),
     Pub(ClientKey),
     Fetch(oneshot::Sender<Result<Vec<Envelope>, String>>),
     Presence(oneshot::Sender<Result<Vec<PresenceEntry>, String>>),
@@ -751,18 +761,30 @@ impl Actor {
 
     async fn handle_cmd(&mut self, ws: &mut Ws, cmd: Cmd) {
         match cmd {
-            Cmd::Validate(tokens, resp) => {
+            Cmd::ReleaseReservation => {
+                let _ = send_frame(
+                    ws,
+                    &ClientFrame {
+                        seq: None,
+                        re: None,
+                        op: ClientOp::Release,
+                    },
+                )
+                .await;
+            }
+            Cmd::Reserve(tokens, resp) => {
                 if tokens.is_empty() || tokens.iter().any(|t| !self.unacked.contains_key(t)) {
                     let _ = resp.send(Err("agent/session-conflict: delivery tokens no longer belong to this connection".into()));
                 } else {
                     let seq = self.next_seq();
-                    self.pending.insert(seq, Pending::Validate(tokens, resp));
+                    let deliveries = tokens.iter().map(|t| self.unacked[t].0).collect();
+                    self.pending.insert(seq, Pending::Reserve(tokens, resp));
                     let _ = send_frame(
                         ws,
                         &ClientFrame {
                             seq: Some(seq),
                             re: None,
-                            op: ClientOp::Ping,
+                            op: ClientOp::Reserve { deliveries },
                         },
                     )
                     .await;
@@ -835,7 +857,7 @@ impl Actor {
 
     fn resolve_ok(&mut self, re: u64, body: OkBody) {
         match self.pending.remove(&re) {
-            Some(Pending::Validate(tokens, resp)) => {
+            Some(Pending::Reserve(tokens, resp)) => {
                 let valid = tokens.iter().all(|t| self.unacked.contains_key(t));
                 let _ = resp.send(if valid {
                     Ok(())
@@ -863,7 +885,7 @@ impl Actor {
 
     fn resolve_err(&mut self, re: u64, body: ErrBody) {
         match self.pending.remove(&re) {
-            Some(Pending::Validate(_, resp)) => {
+            Some(Pending::Reserve(_, resp)) => {
                 let _ = resp.send(Err(format!("{}: {}", body.code, body.message)));
             }
             Some(Pending::Pub(key)) => {
@@ -895,7 +917,7 @@ impl Actor {
         self.waiters.clear();
         for (_, pending) in self.pending.drain() {
             match pending {
-                Pending::Validate(_, resp) => {
+                Pending::Reserve(_, resp) => {
                     let _ = resp.send(Err("connection-closed: ownership check interrupted".into()));
                 }
                 Pending::Pub(_) => {} // outbox가 진실 — 재발행된다
@@ -1671,7 +1693,7 @@ mod tests {
         .unwrap();
         assert!(
             client
-                .validate_delivery(vec![token])
+                .reserve_delivery(vec![token])
                 .await
                 .unwrap_err()
                 .contains("agent/session-conflict")
@@ -1718,9 +1740,12 @@ mod tests {
                 } else {
                     while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
                         let frame: Value = serde_json::from_str(&text).unwrap();
-                        if frame["op"] == "PING" {
+                        if frame["op"] == "PING" || frame["op"] == "RESERVE" {
+                            if frame["op"] == "RESERVE" {
+                                assert_eq!(frame["body"]["deliveries"], serde_json::json!([1]));
+                            }
                             ws.send(WsMessage::Text(
-                                serde_json::json!({"op":"PONG","re":frame["seq"]})
+                                serde_json::json!({"op":if frame["op"] == "RESERVE" {"OK"} else {"PONG"},"re":frame["seq"],"body":{}})
                                     .to_string()
                                     .into(),
                             ))
@@ -1759,10 +1784,67 @@ mod tests {
             .unwrap();
         assert_ne!(old, new);
         assert_ne!(old_receiver, client.receiver_descriptor().unwrap());
-        assert!(client.validate_delivery(vec![old]).await.is_err());
-        client.validate_delivery(vec![new]).await.unwrap();
+        assert!(client.reserve_delivery(vec![old]).await.is_err());
+        client.reserve_delivery(vec![new]).await.unwrap();
         client.stop();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_reservation_response_closes_connection_without_permission_to_start() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let join = ws.next().await.unwrap().unwrap();
+            let join: Value = serde_json::from_str(join.to_text().unwrap()).unwrap();
+            ws.send(WsMessage::Text(
+                serde_json::json!({"op":"OK","re":join["seq"],"body":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(WsMessage::Text(serde_json::json!({"op":"DELIVER","seq":1,"body":{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","client_key":"01ARZ3NDEKTSV4RRFFQ69G5FAV","from":"b","to":"agent:a","kind":"message","hops":0,"content_type":"text/plain","payload":"pending","meta":{}}}).to_string().into())).await.unwrap();
+            let mut reserved = false;
+            while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(
+                    frame["op"], "ACK",
+                    "an ambiguous start must not consume delivery"
+                );
+                if frame["op"] == "RESERVE" {
+                    reserved = true; // 응답 유실: 허가를 돌려주지 않는다.
+                } else if frame["op"] == "PING" {
+                    ws.send(WsMessage::Text(
+                        serde_json::json!({"op":"PONG","re":frame["seq"]})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            }
+            assert!(reserved);
+        });
+        let client = Client::connect(ClientOptions::new(url, "c", "a", "fake"));
+        let (_, token) = client
+            .recv_manual(RecvFilter::Any, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .reserve_delivery(vec![token])
+                .await
+                .unwrap_err()
+                .contains("outcome unknown")
+        );
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!client.is_alive());
     }
 
     #[test]

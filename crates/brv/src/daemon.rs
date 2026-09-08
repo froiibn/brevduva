@@ -687,7 +687,7 @@ async fn binding_loop(
             // 한다 (2026-09-04, 아래 report_unanswered — 저널·로그는 수신 머신에만 남는다).
             // 깨우기 표식은 스폰 **전에** 켠다 — 깨어난 세션의 MCP가 뜨는 시점에 이미 보여야 한다
             if let Err(error) = client
-                .validate_delivery(batch.iter().map(|(_, token)| *token).collect())
+                .reserve_delivery(batch.iter().map(|(_, token)| *token).collect())
                 .await
             {
                 tracing::warn!(binding = %binding.label(), %error, "wake cancelled: receiver ownership is no longer confirmed");
@@ -699,6 +699,7 @@ async fn binding_loop(
                     for (_, token) in &batch {
                         client.confirm(*token).await;
                     }
+                    client.release_reservation().await;
                     // 착수 알림 (2026-09-04): 요청은 응답까지 오래 걸릴 수 있다 — 발신자가
                     // "작업 중 / 미수신 / 세션 소멸"을 구분할 첫 신호를 스폰 직후에 준다
                     report_started(&opts, &envelopes, wake.timeout_s).await;
@@ -721,6 +722,7 @@ async fn binding_loop(
                     }
                 }
                 Err(e) => {
+                    client.release_reservation().await;
                     tracing::error!(
                         binding = %binding.label(),
                         error = %e,
@@ -938,7 +940,7 @@ async fn report_unanswered(
     // 답이 다음 페이지에 있어도 "미응답"이 된다. 기다리는 correlation이 전부 해소되면 일찍 멈추고,
     // 페이지 상한에 닿았는데 스트림이 안 끝났으면 **불확실**로 보고 침묵한다 — 불확실한 이력은
     // 미응답의 증거가 아니다.
-    // "응답했다"로 치는 것은 **최종** 반응뿐이다: reply·ack, 그리고 진행 알림(3.1)이 아닌 report.
+    // "응답했다"로 치는 것은 **최종** 반응뿐이다: reply와 최종 report. expects:ack인 건만 ACK로 해소된다.
     // 데몬 자신이 스폰 직후 낸 착수 알림(in-progress)을 응답으로 세면 실패가 영원히 가려진다
     // (2026-09-04 회귀 테스트가 처음 잡은 것). 이미 낸 failed 보고는 응답으로 친다 — 재깨움 때
     // 같은 correlation에 실패 보고가 두 번 나가지 않게 하는 멱등 장치다.
@@ -973,10 +975,13 @@ async fn report_unanswered(
         answered.extend(
             page.iter()
                 .filter(|e| e.from.as_str() == binding.agent)
-                .filter(|e| match e.kind {
-                    Kind::Reply | Kind::Ack => true,
-                    Kind::Report => !e.is_progress_report(),
-                    _ => false,
+                .filter(|e| {
+                    awaited.iter().any(|request| {
+                        request.id == e.correlation_id
+                            && request
+                                .expects
+                                .is_some_and(|expected| e.satisfies_expectation(expected))
+                    })
                 })
                 .filter_map(|e| e.correlation_id.as_ref().map(|c| c.as_str().to_owned())),
         );

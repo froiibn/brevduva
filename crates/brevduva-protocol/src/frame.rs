@@ -61,6 +61,15 @@ pub enum ClientOp {
     /// DELIVER 수신 확인 (`re`로 대상 지정) — at-least-once의 클라이언트 절반.
     #[serde(rename = "ACK")]
     Ack,
+    /// HTTP 전달 증명과 re를 함께 검증하는 수신 확인.
+    #[serde(rename = "ACK_DELIVERY")]
+    AckDelivery { delivery_id: String },
+    /// 미확인 전달의 착수 동안 수신 점유 인계를 유보한다 (7.1).
+    #[serde(rename = "RESERVE")]
+    Reserve { deliveries: Vec<u64> },
+    /// 착수 예약 해제. 미확인 전달을 소비하지 않는다.
+    #[serde(rename = "RELEASE")]
+    Release,
     /// 히스토리 조회 — 시간·ID 커서 기반, 페이지 최대 100건 (12.2).
     #[serde(rename = "FETCH")]
     Fetch {

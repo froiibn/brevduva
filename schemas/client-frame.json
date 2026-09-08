@@ -435,6 +435,74 @@
       "type": "object"
     },
     {
+      "description": "HTTP 전달 증명과 re를 함께 검증하는 수신 확인.",
+      "properties": {
+        "body": {
+          "properties": {
+            "delivery_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "delivery_id"
+          ],
+          "type": "object"
+        },
+        "op": {
+          "const": "ACK_DELIVERY",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "미확인 전달의 착수 동안 수신 점유 인계를 유보한다 (7.1).",
+      "properties": {
+        "body": {
+          "properties": {
+            "deliveries": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "deliveries"
+          ],
+          "type": "object"
+        },
+        "op": {
+          "const": "RESERVE",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "착수 예약 해제. 미확인 전달을 소비하지 않는다.",
+      "properties": {
+        "op": {
+          "const": "RELEASE",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    {
       "description": "히스토리 조회 — 시간·ID 커서 기반, 페이지 최대 100건 (12.2).",
       "properties": {
         "body": {

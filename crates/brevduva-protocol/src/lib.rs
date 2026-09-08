@@ -26,7 +26,8 @@ mod topic;
 pub use address::Address;
 pub use capability::{Capabilities, ReceiveMode};
 pub use envelope::{
-    Envelope, Expects, Kind, PayloadRef, coerce_report_payload, report_payload_is_progress,
+    Envelope, Expects, Kind, PayloadRef, coerce_report_payload, is_final_reply,
+    report_payload_is_progress,
 };
 pub use errcode::ErrorCode;
 pub use error::ParseError;
