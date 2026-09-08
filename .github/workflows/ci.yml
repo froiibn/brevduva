@@ -14,8 +14,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Install pinned toolchain
         run: rustup show
+      - name: Release procedure regression
+        run: python -m unittest discover -s .github/tests
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

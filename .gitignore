@@ -1,3 +1,6 @@
 /target
 /CLAUDE.md
 /AGENTS.md
+
+/.github/__pycache__/
+/.github/tests/__pycache__/

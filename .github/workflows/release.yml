@@ -1,4 +1,4 @@
-# 릴리스 파이프라인 (2026-08-27) — 태그 `v*` 푸시 → 5종 타깃 빌드 → GitHub Release 게시.
+# 릴리스: 검증된 태그에서 명시적으로 실행 → 정확한 SHA의 CI 확인 → 5종 자산 검증 → 공개.
 #
 # 자산 이름에 버전을 넣지 않는다(`brv-<target>.tar.gz`) — install.sh가
 # /releases/latest/download/ 고정 URL로 항상 최신을 받기 위함. 버전은 태그가 담는다.
@@ -8,14 +8,30 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python3 .github/release_tools.py check
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
+    needs: verify
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -76,24 +92,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          merge-multiple: true
-          path: dist
-      - name: checksums
-        run: cd dist && sha256sum brv-* > SHA256SUMS
-      - name: release
+          python-version: "3.13"
+      - name: Verify artifacts and publish atomically
+        run: python3 .github/release_tools.py publish
         env:
           GH_TOKEN: ${{ github.token }}
-        # -R 필수: 이 잡은 checkout이 없어 gh가 리포를 git에서 추론하지 못한다.
-        # 재실행 시 릴리스가 이미 있으면 자산만 갱신 (--clobber)
-        run: |
-          notes="docs/RELEASE_${GITHUB_REF_NAME#v}.md"
-          if [ ! -f "$notes" ]; then
-            notes="$RUNNER_TEMP/brv-release-notes.md"
-            printf '%s\n' '설치: https://brevduva.dev/install.sh · https://brevduva.dev/install.ps1 — 자산은 SHA256SUMS로 검증하세요.' > "$notes"
-          fi
-          gh release create "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" \
-            --title "brv $GITHUB_REF_NAME" \
-            --notes-file "$notes" \
-          || gh release upload "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --clobber
