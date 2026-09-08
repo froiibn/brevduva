@@ -12,6 +12,13 @@ spec.loader.exec_module(tools)
 SHA = "a" * 40
 
 class ReleaseTests(unittest.TestCase):
+    def test_real_manifest_and_bom_are_supported(self):
+        manifest = '[workspace.package]\nversion = "1.2.3"\n'
+        for prefix in ["", "\ufeff"]:
+            self.assertEqual(tools.manifest_version(prefix+manifest),"1.2.3")
+        actual = (Path(__file__).parents[2]/"Cargo.toml").read_text(encoding="utf-8")
+        self.assertRegex(tools.manifest_version(actual),r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
     def record(self, number=1, status="completed", conclusion="success", sha=SHA):
         return dict(id=number, head_sha=sha, event="push", status=status, conclusion=conclusion, html_url="test")
 

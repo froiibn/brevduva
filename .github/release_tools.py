@@ -19,11 +19,16 @@ ASSETS = {
 
 
 def run(*args):
-    return subprocess.check_output(args, text=True).strip()
+    return subprocess.check_output(args, text=True, encoding="utf-8").strip()
 
 
 def api(path):
     return json.loads(run("gh", "api", path))
+
+
+def manifest_version(contents):
+    # 기존 Cargo.toml은 UTF-8 BOM을 포함한다. 경로 읽기와 git show 모두 같은 규칙을 쓴다.
+    return tomllib.loads(contents.removeprefix("\ufeff"))["workspace"]["package"]["version"]
 
 
 def successful_run(repo, sha, workflow="ci.yml", event="push"):
@@ -105,7 +110,7 @@ def main():
     parser.add_argument("action", choices=["check", "publish"])
     args = parser.parse_args()
     repo, sha, tag = (os.environ[k] for k in ["GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF_NAME"])
-    version = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+    version = manifest_version(Path("Cargo.toml").read_text(encoding="utf-8"))
     if os.environ.get("GITHUB_REF_TYPE") != "tag" or tag != "v" + version:
         raise ValueError("버전과 일치하는 태그에서만 릴리스할 수 있습니다")
     successful_run(repo, sha)
