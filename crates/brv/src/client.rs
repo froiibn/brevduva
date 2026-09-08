@@ -169,6 +169,8 @@ impl PublishSpec {
 /// `wait_for_reply`의 결과 — 최종 답이 왔거나, 진행 알림만 온 채(또는 아무것도 없이) 시간이 다했거나.
 #[derive(Debug)]
 pub enum ReplyWait {
+    /// 첨부 판정 실패는 미수신/진행 상태가 아니다. 소비를 확정하지 않아 재시도할 수 있다.
+    Error(String),
     Replied {
         /// Box: 봉투가 크고(수백 바이트) Pending 변형은 작다 — variant 크기 차이 경고 회피.
         reply: Box<Envelope>,
@@ -432,17 +434,36 @@ impl Client {
                 return ReplyWait::Pending { progress };
             }
             match self
-                .recv(RecvFilter::Correlation(correlation.to_owned()), left)
+                .recv_manual(RecvFilter::Correlation(correlation.to_owned()), left)
                 .await
             {
-                Some(env) if env.is_progress_report() => progress = Some(env),
-                Some(reply) if reply.is_final_reply() => {
-                    return ReplyWait::Replied {
-                        reply: Box::new(reply),
-                        progress,
+                Some((env, token)) => {
+                    // 완료 판정은 표시용 첨부 미리보기가 아닌 전체 본문을 사용한다.
+                    let classification = timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        final_response(&self.server, &self.channel, &self.token, &env),
+                    )
+                    .await;
+                    let final_reply = match classification {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(error)) => return ReplyWait::Error(error.to_string()),
+                        Err(_) => {
+                            return ReplyWait::Error(
+                                "report attachment classification timed out; retry".into(),
+                            );
+                        }
                     };
+                    self.confirm(token).await;
+                    if final_reply {
+                        return ReplyWait::Replied {
+                            reply: Box::new(env),
+                            progress,
+                        };
+                    }
+                    if env.kind == Kind::Report {
+                        progress = Some(env);
+                    }
                 }
-                Some(_) => {} // ACK는 소비하되 최종 답변 대기를 끝내지 않는다.
                 None => return ReplyWait::Pending { progress },
             }
         }
@@ -1213,6 +1234,30 @@ pub async fn download_blob(
     Ok(resp.bytes().await.context("blob body")?.to_vec())
 }
 
+/// 첨부 유무와 무관한 완료 판정. 읽기 실패는 진행/미응답으로 오인하지 않고 전파한다.
+pub async fn final_response(
+    server: &str,
+    channel: &str,
+    token: &str,
+    env: &Envelope,
+) -> anyhow::Result<bool> {
+    if env.kind == Kind::Report
+        && let Some(reference) = &env.payload_ref
+    {
+        let bytes = timeout(
+            Duration::from_secs(30),
+            download_blob(server, channel, token, &reference.id, None),
+        )
+        .await
+        .context("report attachment read timed out; retry")??;
+        return Ok(brevduva_protocol::is_final_reply(
+            env.kind,
+            std::str::from_utf8(&bytes).ok(),
+        ));
+    }
+    Ok(env.is_final_reply())
+}
+
 /// 롱폴 엔드포인트(7장 — WS와 동일 시맨틱)로 프레임 하나를 보내고 OK 본문을 받는다.
 /// **액터를 거치지 않는다**: 데몬이 자리를 양보한 standby 중에도 즉시 동작해야 하는 조회·발행용
 /// (2026-09-04 — `client.fetch()`는 standby 중 큐에 갇혀 최대 `standby_probe`만큼 늦는다).
@@ -1594,6 +1639,31 @@ async fn run_connection(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn report_attachment_failure_is_an_error_not_progress() {
+        use super::*;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        });
+        let env: Envelope = serde_json::from_value(serde_json::json!({
+            "v":1,"client_key":ClientKey::generate(),"from":"peer","to":"agent:reader","kind":"report",
+            "correlation_id":MessageId::generate(),"content_type":"application/json",
+            "payload_ref":{"id":"blob_test","size":300000,"sha256":"test","content_type":"application/json"}
+        })).unwrap();
+        assert!(
+            final_response(&format!("http://{address}"), "c", "fake", &env)
+                .await
+                .is_err()
+        );
+        serving.await.unwrap();
+    }
+
     #[tokio::test]
     async fn stopped_adapter_releases_socket_despite_other_client_handles() {
         use super::*;

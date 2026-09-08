@@ -121,6 +121,8 @@ The common schema for every message. Serialization is JSON (UTF-8) in v1; CBOR n
 
 **Broadcast completion determination** (the answer to a previously open planning question): send `broadcast` + `expects: "ack"`, and each receiving agent answers with an `ack` carrying `{"relevant": true|false}`; agents that answered "relevant" send a `report` when done. The sender determines completion by "collect acks → await reports from the relevant ones." The ack deadline is the message's `ttl_ms`.
 
+**Attachment report classification** (2026-09-09): `payload_ref` changes only where the body is stored. Apply the status rules above to the complete attachment, never to the absent inline body or a display preview. If the body cannot be read, surface a classification error and do not acknowledge consumption in a reply wait. Session-exit checks must not treat that failure as evidence of an unanswered request. Display previews and progressive reading may remain unchanged after classification.
+
 ### 3.2 payload_ref — claim-check
 
 ```jsonc

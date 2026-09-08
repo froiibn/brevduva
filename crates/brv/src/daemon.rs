@@ -972,19 +972,36 @@ async fn report_unanswered(
                 return;
             }
         };
-        answered.extend(
-            page.iter()
-                .filter(|e| e.from.as_str() == binding.agent)
-                .filter(|e| {
-                    awaited.iter().any(|request| {
-                        request.id == e.correlation_id
-                            && request
-                                .expects
-                                .is_some_and(|expected| e.satisfies_expectation(expected))
-                    })
-                })
-                .filter_map(|e| e.correlation_id.as_ref().map(|c| c.as_str().to_owned())),
-        );
+        for env in page.iter().filter(|e| e.from.as_str() == binding.agent) {
+            let Some(expected) = awaited
+                .iter()
+                .find(|request| request.id == env.correlation_id)
+                .and_then(|request| request.expects)
+            else {
+                continue;
+            };
+            let final_reply = match crate::client::final_response(
+                &opts.server,
+                &opts.channel,
+                &opts.token,
+                env,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "report attachment unavailable — uncertain, not reporting");
+                    return;
+                }
+            };
+            if (final_reply
+                || (expected == brevduva_protocol::Expects::Ack
+                    && env.kind == brevduva_protocol::Kind::Ack))
+                && let Some(id) = &env.correlation_id
+            {
+                answered.insert(id.as_str().to_owned());
+            }
+        }
         if wanted.iter().all(|id| answered.contains(*id)) {
             exhausted = true; // 볼 것을 다 봤다 — 더 읽을 이유가 없다
             break;

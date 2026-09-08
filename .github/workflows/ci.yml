@@ -19,3 +19,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Regression under an unattended host environment
+        run: cargo test -p brv --lib
+        env:
+          BREVDUVA_BINDING: qa-unattended@isolated

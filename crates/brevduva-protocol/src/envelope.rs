@@ -129,6 +129,7 @@ pub fn report_payload_is_progress(payload: Option<&str>) -> bool {
 }
 
 /// 요청의 최종 응답 판정 (3.1·9·11장). ACK는 수신 확인이며 업무 완료가 아니다.
+/// 첨부 report는 호출자가 전체 본문을 읽어 전달해야 한다. 잘린 미리보기는 판정 입력이 아니다.
 pub fn is_final_reply(kind: Kind, payload: Option<&str>) -> bool {
     kind == Kind::Reply || (kind == Kind::Report && !report_payload_is_progress(payload))
 }
@@ -154,6 +155,7 @@ impl Envelope {
         self.is_final_reply() || (expects == Expects::Ack && self.kind == Kind::Ack)
     }
 
+    /// 인라인 봉투의 판정. payload_ref report는 I/O 계층에서 원문을 읽고 자유 함수를 사용한다.
     pub fn is_final_reply(&self) -> bool {
         is_final_reply(self.kind, self.payload.as_deref())
     }

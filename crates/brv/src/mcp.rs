@@ -31,6 +31,9 @@ struct CodexSetup {
 }
 
 pub struct McpServer {
+    // 테스트는 프로세스 전역 환경을 바꾸지 않고 인스턴스별 판정 입력을 지정한다.
+    #[cfg(test)]
+    attendance_override: Option<fn() -> crate::manage::Attendance>,
     opts: ClientOptions,
     /// 이 MCP 프로세스를 띄운 러너 id — 등록 시 `--host`로 받은 값 (2026-09-05, 1단계). 추측하지
     /// 않으므로 손 등록은 None이 정상. 지금은 initialize 응답에 되비치기만 한다 — 유인 세션
@@ -52,8 +55,18 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    fn attendance(&self) -> crate::manage::Attendance {
+        #[cfg(test)]
+        if let Some(probe) = self.attendance_override {
+            return probe();
+        }
+        crate::manage::attendance()
+    }
+
     pub fn new(opts: ClientOptions, host: Option<String>) -> Self {
         Self {
+            #[cfg(test)]
+            attendance_override: None,
             opts,
             host,
             client: None,
@@ -192,7 +205,7 @@ impl McpServer {
                 if let Some(list) = tools.as_array_mut() {
                     list.extend(crate::claude_channel::tools());
                 }
-                if let crate::manage::Attendance::Attended = crate::manage::attendance()
+                if let crate::manage::Attendance::Attended = self.attendance()
                     && let Some(list) = tools.as_array_mut()
                 {
                     list.extend(crate::manage::tool_definitions());
@@ -243,6 +256,10 @@ impl McpServer {
     /// `request`·`wait_for_reply`의 공통 응답 — 최종 답만 `replied`, 진행 알림은 `progress`로 (9장).
     async fn render_reply_wait(&mut self, correlation: &str, outcome: ReplyWait) -> (Value, bool) {
         match outcome {
+            ReplyWait::Error(message) => (
+                json!({"status":"error","message":message,"correlation_id":correlation}),
+                true,
+            ),
             ReplyWait::Replied { reply, progress } => {
                 let mut v =
                     json!({ "status": "replied", "reply": self.record_and_resolve(&reply).await });
@@ -367,10 +384,7 @@ impl McpServer {
                 Some("codex-cli" | "claude-cli" | "claude-code")
             )
         {
-            if !matches!(
-                crate::manage::attendance(),
-                crate::manage::Attendance::Attended
-            ) {
+            if !matches!(self.attendance(), crate::manage::Attendance::Attended) {
                 return (
                     json!({"status":"refused","message":"activation requires an attended session"}),
                     true,
@@ -385,10 +399,7 @@ impl McpServer {
             };
         }
         if name == "receiver_connect" && self.codex_setup.is_some() {
-            if !matches!(
-                crate::manage::attendance(),
-                crate::manage::Attendance::Attended
-            ) {
+            if !matches!(self.attendance(), crate::manage::Attendance::Attended) {
                 return (
                     json!({"status":"refused","message":"CLI binding requires an attended session"}),
                     true,
@@ -441,10 +452,7 @@ impl McpServer {
         }
         if let Some(channel) = self.channel.clone() {
             if name == "channel_pause" {
-                if !matches!(
-                    crate::manage::attendance(),
-                    crate::manage::Attendance::Attended
-                ) {
+                if !matches!(self.attendance(), crate::manage::Attendance::Attended) {
                     return (
                         json!({"status":"refused","message":"pause/resume requires an attended operator"}),
                         true,
@@ -501,7 +509,7 @@ impl McpServer {
         // 리시버 관리 (2026-09-04, 재설계 4): CLI를 자식으로 실행 — 채널에는 붙지 않는다.
         // 호출 시점에 유인/무인을 다시 검사한다 (목록을 받은 뒤 깨우기가 시작됐을 수 있다)
         if crate::manage::is_management_tool(name) {
-            if let crate::manage::Attendance::Unattended(why) = crate::manage::attendance() {
+            if let crate::manage::Attendance::Unattended(why) = self.attendance() {
                 return (
                     json!({ "status": "refused", "message": format!(
                         "receiver management is for attended sessions only — {why}. Tell the requester that this machine's receiver settings can only be changed by its owner in an interactive session."
@@ -1089,11 +1097,57 @@ pub async fn run_codex_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn attended_server(opts: ClientOptions, host: Option<String>) -> McpServer {
+        let mut server = McpServer::new(opts, host);
+        server.attendance_override = Some(|| crate::manage::Attendance::Attended);
+        server
+    }
+
+    #[tokio::test]
+    async fn unattended_activation_and_binding_remain_refused() {
+        for probe in [
+            (|| crate::manage::attendance_from(true, false)) as fn() -> crate::manage::Attendance,
+            || crate::manage::attendance_from(false, true),
+        ] {
+            let mut server = attended_server(
+                ClientOptions::new("http://127.0.0.1:1", "c", "a", "fake"),
+                None,
+            );
+            server.attendance_override = Some(probe);
+            let identity = crate::delivery::Identity {
+                server: "test".into(),
+                binding: "org/a@c".into(),
+            };
+            server.local_setup = Some((
+                std::env::temp_dir().join("unused-refused-journal"),
+                identity.clone(),
+            ));
+            let (value, error) = server
+                .call_tool("receiver_connect", &json!({"session_kind":"claude-cli"}))
+                .await;
+            assert!(error);
+            assert_eq!(value["message"], "activation requires an attended session");
+            server.codex_setup = Some(CodexSetup {
+                endpoint: "http://127.0.0.1:1".into(),
+                token_env: None,
+                path: std::env::temp_dir().join("unused-refused-codex"),
+                identity,
+            });
+            let (value, error) = server
+                .call_tool("receiver_connect", &json!({"thread_id":"fake"}))
+                .await;
+            assert!(error);
+            assert_eq!(value["message"], "CLI binding requires an attended session");
+            assert!(server.client.is_none());
+            assert!(server.channel.is_none());
+        }
+    }
+
     use tokio::io::AsyncWriteExt as _;
 
     #[tokio::test]
     async fn session_status_does_not_join_or_claim_automatic_readiness() {
-        let mut server = McpServer::new(
+        let mut server = attended_server(
             ClientOptions::new("http://127.0.0.1:1", "c", "a", "fake"),
             Some("codex".into()),
         );
@@ -1157,7 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_cli_connect_never_prepares_desktop_command_or_joins() {
-        let mut server = McpServer::new(
+        let mut server = attended_server(
             ClientOptions::new("http://127.0.0.1:1", "c", "a", "fake"),
             Some("codex".into()),
         );
@@ -1181,7 +1235,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_activation_checks_binding_and_readiness_without_joining() {
-        let mut server = McpServer::new(
+        let mut server = attended_server(
             ClientOptions::new("http://127.0.0.1:1", "c", "a", "fake"),
             None,
         );
@@ -1311,7 +1365,7 @@ mod tests {
         };
         let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let mut rpc_task = None;
-        let mut mcp = McpServer::new(
+        let mut mcp = attended_server(
             ClientOptions::new(&server_url, "c", "a", "fake-test-token"),
             Some(if codex { "codex" } else { "claude" }.into()),
         );
@@ -1538,7 +1592,7 @@ mod tests {
     async fn initialize_and_tools_list_shapes() {
         // 클라이언트 연결 없이 프로토콜 계층만 검증 (dead client — 도구 호출은 안 함)
         let opts = ClientOptions::new("http://127.0.0.1:1", "x", "x", "t");
-        let mut mcp = McpServer::new(opts, Some("codex".to_owned()));
+        let mut mcp = attended_server(opts, Some("codex".to_owned()));
         let init = mcp
             .dispatch(
                 serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
