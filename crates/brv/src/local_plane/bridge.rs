@@ -10,6 +10,11 @@
 //! 그래서 갱신 뒤 러너가 살려 둔 옛 브리지가 붙어 있어도 옛 **로직**이 서버와 대화하는 일이
 //! 없다(P8). 그래도 규약이 바뀔 수 있으므로 기동 시 버전을 대조해 크게 다르면 물러난다.
 //!
+//! **갱신 뒤 스스로 물러난다** (2026-09-14, P8 ⑩·수칙 9): 앱이 살려 둔 옛 중계기는 설치기가 끝낼 수 없다 —
+//! 그래서 중계기가 리시버 기술서(`endpoint.json`)를 주기적으로 읽어 리시버가 다른 버전으로 재기동한 것을
+//! 보면, 또는 요청이 버전 불일치(409)로 거부되면, 이유를 stderr에 남기고 종료한다. 옛 프로세스가 작업
+//! 관리자에 남지 않고, 앱은 다음 연결에서 현재 실행 파일의 중계기를 띄운다.
+//!
 //! 정체성: 리시버가 깨운 세션은 `BREVDUVA_BINDING`·`BREVDUVA_WAKE`를 물려받는다. 브리지는
 //! `initialize` 직후 그 정체성으로 `become`을 대신 보내 준다 — 모델이 자기가 누구인지 묻지
 //! 않아도 되고, 깨우기 창의 작업 잠금을 그대로 승계한다(P7). 사람이 연 세션은 그런 변수가
@@ -17,6 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use serde_json::{Value, json};
@@ -47,14 +53,46 @@ pub async fn run(host: Option<String>) -> anyhow::Result<()> {
         .no_proxy()
         .build()
         .context("http client")?;
+    let descriptor = super::auth::endpoint_path()?;
     run_io(
         endpoint,
         client,
         host,
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
+        Some((descriptor, RETIRE_POLL)),
     )
     .await
+}
+
+/// 리시버 기술서를 다시 읽는 간격 — 갱신 뒤 옛 중계기가 물러나기까지의 상한.
+const RETIRE_POLL: Duration = Duration::from_secs(5);
+
+/// 리시버가 다른 버전으로 재기동한 것을 알아채는 감시 — 기술서를 주기적으로 읽는다. 기술서가 없으면(리시버가
+/// 내려간 중) 기다린다: 재기동 중일 뿐일 수 있고, 리시버 없음은 요청 때 따로 드러난다.
+fn watch_receiver_version(
+    path: PathBuf,
+    every: Duration,
+    retire: Arc<tokio::sync::watch::Sender<Option<String>>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            if retire.is_closed() {
+                return;
+            }
+            if let Ok(fresh) = Endpoint::load_from(&path)
+                && fresh.version != env!("CARGO_PKG_VERSION")
+            {
+                let _ = retire.send(Some(format!(
+                    "the receiver was updated to {} while this bridge is {} — this bridge exits so the app can start the current one (restart the Brevduva MCP in this app, or open a new session)",
+                    fresh.version,
+                    env!("CARGO_PKG_VERSION")
+                )));
+                return;
+            }
+        }
+    });
 }
 
 /// 버전이 다를 때 사용자가 할 일 — 어느 쪽이 낡았는지에 따라 다르다.
@@ -72,12 +110,15 @@ fn version_mismatch(bridge: &str, receiver: &str) -> String {
 }
 
 /// 실제 입출력을 갈아 끼울 수 있게 분리 — 회귀 시험이 파이프로 같은 경로를 돈다.
+/// `retire_on`: 리시버 기술서 경로와 확인 간격 — 리시버가 다른 버전으로 재기동하면 이 중계기는 물러난다(None이면
+/// 요청이 409로 거부될 때만).
 pub(crate) async fn run_io<R, W>(
     endpoint: Endpoint,
     client: reqwest::Client,
     host: Option<String>,
     reader: R,
     writer: W,
+    retire_on: Option<(PathBuf, Duration)>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -88,8 +129,28 @@ where
     let url = endpoint.mcp_url();
     let mut lines = reader.lines();
     let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
+    let (retire_tx, mut retire_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    let retire_tx = Arc::new(retire_tx);
+    if let Some((path, every)) = retire_on {
+        watch_receiver_version(path, every, Arc::clone(&retire_tx));
+    }
 
-    while let Some(line) = lines.next_line().await? {
+    let retired = loop {
+        let line = tokio::select! {
+            next = lines.next_line() => match next? {
+                Some(line) => line,
+                None => break None,
+            },
+            changed = retire_rx.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                match retire_rx.borrow().clone() {
+                    Some(reason) => break Some(reason),
+                    None => continue,
+                }
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -140,6 +201,7 @@ where
         if let Some(id) = current {
             let (client, url, out) = (client.clone(), url.clone(), Arc::clone(&out));
             let token = endpoint.token.expose().to_owned();
+            let retire = Arc::clone(&retire_tx);
             tokio::spawn(async move {
                 let rpc_id = request.get("id").cloned();
                 let sent = client
@@ -153,19 +215,28 @@ where
                 let answered = match sent {
                     // 알림과 취소된 요청에는 응답이 없다
                     Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => return,
+                    // 버전 불일치 — 이 요청에 이유를 답하고 중계기는 물러난다(옛 프로세스를 남기지 않는다)
+                    Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                        let reason = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|error| error.to_string());
+                        let _ = retire.send(Some(reason.clone()));
+                        Err(anyhow::anyhow!(reason))
+                    }
                     Ok(response) => response.text().await.map_err(anyhow::Error::from),
-                    Err(error) => Err(error.into()),
+                    Err(error) => Err(anyhow::anyhow!(
+                        "the local receiver at {url} did not answer — is it still running? ({error:#})"
+                    )),
                 };
                 let line = match answered {
                     Ok(body) => body,
                     Err(error) => {
-                        tracing::error!(%error, "the local receiver did not answer a request");
+                        tracing::error!(%error, "a request through the bridge failed");
                         let Some(rpc_id) = rpc_id else {
                             return;
                         };
-                        json!({"jsonrpc":"2.0","id":rpc_id,"error":{"code":-32603,"message":format!(
-                            "the local receiver at {url} did not answer — is it still running? ({error:#})"
-                        )}})
+                        json!({"jsonrpc":"2.0","id":rpc_id,"error":{"code":-32603,"message":format!("{error:#}")}})
                         .to_string()
                     }
                 };
@@ -182,6 +253,13 @@ where
         let response = post.json(&request).send().await.with_context(|| {
             format!("the local receiver at {url} did not answer — is it still running?")
         })?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            let reason = response
+                .text()
+                .await
+                .unwrap_or_else(|error| error.to_string());
+            break Some(reason);
+        }
 
         let fresh = response
             .headers()
@@ -211,10 +289,15 @@ where
         if request["method"] == "initialize" {
             claim_woken_identity(&client, &url, &endpoint, &session, &out).await;
         }
-    }
+    };
 
     if let Some(task) = stream_task {
         task.abort();
+    }
+    if let Some(reason) = retired {
+        // 갱신으로 물러나는 길 — 세션 정리 요청도 거부될 것이므로 보내지 않는다. 종료 이유는 러너의 stderr로.
+        eprintln!("brv mcp: {reason}");
+        anyhow::bail!(reason);
     }
     if let Some(id) = session.lock().await.as_deref() {
         let _ = client
@@ -531,6 +614,7 @@ mod tests {
                 Some("claude".to_owned()),
                 BufReader::new(bridge_in),
                 bridge_out,
+                None,
             )
             .await;
         });
@@ -783,6 +867,57 @@ mod tests {
         )
         .expect("tool json");
         assert_eq!(result["status"], "timeout");
+    }
+
+    /// 2026-09-14 (P8 ⑩, 수칙 9): 리시버가 다른 버전으로 재기동하면 앱 안에 떠 있던 중계기는 스스로 끝난다 — 설치기가
+    /// 죽일 수 없는 옛 프로세스가 작업 관리자에 남지 않는다. 종료 이유가 결과로 돌아온다.
+    #[tokio::test]
+    async fn an_old_bridge_exits_by_itself_when_the_receiver_comes_back_updated() {
+        let dir = std::env::temp_dir().join(format!("brv-bridge-retire-{}", ClientKey::generate()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let descriptor = dir.join("endpoint.json");
+        let current = Endpoint {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            addr: "127.0.0.1:1".parse().expect("addr"),
+            token: Token::generate().expect("token"),
+            pid: std::process::id(),
+            started_unix: 0,
+        };
+        current.publish_at(&descriptor).expect("publish current");
+        let (_keep_stdin_open, bridge_in) = tokio::io::duplex(1024);
+        let (bridge_out, _test_out) = tokio::io::duplex(1024);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let bridge = tokio::spawn(run_io(
+            current.clone(),
+            client,
+            None,
+            BufReader::new(bridge_in),
+            bridge_out,
+            Some((descriptor.clone(), Duration::from_millis(30))),
+        ));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !bridge.is_finished(),
+            "same version: the bridge keeps serving"
+        );
+
+        let updated = Endpoint {
+            version: "9.9.9".to_owned(),
+            ..current
+        };
+        updated.publish_at(&descriptor).expect("publish updated");
+        let outcome = tokio::time::timeout(Duration::from_secs(3), bridge)
+            .await
+            .expect("the bridge notices the new receiver version")
+            .expect("task");
+        let reason = outcome
+            .expect_err("the bridge exits with a reason")
+            .to_string();
+        assert!(reason.contains("updated to 9.9.9"), "{reason}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
