@@ -43,6 +43,7 @@ pub fn sweep_parked_binaries(exe: &std::path::Path) -> Vec<std::path::PathBuf> {
         return Vec::new();
     };
     let parked_by_service = format!("{stem}.old");
+    let service_variant = format!("{parked_by_service}.");
     let parked_by_installer = format!("{name}.old");
     let installer_variant = format!("{parked_by_installer}.");
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -57,6 +58,7 @@ pub fn sweep_parked_binaries(exe: &std::path::Path) -> Vec<std::path::PathBuf> {
                 .is_some_and(|file| {
                     file == parked_by_service
                         || file == parked_by_installer
+                        || file.starts_with(&service_variant)
                         || file.starts_with(&installer_variant)
                 })
         })
@@ -122,15 +124,16 @@ pub fn align_binary() -> Option<(std::path::PathBuf, String)> {
     if installed_version.trim() == ours {
         return None;
     }
-    let parked = registered.with_extension("old");
-    let _ = std::fs::remove_file(&parked); // 지난 갱신의 잔재 (실행 중이면 실패 — 무시)
-    if let Err(e) = std::fs::rename(&registered, &parked) {
-        eprintln!(
-            "warning: the service runs {} but this is {ours} — could not move the old file aside ({e}). The daemon keeps running the old version.",
-            registered.display()
-        );
-        return None;
-    }
+    let parked = match park_aside(&registered) {
+        Ok(parked) => parked,
+        Err(e) => {
+            eprintln!(
+                "warning: the service runs {} but this is {ours} — could not move the old file aside ({e}). The daemon keeps running the old version — run `brv daemon restart` again once the old bridges have exited.",
+                registered.display()
+            );
+            return None;
+        }
+    };
     if let Err(e) = std::fs::copy(&current, &registered) {
         let _ = std::fs::rename(&parked, &registered); // 되돌린다 — 반쪽 상태로 두지 않는다
         eprintln!(
@@ -140,6 +143,38 @@ pub fn align_binary() -> Option<(std::path::PathBuf, String)> {
         return None;
     }
     Some((registered, installed_version.trim().to_owned()))
+}
+
+/// 실행 중인 서비스 파일을 비켜 둔다 — `brv.old`가 비어 있거나 지울 수 있으면 그 이름, 아니면 `brv.old.<unix초>`.
+///
+/// 2026-09-14 실사고: 0.7.2 갱신 때 `brv.old`(직전 갱신이 비켜 둔 0.7.0)를 앱 안에 남아 있던 옛 중계기가 아직 쥐고 있어
+/// 이름 바꾸기가 실패했고, 서비스는 0.7.1로 남은 채 새 0.7.2 중계기가 "버전이 다르다"며 거부됐다 — 갱신이 절반만 닿은
+/// 상태(수칙 9 위반). 비켜 둘 이름이 막혀 있다고 갱신을 포기하지 않는다. 고유 이름의 잔재는 [`sweep_parked_binaries`]가
+/// 다음 기동·재기동 때 치운다.
+fn park_aside(registered: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let parked = registered.with_extension("old");
+    let _ = std::fs::remove_file(&parked); // 지난 갱신의 잔재 (아직 실행 중이면 실패 — 아래서 다른 이름을 쓴다)
+    match std::fs::rename(registered, &parked) {
+        Ok(()) => Ok(parked),
+        Err(first) => {
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let unique = registered.with_extension(format!("old.{unix}"));
+            match std::fs::rename(registered, &unique) {
+                Ok(()) => Ok(unique),
+                Err(second) => Err(std::io::Error::new(
+                    second.kind(),
+                    format!(
+                        "{} ({first}); {} ({second})",
+                        parked.display(),
+                        unique.display()
+                    ),
+                )),
+            }
+        }
+    }
 }
 
 /// 같은 파일인가 — 경로 표기 차이(대소문자·구분자·`.`)를 정규화해 비교한다.
@@ -934,6 +969,31 @@ pub fn restart() -> anyhow::Result<bool> {
 #[cfg(test)]
 mod registration_tests {
     use super::*;
+
+    /// 2026-09-14 (P8, 수칙 9): 비켜 둘 이름 `brv.old`가 이미 있어도(직전 갱신의 잔재) 새 파일을 비켜 두는 데 실패하지
+    /// 않는다 — 지울 수 있으면 그 이름을 다시 쓰고, 어느 이름이든 나중에 청소 대상이다.
+    #[test]
+    fn a_service_binary_is_parked_even_when_the_previous_parking_name_is_taken() {
+        let dir = std::env::temp_dir().join(format!("brv-park-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registered = dir.join("brv.exe");
+        std::fs::write(&registered, b"new").unwrap();
+        std::fs::write(dir.join("brv.old"), b"previous").unwrap();
+        let parked = park_aside(&registered).unwrap();
+        assert!(
+            !registered.exists(),
+            "the registered path is free for the copy"
+        );
+        assert_eq!(std::fs::read(&parked).unwrap(), b"new");
+        let name = parked.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name == "brv.old" || name.starts_with("brv.old."), "{name}");
+        let swept = sweep_parked_binaries(&registered);
+        assert!(
+            swept.contains(&parked),
+            "whichever name was used is an update leftover"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 2026-09-13 (P8): 러너 등록은 brv 버전이 바뀐 뒤 한 번만 다시 쓴다 — 표시 파일이 없거나 다른 버전이면
     /// 낡은 것이고, 지금 버전으로 표시하면 다음 재기동에서는 건드리지 않는다.

@@ -2188,6 +2188,7 @@ mod tests {
         for name in [
             "brv.exe",
             "brv.old",
+            "brv.old.1789300000",
             "brv.exe.old",
             "brv.exe.old.3f2a",
             "brv.exe.config",
@@ -2200,7 +2201,15 @@ mod tests {
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         removed.sort();
-        assert_eq!(removed, vec!["brv.exe.old", "brv.exe.old.3f2a", "brv.old"]);
+        assert_eq!(
+            removed,
+            vec![
+                "brv.exe.old",
+                "brv.exe.old.3f2a",
+                "brv.old",
+                "brv.old.1789300000"
+            ]
+        );
         for kept in ["brv.exe", "brv.exe.config", "brvx.old"] {
             assert!(dir.join(kept).exists(), "{kept} is not an update leftover");
         }

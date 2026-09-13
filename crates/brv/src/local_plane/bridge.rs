@@ -35,11 +35,12 @@ pub async fn run(host: Option<String>) -> anyhow::Result<()> {
          Sessions attach to the receiver; they no longer connect to the server themselves.",
     )?;
     if endpoint.version != env!("CARGO_PKG_VERSION") {
-        // 갱신 뒤 러너가 살려 둔 옛 브리지 — 조용히 이상하게 도느니 이유를 말하고 물러난다(P8).
+        // 갱신 뒤 러너가 살려 둔 옛 브리지 — 조용히 이상하게 도느니 이유를 말하고 물러난다(P8). 반대로 리시버 쪽이
+        // 낡았으면(2026-09-14 실사고: 서비스 파일 교체가 잠긴 잔재 때문에 실패) 세션 재시작은 소용없다 — 갱신을 마저
+        // 하라고 말한다
         anyhow::bail!(
-            "this brv bridge is {} but the running receiver is {} — restart this session so the runner spawns the current bridge",
-            env!("CARGO_PKG_VERSION"),
-            endpoint.version
+            "{}",
+            version_mismatch(env!("CARGO_PKG_VERSION"), &endpoint.version)
         );
     }
     let client = reqwest::Client::builder()
@@ -54,6 +55,20 @@ pub async fn run(host: Option<String>) -> anyhow::Result<()> {
         tokio::io::stdout(),
     )
     .await
+}
+
+/// 버전이 다를 때 사용자가 할 일 — 어느 쪽이 낡았는지에 따라 다르다.
+fn version_mismatch(bridge: &str, receiver: &str) -> String {
+    let key = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    if key(receiver) < key(bridge) {
+        format!(
+            "this brv bridge is {bridge} but the receiver service still runs {receiver} — the update has not reached the service yet: run `brv daemon restart` (it replaces the service binary), then restart this session"
+        )
+    } else {
+        format!(
+            "this brv bridge is {bridge} but the running receiver is {receiver} — restart this session so the runner spawns the current bridge"
+        )
+    }
 }
 
 /// 실제 입출력을 갈아 끼울 수 있게 분리 — 회귀 시험이 파이프로 같은 경로를 돈다.

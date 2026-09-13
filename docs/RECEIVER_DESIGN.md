@@ -345,6 +345,10 @@ Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
   갱신마다 승인 프롬프트가 되살아난다. 그래서 Codex 등록은 이미 지금 값이면 건드리지 않고, 다시 쓸 때는 `tools` 표를
   읽어 두었다가 `mcp add` 뒤 그 항목 바로 아래 되돌려 넣는다(`toml_edit`, 서식·주석 보존 — brv가 러너 설정 파일을 직접
   고치는 유일한 예외이며 이 항목 아래만 만진다). Claude Code의 remove+add는 승인을 잃지 않는다(승인은 settings.json).
+  ⑨ **(2026-09-14, 0.7.3, 수칙 9)** 서비스 파일 교체는 비켜 둘 이름이 잠겨 있어도 포기하지 않는다 — `brv.old`를 못 쓰면
+  `brv.old.<unix초>`로 비켜 두고, 그런 잔재도 기동·재기동 때 치운다(실사고: 0.7.2 갱신이 서비스에 닿지 못해 중계기와
+  버전이 갈렸다). 중계기는 리시버 쪽이 낡았을 때 "세션 재시작"이 아니라 "`brv daemon restart`로 갱신을 마저 하라"고
+  말한다 — 사용자가 할 수 있는 조치만 안내한다.
 
 ### P9. 위 원칙은 세 OS에 동일하게 적용한다
 
@@ -396,6 +400,20 @@ Desktop(미실측) / 그 밖의 러너 — 깨우기 프로필 기준(미실측)
 확인했다(시험 바인딩만 보임) ⑥ `brv listen`·`brv status` 실제 출력과 받을 곳 없는 발신 리시버의 `dormant` → 세션이
 쥐면 접속(16단계)을 확인했다. 남은 실기: Channels·codex queue(대화형 세션), Codex Desktop(앱), `.cmd` 결함 수정 뒤
 Codex 깨우기, 윈도우 서비스 모드(운영 서비스 교체 승인 필요), macOS·Linux.
+
+**실측(2026-09-14, 12단계 3차 — 이 윈도우 머신의 운영 서비스, brv 0.7.1)**: 사용자가 설치 한 줄로 갱신한 뒤 실제
+앱으로 돌렸고 판정은 리시버 기록(`daemon-journal.jsonl`)과 서비스 로그로 했다. ① **Codex CLI — codex queue**: 대화형
+Codex 작업이 `receiver_connect(codex-cli)` → "Codex queue input path attached" → 요청 7건이 `handed to the attached
+session's input path` → 모델의 receipt → reply 왕복(brvcodex ↔ brvclaude 대화가 기록에 남음) — 성공 ② **Codex
+Desktop**: 앱의 열린 작업이 `receiver_connect(codex-desktop)` → "Codex Desktop input path attached" → 4건 전달 → reply —
+성공 ③ **Claude Code (GUI 앱·CLI)**: Monitor 통로("delivery path attached") 세션 둘에 11건 전달 → reply — 성공
+④ **윈도우 서비스 모드**: 위 전부가 SCM 서비스 `brv-daemon`(LocalSystem)이 로그온 사용자 명의로 전달한 것이다 — P9의
+윈도우 예외가 실기로 확인됐다. Channels·macOS·Linux는 아직이다. 세 칸 표기: Codex의 codex queue·Codex Desktop이
+measured로 바뀐다.
+
+같은 실기에서 **갱신 결함 발견**(P8 ⑨): 0.7.2 설치 때 서비스 파일 교체(`align_binary`)가 실패해 서비스는 0.7.1로
+남았고, 새 0.7.2 중계기는 "버전이 다르다 — 세션을 재시작하라"며 거부됐다(재시작해도 소용없는 안내). 원인은 비켜 둘
+이름 `brv.old`를 앱 안에 남아 있던 옛 중계기(직전 갱신이 비켜 둔 0.7.0 이미지)가 쥐고 있어 이름 바꾸기가 거부된 것.
 
 ## 4. 미확정 사항 (확정되면 §2에 반영하고 §6에 기록)
 
@@ -477,6 +495,7 @@ Codex 깨우기, 윈도우 서비스 모드(운영 서비스 교체 승인 필�
 | 2026-09-11 | 18단계 완료 — P4 "리시버 없는 환경도 1급"에 원격 MCP 대기 점검 메모(호스트 제한 실측·45초 정정·SSE 미채택 이유) | 실측: Claude Code가 HTTP MCP 도구 호출의 첫 응답을 60.0초에 끊음 — 종전 원격 MCP 대기(기본 60초·최대 120초)가 결과를 잃을 수 있었다. PROTOCOL 12.2 개정. 서버 전체 스위트 녹색 |
 | 2026-09-12 | 10단계 완료 — P8 "남은 것" 해소(`.old` 청소·요청마다 브리지 버전 대조·STANDBY 원인 안내·옛 기록의 `brv status` 표시) | 착수 전 확인: `align_binary`·윈도우 설치기가 남긴 `.old`는 다음 갱신 때에야 덮였고, 브리지는 기동 때만 버전을 대조했으며, 끝나지 않은 옛 기록은 로그에만 있었다. brv 시험 197건·서버 전체 스위트 녹색 |
 | 2026-09-12 | 11단계 완료 — §3 구현 메모(세 칸의 현재 값·옛 `attended` 분류 삭제 이유), P5 7b 문단에 14단계 번복 표기 | 옛 표기는 재구축 전 분류라 리시버 소유 통로(Monitor·Channels·codex queue·Desktop)와 수동 수신을 담지 못했다. 문서 대조 중 P5 7b의 "queue id 때 확정" 문구가 번복 표기 없이 남은 것을 발견. brv 시험 197건·서버 전체 스위트 녹색 |
+| 2026-09-14 | §3 실측 3차 — 윈도우 운영 서비스에서 Codex CLI(codex queue)·Codex Desktop·Claude Code GUI/CLI(Monitor) 왕복 성공, 서비스 모드 확인; codex queue·Codex Desktop measured. P8 ⑨ — 서비스 파일 비켜 두기 고유 이름 대체, 중계기 안내 정정 (0.7.3) | 사용자 실기 보고("윈도우에서 코덱스, 클로드 gui, cli 모두 통과")를 리시버 기록·로그로 대조. 같은 로그에서 0.7.2 갱신이 서비스에 닿지 못한 실사고 발견 |
 | 2026-09-14 | P8 ⑧ — Codex 등록 다시 쓰기가 사용자 도구 승인(`tools.*`)을 보존, 이미 같은 값이면 건드리지 않음 (0.7.2) | 0.7.1 실기: Codex가 도구마다 승인을 묻고 "Always allow"는 설정의 하위 표에 남는데 `codex mcp add`가 그 표를 지운다 — 갱신마다 프롬프트 재발(수칙 9 위반). brv 시험 202건 |
 | 2026-09-13 | P8 보강 — 갱신이 러너 등록에도 닿게(`brv daemon restart`가 버전 표시 파일 기준으로 등록을 다시 씀), 옛 `--binding` 등록은 거부 대신 무시(번복), 다중 바인딩 안내 가지 삭제 | 0.7.0 갱신 직후 Codex CLI가 옛 등록으로 "MCP startup failed"(사용자 지적: 재등록 안내는 해결이 아니라 업데이트마다 겪는 문제). 이후 모든 작업에 사용자 관점 사용 시뮬레이션을 선행한다(CLAUDE.md 개발 수칙 8). brv 시험 199건 |
 | 2026-09-12 | 12단계 1차 실기 — §3에 실측 기록(Claude 무인 깨우기·수동 수신·Monitor 성공, Channels 미실측, Codex `.cmd` 결함), §4 U7 신설(윈도우 `.cmd` 러너 깨우기 결함, 결정 필요) | 실제 러너 왕복(격리 인프라). Codex 시험 중 깨운 세션이 사용자 설정의 옛 0.6.39 등록으로 운영 서버에 붙어 이력을 읽음(발행 없음) — 발견 즉시 중단. brv 시험 197건·서버 전체 스위트 녹색 |

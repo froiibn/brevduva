@@ -292,14 +292,15 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_codex),
         }),
         wake_measured: true, // 한 턴 실행 + MCP 도구 호출 실측. 데몬 경유 E2E(깨움→답신)는 별도
-        // 작업 대기열(7b)·Desktop 작업(7d) 통로 — `codex queue` 동작과 실행 명의는 실측, 모델 왕복·Desktop 앱은 12단계
+        // 작업 대기열(7b)·Desktop 작업(7d) 통로 — 2026-09-14 이 윈도우 머신의 운영 서비스(SCM, 사용자 명의 전달)에서
+        // 실제 Codex CLI 작업과 Codex Desktop 작업에 전달 → receipt → reply 왕복을 확인(12단계 3차, 리시버 기록·로그)
         attended_cli: Push::Paths(&[PushPath {
             via: "codex queue",
-            measured: false,
+            measured: true,
         }]),
         attended_gui: Push::Paths(&[PushPath {
             via: "Codex Desktop",
-            measured: false,
+            measured: true,
         }]),
         mcp: McpRegistration::Command(&[
             "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
@@ -1064,7 +1065,8 @@ mod tests {
     }
 
     /// 2026-09-12(11·12단계, RECEIVER_DESIGN §3): 세 칸은 서로 독립이다 — 깨우기 실측이 밀어넣기 실측을 뜻하지 않고,
-    /// 통로가 코드로 있는 러너만 칸이 채워지며, 통로마다 실제 모델 왕복을 확인한 것만 measured다(12단계: Monitor).
+    /// 통로가 코드로 있는 러너만 칸이 채워지며, 통로마다 실제 모델 왕복을 확인한 것만 measured다(12단계: Monitor,
+    /// 2026-09-14 3차: codex queue·Codex Desktop). Channels만 미실측으로 남는다.
     #[test]
     fn capability_columns_are_separate_and_honest() {
         let claude = spec("claude").expect("claude");
@@ -1077,14 +1079,8 @@ mod tests {
         );
         assert_eq!(claude.attended_gui, Push::None);
         assert_eq!(claude.attended_gui.describe(), "manual receive only");
-        assert_eq!(
-            codex.attended_cli.describe(),
-            "codex queue (not yet measured)"
-        );
-        assert_eq!(
-            codex.attended_gui.describe(),
-            "Codex Desktop (not yet measured)"
-        );
+        assert_eq!(codex.attended_cli.describe(), "codex queue (measured)");
+        assert_eq!(codex.attended_gui.describe(), "Codex Desktop (measured)");
         for r in RUNNERS
             .iter()
             .filter(|r| r.id != "claude" && r.id != "codex")

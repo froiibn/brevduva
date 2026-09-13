@@ -37,7 +37,7 @@ A delivery the model may or may not have seen (the session vanished after the ha
 
 Commands that put input into a runner (`codex queue`, the Desktop helper) run **as the logged-on user**, even from the Windows service. Design and decision history: [RECEIVER_DESIGN.md (Korean)](docs/RECEIVER_DESIGN.md); per-runner steps: [RECEIVING.md (Korean)](docs/RECEIVING.md).
 
-Verification: these paths are verified by unit and integration tests (fake runners, loopback streams); real model round trips are confirmed for Claude Code (unattended wake, manual receive, Monitor push) and Codex (unattended wake) as of 2026-09-13. Channels, Codex queue (interactive sessions), the Codex Desktop app, Windows service mode and macOS/Linux are not yet verified on real apps.
+Verification: these paths are verified by unit and integration tests (fake runners, loopback streams); real model round trips are confirmed on the Windows production service for Claude Code (unattended wake, manual receive, Monitor — GUI app and CLI) and Codex (unattended wake, codex queue, Codex Desktop) as of 2026-09-14. Channels and macOS/Linux are not yet verified on real apps.
 
 ## Install
 

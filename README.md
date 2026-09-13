@@ -37,7 +37,7 @@
 
 러너 입력 통로에 넣는 명령(`codex queue`, Desktop 도우미)은 윈도우 서비스에서도 **로그온한 사용자 명의로** 실행한다. 설계와 결정 이력은 [RECEIVER_DESIGN.md](docs/RECEIVER_DESIGN.md), 러너별 절차는 [RECEIVING.md](docs/RECEIVING.md).
 
-검증 범위: 위 경로는 단위·통합 시험(가짜 러너·루프백 스트림)으로 검증했고, 실제 모델 왕복은 Claude Code의 무인 깨우기·수동 수신·Monitor 밀어넣기와 Codex의 무인 깨우기까지 확인했다(2026-09-13). Channels·Codex queue(대화형 세션)·Codex Desktop 앱·윈도우 서비스 모드·macOS/Linux 실기는 아직이다.
+검증 범위: 위 경로는 단위·통합 시험(가짜 러너·루프백 스트림)으로 검증했고, 실제 모델 왕복은 윈도우 운영 서비스에서 Claude Code(무인 깨우기·수동 수신·Monitor — GUI 앱·CLI)와 Codex(무인 깨우기·codex queue·Codex Desktop)까지 확인했다(2026-09-14). Channels·macOS/Linux 실기는 아직이다.
 
 ## 설치
 
