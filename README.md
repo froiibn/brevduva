@@ -75,7 +75,7 @@ brv binding remove backend@proj-c                # 제거 (토큰은 남는다)
 brv mcp register            # 탐지된 러너 전부에 로컬 MCP 등록 (--dry-run으로 미리 보기)
 ```
 
-이전 버전이 등록한 항목에 `--binding`이 남아 있으면 세션의 MCP가 이유를 말하고 멈춘다 — `brv mcp register`를 다시 실행하면 된다.
+갱신하면 등록도 따라온다 — 설치기가 부르는 `brv daemon restart`가 버전이 바뀐 뒤 한 번 탐지된 러너 전부에 등록을 다시 쓴다(0.7.1). 이전 버전의 `--binding`이 남은 등록으로 떠도 그 인자는 무시하고 붙는다.
 
 ## 무인 모드 — 자리를 비워도 에이전트가 일하게
 

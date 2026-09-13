@@ -118,7 +118,9 @@ Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
 
 - 옛 `brv connect`로 연결한 Desktop 작업은 새 리시버가 기동할 때 연결이 거둬지고 옛 worker가 멈춘다. 옛 어댑터가
   서버에 확정했지만 넘기지 못한 메시지가 기록에 남아 있으면 리시버 로그에 목록이 나온다 — 자동으로 다시 넣지 않는다.
-- 옛 등록에 `--binding`이 남아 있으면 중계기가 이유를 말하고 멈춘다 — `brv mcp register`를 다시 실행한다.
+- 러너 등록은 갱신이 스스로 다시 쓴다(0.7.1) — 설치기가 부르는 `brv daemon restart`가 버전이 바뀐 뒤 한 번, 탐지된
+  러너 전부에 지금 형식으로 등록한다. 등록 명령이 없는 러너는 붙여 넣을 조각이 다시 출력된다. 옛 `--binding`이 남은
+  등록으로 중계기가 떠도 그 인자는 무시하고 붙는다(정체성은 `become`).
 - 갱신 뒤에도 앱 안에 떠 있던 옛 중계기는 요청마다 거부되고 "이 앱의 MCP를 재시작하라"는 이유가 도구 오류로 보인다.
   재구축 이전의 옛 `brv mcp`가 서버에 직접 붙어 채널 자리를 가져가면 `brv status`가 리시버를 STANDBY로 보이고 같은
   조치를 안내한다.
@@ -127,7 +129,7 @@ Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
 
 ## 검증 범위
 
-단위·통합 시험(가짜 러너 실행기, 루프백 Monitor 스트림, 모의 Desktop IPC, 쓰기 잠금 흉내)으로 판정·기록·확정
-규칙을 검증했다. 실제 모델 왕복은 Claude Code(무인 깨우기·수동 수신·Monitor 밀어넣기)와 Codex(무인 깨우기)까지
+단위·통합 시험(가짜 러너 실행기, 루프백 Monitor 스트림, 모의 Desktop IPC, 쓰기 잠금 흉내, 등록 버전 표시)으로
+판정·기록·확정·갱신 규칙을 검증했다. 실제 모델 왕복은 Claude Code(무인 깨우기·수동 수신·Monitor 밀어넣기)와 Codex(무인 깨우기)까지
 확인했다(2026-09-13). Channels·Codex queue(대화형 세션), Codex Desktop 실제 앱, 윈도우 서비스 모드의 사용자 명의
 실행, macOS·Linux 실기는 아직이다(RECEIVER_REBUILD_PLAN 12단계).

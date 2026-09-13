@@ -492,7 +492,7 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             }
             match action {
                 Some(McpCmd::Register { runner, dry_run }) => {
-                    mcp_register(&config::load()?, runner.as_deref(), dry_run)
+                    mcp_register(runner.as_deref(), dry_run)
                 }
                 None => mcp(binding.as_deref(), host).await,
             }
@@ -1079,7 +1079,7 @@ async fn enroll_init(
     if no_mcp {
         println!("to register the MCP server in your agent runners later: brv mcp register");
     } else {
-        register_mcp(&cfg);
+        register_mcp();
     }
     // 돌고 있는 데몬에 새 토큰·바인딩을 즉시 반영 (2026-09-02 맥북 실사고 — 재enroll 후 재기동
     // 없이는 데몬이 옛 토큰으로 죽어 있었다). 서비스 미등록이면 조용히 지나간다
@@ -1258,11 +1258,34 @@ fn ask_number(prompt: &str, max: usize) -> anyhow::Result<usize> {
 /// 주입하는 것과 같은 규약. 이미 등록돼 있으면 지우고 다시 등록해 **낡은 등록이 현행 설정을
 /// 가리지 않게** 한다 (2026-09-01 실사고: 옛 프로필 env가 박힌 등록이 데몬 주입을 덮어 깨운
 /// 세션의 MCP가 즉사 — Claude는 서버 정의 env로 상속 env를 덮는다).
-/// 바인딩이 여럿이면 자동 등록하지 않는다 — 전역 `brv mcp`는 바인딩 선택이 안 되므로,
-/// 프로젝트별 등록(--binding 포함)을 안내한다 (페이즈 27).
-fn register_mcp(cfg: &BrvConfig) {
-    if let Err(e) = mcp_register(cfg, None, false) {
+/// 바인딩 수와 무관하게 등록한다 — 세션은 리시버에 붙은 뒤 `become`으로 바인딩을 고르므로(2026-09-09)
+/// 옛 "바인딩이 여럿이면 프로젝트별 `--binding` 등록 안내"(페이즈 27)는 삭제했다(2026-09-13).
+fn register_mcp() {
+    if let Err(e) = mcp_register(None, false) {
         println!("MCP registration skipped: {e:#} — later: brv mcp register");
+    }
+}
+
+/// 갱신 뒤 러너 등록을 지금 버전 형식으로 다시 쓴다 (2026-09-13, P8 — 사용자 지적 "업데이트마다 사용자가 겪는
+/// 문제"): 등록은 `{brv} mcp --config … --host …` 인자를 러너 설정에 박아 두므로, 인자 형식·실행 파일 경로가 바뀐
+/// 갱신은 러너 쪽 등록도 새로 써야 한다. 0.7.0 갱신 실사고 — Codex가 옛 `--binding` 등록으로 중계기를 띄워
+/// "MCP startup failed: … initialize response"만 보였다(중계기의 이유는 stderr라 사용자가 못 본다). 설치기가 부르는
+/// `brv daemon restart`가 이 함수를 거쳐 표시 파일(`mcp-registered.version`)이 지금 버전이 아닐 때 한 번 다시 쓴다.
+/// 등록 명령이 없는 러너(조각 안내)는 여기서도 안내만 나온다 — 그 러너는 중계기가 옛 인자를 관용해 붙는다(`mcp`).
+fn refresh_registrations_after_update() {
+    let Ok(config_path) = config::config_path() else {
+        return; // 프로필이 없으면 등록할 것도 없다
+    };
+    if !config_path.is_file() || !brv::service::registrations_stale(&config_path) {
+        return;
+    }
+    println!(
+        "rewriting runner MCP registrations for brv {} (an update changes what they must run)",
+        env!("CARGO_PKG_VERSION")
+    );
+    match mcp_register(None, false) {
+        Ok(()) => {}
+        Err(e) => println!("  registrations not refreshed: {e:#} — later: brv mcp register"),
     }
 }
 
@@ -1271,7 +1294,8 @@ fn register_mcp(cfg: &BrvConfig) {
 /// 러너 설정 파일을 직접 고치지 않는다(형식이 제각각이라 파손 위험 > 편의).
 /// 등록은 `--config`로 이 설정 파일을 못 박는다 — 러너가 MCP 자식에 환경변수를 넘기지 않아도
 /// (Codex는 허용 목록만 전달) 같은 프로필을 본다.
-fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+/// 실제로 등록을 돌린 뒤에는 표시 파일에 지금 버전을 적는다 — 다음 갱신까지 `brv daemon restart`가 다시 쓰지 않는다.
+fn mcp_register(runner: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     let config_path = config::config_path()?;
     let brv = std::env::current_exe().context("current exe")?;
     let targets = match runner {
@@ -1288,17 +1312,9 @@ fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow:
         println!(
             "no agent runner found on this machine — nothing to register (brv mcp register later)"
         );
+        stamp(&config_path, dry_run);
         return Ok(());
     }
-    // 바인딩이 여럿이면 `brv mcp`가 --binding을 요구한다 — 전역 등록은 어느 바인딩인지 모르니
-    // 프로젝트별 등록 명령을 안내한다 (깨어난 세션은 데몬이 바인딩을 넘기므로 무관)
-    let binding_note = (cfg.bindings.len() > 1).then(|| {
-        cfg.bindings
-            .iter()
-            .map(|b| format!("--binding {}", b.label()))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    });
     for d in &targets {
         match &d.spec.mcp {
             brv::runners::McpRegistration::Command(args) => {
@@ -1307,13 +1323,6 @@ fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow:
                     .map(|a| brv::runners::fill(a, &brv, &config_path, d.spec.id))
                     .collect();
                 let shown = format!("{} {}", d.path.display(), filled.join(" "));
-                if let Some(note) = &binding_note {
-                    println!(
-                        "{}: multiple bindings — register per project, appending one of [{note}]:\n  {shown}",
-                        d.spec.display
-                    );
-                    continue;
-                }
                 if dry_run {
                     println!("{}: would run\n  {shown}", d.spec.display);
                     continue;
@@ -1326,8 +1335,10 @@ fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow:
                     Ok(out) => {
                         let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
                         let already = err.to_ascii_lowercase().contains("already");
-                        // Claude Code는 종전처럼 갱신한다 — 다른 설정 경로로 재init한 머신이 옛 등록을
-                        // 물고 있던 실사고(2026-09-02)의 대응. 다른 러너는 remove 문법을 실측 전이라 안내만
+                        // Claude Code는 지우고 다시 등록한다 — 다른 설정 경로로 재init한 머신이 옛 등록을 물고 있던
+                        // 실사고(2026-09-02)의 대응이고, 갱신 뒤 자동 재등록(2026-09-13)도 이 길로 새 인자를 쓴다.
+                        // Codex는 `mcp add`가 같은 이름을 덮어써(0.153.4 실측) 이 가지에 오지 않는다. 다른 러너는
+                        // remove 문법을 실측 전이라 안내만
                         if already && d.spec.id == "claude" {
                             let removed = std::process::Command::new(&d.path)
                                 .args(["mcp", "remove", "brevduva", "-s", "user"])
@@ -1372,7 +1383,15 @@ fn mcp_register(cfg: &BrvConfig, runner: Option<&str>, dry_run: bool) -> anyhow:
             }
         }
     }
+    stamp(&config_path, dry_run);
     Ok(())
+}
+
+/// 등록을 실제로 돌렸으면 표시 파일에 지금 버전을 적는다(미리 보기는 제외).
+fn stamp(config_path: &std::path::Path, dry_run: bool) {
+    if !dry_run && let Err(e) = brv::service::stamp_registrations(config_path) {
+        println!("  (could not record the registration version: {e})");
+    }
 }
 
 async fn init(
@@ -1598,11 +1617,10 @@ fn restart_daemon(explicit: bool) -> anyhow::Result<()> {
             env!("CARGO_PKG_VERSION")
         );
     }
-    match brv::service::restart() {
+    let restarted = brv::service::restart();
+    match &restarted {
         Ok(true) => println!("daemon restarted (OS service) — changes are live"),
-        Ok(false) if explicit => anyhow::bail!(
-            "daemon is not registered as an OS service — restart the process you started yourself, or register one with `brv daemon install`"
-        ),
+        Ok(false) if explicit => {}
         // 서비스는 없지만 데몬이 돌았던 흔적(상태 파일)이 있으면 — 직접 띄운 데몬·작업 스케줄러 등
         Ok(false) if brv::daemon::read_state().is_some() => println!(
             "daemon is not an OS service here — if one is running, restart it yourself so the change applies"
@@ -1610,7 +1628,8 @@ fn restart_daemon(explicit: bool) -> anyhow::Result<()> {
         Ok(false) => {}
         Err(e) => println!("daemon restart failed — restart it yourself: {e}"),
     }
-    // 갱신 잔재 정리 (10단계, P8) — 설치기가 이 실행 파일 옆에 비켜 둔 옛 파일
+    // 갱신 뒤처리는 서비스 유무와 무관하게 한다 (2026-09-13) — 설치기는 이 명령 하나만 부르므로 여기서 끝나야
+    // 사용자가 손댈 것이 없다(P8). ① 설치기가 이 실행 파일 옆에 비켜 둔 옛 파일 정리(10단계) ② 러너 등록 다시 쓰기
     if let Ok(exe) = std::env::current_exe() {
         let removed = brv::service::sweep_parked_binaries(&exe);
         if !removed.is_empty() {
@@ -1619,6 +1638,12 @@ fn restart_daemon(explicit: bool) -> anyhow::Result<()> {
                 removed.len()
             );
         }
+    }
+    refresh_registrations_after_update();
+    if explicit && matches!(restarted, Ok(false)) {
+        anyhow::bail!(
+            "daemon is not registered as an OS service — restart the process you started yourself, or register one with `brv daemon install`"
+        );
     }
     Ok(())
 }
@@ -2057,9 +2082,14 @@ async fn mcp(binding_sel: Option<&str>, host: Option<String>) -> anyhow::Result<
     // JOIN하지 않고 바인딩을 고르지도 않는다 — 정체성은 리시버의 등록부가 정한다. 그래서 바인딩이
     // 여럿인 머신에서도 대화형 세션이 그대로 붙는다(0.6.39 검토 1번의 근본 수정). 러너별 전달
     // 어댑터(`--claude-channel`·`--codex-cli-endpoint`)는 리시버 소유로 옮겨져 삭제됐다(2026-09-11, 7e).
-    anyhow::ensure!(
-        binding_sel.is_none(),
-        "--binding is not used any more: sessions attach to this machine's receiver and take an identity with the `become` tool (list_bindings shows what is available) — re-run `brv mcp register` to refresh this runner's entry"
-    );
+    // 옛 등록의 `--binding`은 무시하고 붙는다 (2026-09-13 번복 — 종전엔 이유를 말하고 종료): 이 프로세스는 지금
+    // 버전의 중계기이고 낡은 것은 러너 설정의 인자뿐이다. 거부하면 러너(Codex)는 stderr를 삼켜 "MCP startup failed"만
+    // 보이고, 등록을 새로 쓰는 것은 갱신(`brv daemon restart`)의 몫이다 — 그것이 닿지 못한 등록(조각 안내 러너·손 편집)
+    // 때문에 사용자가 멈춰서는 안 된다. 정체성은 여전히 `become`이 정한다.
+    if let Some(binding) = binding_sel {
+        eprintln!(
+            "brv mcp: ignoring --binding {binding} from a registration older than 0.7.0 — sessions take an identity with `become`; `brv mcp register` rewrites this runner's entry"
+        );
+    }
     brv::local_plane::bridge::run(host).await
 }

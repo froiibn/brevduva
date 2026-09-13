@@ -64,6 +64,36 @@ pub fn sweep_parked_binaries(exe: &std::path::Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// 러너 등록이 어느 brv 버전의 형식으로 쓰였는지 적어 두는 표시 파일 — 설정 파일 옆 `mcp-registered.version`.
+/// 갱신 뒤 사용자가 `brv mcp register`를 손으로 다시 치지 않게 하기 위한 것(2026-09-13, P8): 0.7.0 갱신 직후
+/// Codex가 옛 등록(`--binding`)으로 중계기를 띄워 "MCP startup failed"만 보인 실사고 — 등록 형식이 바뀌는 갱신은
+/// 제품이 스스로 등록을 새로 써야 한다. 표시 파일의 버전이 지금 실행 파일과 다르면(없으면) 갱신이 있었던 것이다.
+pub fn registration_stamp_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|dir| dir.join("mcp-registered.version"))
+        .unwrap_or_else(|| std::path::PathBuf::from("mcp-registered.version"))
+}
+
+/// 러너 등록을 지금 버전 형식으로 다시 써야 하는가 — 표시 파일이 없거나 다른 버전이다.
+pub fn registrations_stale(config_path: &std::path::Path) -> bool {
+    std::fs::read_to_string(registration_stamp_path(config_path))
+        .map(|v| v.trim() != env!("CARGO_PKG_VERSION"))
+        .unwrap_or(true)
+}
+
+/// 러너 등록을 지금 버전 형식으로 썼다고 표시한다.
+pub fn stamp_registrations(config_path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(
+        registration_stamp_path(config_path),
+        concat!(
+            env!("CARGO_PKG_VERSION"),
+            "
+"
+        ),
+    )
+}
+
 /// 서비스가 실제로 실행하는 바이너리 — 갱신이 이 파일에 닿아야 새 코드가 뜬다 (`align_binary`).
 pub fn registered_exe() -> Option<std::path::PathBuf> {
     registration_exe()
@@ -904,6 +934,38 @@ pub fn restart() -> anyhow::Result<bool> {
 #[cfg(test)]
 mod registration_tests {
     use super::*;
+
+    /// 2026-09-13 (P8): 러너 등록은 brv 버전이 바뀐 뒤 한 번만 다시 쓴다 — 표시 파일이 없거나 다른 버전이면
+    /// 낡은 것이고, 지금 버전으로 표시하면 다음 재기동에서는 건드리지 않는다.
+    #[test]
+    fn runner_registrations_are_rewritten_once_per_brv_version() {
+        let dir = std::env::temp_dir().join(format!("brv-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        assert!(
+            registrations_stale(&config),
+            "no stamp = never registered by this version"
+        );
+        std::fs::write(
+            registration_stamp_path(&config),
+            "0.6.39
+",
+        )
+        .unwrap();
+        assert!(
+            registrations_stale(&config),
+            "a stamp from another version = updated since"
+        );
+        stamp_registrations(&config).unwrap();
+        assert!(!registrations_stale(&config));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mcp-registered.version"))
+                .unwrap()
+                .trim(),
+            env!("CARGO_PKG_VERSION")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// 2026-09-04: 세 OS의 등록 파일/SCM 문자열에서 프로필 경로를 읽는다 — 공백·따옴표 포함.
     #[test]

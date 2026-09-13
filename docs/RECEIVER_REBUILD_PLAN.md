@@ -124,6 +124,7 @@ PLAN 2026-08-25 "개인 개발자 → 기업 B2B → 로봇 에이전트" 로드
 | 2026-09-12 | 12. 실기 검증 (1차 — 이 윈도우 머신) | 진행 | 운영 서비스·배포 없이 로컬 시험 서버(격리 인프라)·임시 프로필 포그라운드 리시버 둘·모델 없는 발신 MCP 클라이언트. 실제 러너: Claude Code 2.1.263 무인 깨우기 왕복(`become(wake)` 1.1초 증명·착수 알림·reply) 성공, 수동 수신(입력 통로 없는 `claude -p`) 성공, Monitor 밀어넣기(전달→2초 receipt→reply) 성공, Channels는 `claude -p` 턴 종료로 미실측, Codex(0.153.4 npm `codex.cmd`) 깨우기는 **`.cmd` 감싸기 결함으로 실패**(프롬프트 첫 줄 뒤 유실 — RECEIVER_DESIGN §4 U7), 14단계 재깨우기 상한·failed 보고 실측, `brv listen`·`brv status` 실제 출력·`dormant`→세션 접속 확인. 반영: `runners.rs` 통로별 실측(`Push::Paths` — Claude Monitor measured), 낡은 주석 3곳. RUNNERS.md 표. brv 시험 197건·서버 전체 스위트 녹색. 남은 실기: Channels·codex queue(대화형), Codex Desktop, U7 수정 뒤 Codex, 서비스 모드(운영 교체 승인), macOS·Linux |
 | 2026-09-13 | U7 수정 + 12. 실기 검증 (2차 — Codex) | 진행 | 사용자 승인(권고안): 프로필 인자에 `{prompt}`가 없으면 프롬프트를 **표준 입력**으로(`runners.rs` Codex `exec … -`, `daemon.rs` 프롬프트 파일→stdin 두 스폰 경로, `winspawn.rs` stdin 핸들, `main.rs` `wake show`·`wake test`가 `.cmd`+인자 전달 설정 경고). 착수 전 실측: Codex 직접·`cmd /c codex.cmd` 감싸기·Claude `-p` 모두 표준 입력 4줄 완전 도달. 구현 중 실측: 프롬프트 파일을 열어 둔 채 스폰 전에 지우면 Node 경유 자식이 빈 입력을 봄 → 다음 깨우기 때 청소로 변경. 실기: 격리 `CODEX_HOME` 래퍼로 Codex 0.153.4 무인 깨우기 왕복 성공(요청→깨우기→18초 뒤 `become(wake)` 증명→reply). brv 시험 198건·서버 전체 스위트 녹색. 남은 실기: Channels·codex queue(대화형), Codex Desktop, 서비스 모드(운영 교체 승인), macOS·Linux |
 | 2026-09-13 | 릴리스·배포 (brv 0.7.0) | 완료 | 공개 `2f60fb5`·서버 `7256000`(공개 SHA 핀), 두 CI 녹색(공개 3 OS + 무인 회귀, 서버 실 인프라 전체) → `deploy/release.py publish`(태그 v0.7.0, 릴리스 워크플로 검증·5종 빌드·체크섬 대조 후 공개) → `deploy`(EC2 스테이징 빌드, server·web 같은 이미지로 교체, healthz, 설치 스크립트 갱신). 배포 후 확인: 공개 healthz 2곳, 원격 MCP 도구 설명에 45초 상한 반영, 서빙 install.sh/ps1 = 릴리스 커밋, 컨테이너 로그 오류 0, 공식 경로 다운로드 체크섬 일치·`brv 0.7.0`. 각 머신은 설치 한 줄로 갱신 뒤 `brv mcp register` 재실행 |
+| 2026-09-13 | 갱신 시 러너 등록 자동 갱신 (P8 보강, brv 0.7.1) | 완료 | 0.7.0 갱신 직후 Codex CLI "MCP startup failed"(옛 `--binding` 등록을 중계기가 거부, Codex는 stderr를 숨김). 사용자 지시: 재등록 안내가 아니라 갱신이 스스로 정리. `service.rs` 등록 버전 표시 파일(`registrations_stale`·`stamp_registrations`), `restart_daemon`이 서비스 유무와 무관하게 잔재 정리·등록 다시 쓰기(`refresh_registrations_after_update`), 중계기는 옛 `--binding`을 경고만 하고 붙음, 자동 등록의 다중 바인딩 안내 가지 삭제. 격리 CODEX_HOME으로 옛 항목이 덮이는 것·표시 파일·관용 중계기 실측. 시험 199건 |
 | — | 8·10·11·12 | 진행·미착수 | 아래 참조 |
 
 ### 다음에 할 일 (남은 단계의 현재 상태)
@@ -150,10 +151,12 @@ PLAN 2026-08-25 "개인 개발자 → 기업 B2B → 로봇 에이전트" 로드
 
 ### 이 변경이 요구하는 사용자 조치 (마이그레이션)
 
-`brv mcp`가 브리지가 되면서 **등록에 `--binding`이 있으면 거부**된다(있으면 이유를 말하고 종료).
+`brv mcp`가 브리지가 되면서 등록의 `--binding`은 의미가 없다 — 0.7.0은 거부했고, 0.7.1부터 **무시하고 붙는다**
+(2026-09-13 번복: 거부는 사용자만 멈추게 했다 — Codex는 중계기의 stderr를 보여 주지 않는다).
 - 데몬이 깨우는 세션은 자동이다 — 깨우기용 MCP 설정 파일을 리시버가 매번 새로 쓴다.
-- 손으로 등록된 것(예: 이 개발 머신의 `~/.codex/config.toml`)은 `brv mcp register`를 다시 실행해야
-  한다.
+- 러너 등록은 갱신이 다시 쓴다(0.7.1) — 설치기가 부르는 `brv daemon restart`가 설정 옆 `mcp-registered.version`이
+  지금 버전이 아니면 탐지된 러너 전부에 등록한다. 사용자가 `brv mcp register`를 칠 일은 등록 명령이 없는 러너
+  (조각 붙여 넣기)뿐이다.
 - 리시버 서비스가 떠 있어야 세션이 붙는다. 없으면 `brv mcp`가 그 사실을 말하고 종료한다.
 - 옛 `brv connect`로 연결한 Codex Desktop 작업은 새 리시버가 기동할 때 연결이 거둬진다(옛 worker 정지) — 그 작업
   안에서 `receiver_connect(session_kind="codex-desktop")`로 다시 붙인다.

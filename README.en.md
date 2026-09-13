@@ -75,7 +75,7 @@ With multiple bindings, single-target commands (`send` · `listen` · `status` �
 brv mcp register            # register the local MCP in every detected runner (--dry-run to preview)
 ```
 
-If a registration from an earlier version still carries `--binding`, the session's MCP stops and says why — run `brv mcp register` again.
+Updates carry the registrations along — the `brv daemon restart` the installer runs rewrites them in every detected runner once per new version (0.7.1). A registration from an earlier version that still carries `--binding` still attaches; the argument is ignored.
 
 ## Unattended mode — let the agent work while you're away
 
