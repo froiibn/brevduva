@@ -79,7 +79,7 @@ Updates carry the registrations along — the `brv daemon restart` the installer
 
 ## Unattended mode — let the agent work while you're away
 
-While you have an app open (Claude Code, Claude Desktop, claude.ai, …) **no setup is needed at all** — messages arrive as MCP tool calls, and a human approves tool permissions on the spot. This section is only for making an agent on this machine receive and act on messages **while you're away**.
+An interactive session attaches to this machine's receiver and receives through it (section above), and a human approves tool permissions on the spot — where no receiver can run (claude.ai, mobile) the session receives directly through the server's remote MCP. This section is only for making an agent on this machine receive and act on messages **while you're away**.
 
 In unattended mode, the daemon wakes a headless session (`codex exec`, `claude -p`, … — to the daemon a runner is just the executable named in the config) when a message arrives. An unattended session has no human to ask for permissions, so it can only use **tools you allowed in advance** — choosing that allowance level is the only extra setup.
 
@@ -127,7 +127,7 @@ server = "https://api.brevduva.dev"
 
 [wake]                                 # machine-global — runner, allowance, timeout (local trust policy)
 command = "/home/me/.local/bin/codex"  # absolute path (a service environment's PATH lacks user paths) — filled in by brv wake set --runner codex
-args = ["exec", "--skip-git-repo-check", "{prompt}", "--approve-for-me"]  # the Codex profile's respond/edit (read-only sandbox cannot call MCP)
+args = ["exec", "--skip-git-repo-check", "-", "--approve-for-me"]  # the Codex profile's respond/edit — the prompt goes in on stdin (`-`) (read-only sandbox cannot call MCP)
 timeout_s = 600                        # max run time for a woken session (seconds)
 
 [[binding]]                            # one per binding (agent × channel) — several allowed
@@ -147,14 +147,14 @@ wake_command = "/home/me/.local/bin/claude"  # executable just for this binding 
 wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # arguments just for this binding (the Claude profile's respond)
 ```
 
-Legacy singular form (top-level `channel`/`agent` plus `dir`/`policy` under `[wake]`) still parses — it reads as one binding. Per-binding runners can also be set by command: `brv wake set --binding claude@my-project --runner claude`. `{prompt}` is replaced with the incoming message prompt. After editing, verify with `brv wake test --binding …` and restart the daemon.
+Legacy singular form (top-level `channel`/`agent` plus `dir`/`policy` under `[wake]`) still parses — it reads as one binding. Per-binding runners can also be set by command: `brv wake set --binding claude@my-project --runner claude`. `{prompt}` is replaced with the incoming message prompt; a profile without that slot receives the prompt on stdin. After editing, verify with `brv wake test --binding …` and restart the daemon.
 
 ### If something goes wrong
 
 - `brv wake test` fails: check that the command is an absolute path, and see what the session output log (`wake.log` in the config directory) left behind
 - The wake fired but the agent can't do the work: the `allow` level in `brv wake show` is too low — `brv wake set --allow edit|full`
 - Inside an unattended session, `brv wake set` / `binding` / `init` / `daemon` are refused with "refused … unattended session": by design — a remote message must not be able to change this machine's local policy. The machine owner changes the setup
-- The wake fired but the session can't use brevduva tools (can't reply): check whether Claude Code's MCP registration (`claude mcp get brevduva`) carries a stale `--env BREVDUVA_CONFIG=…` — **an env pinned in the registration overrides what the daemon auto-propagates**. Remove the env from the registration or update it to the current config path (rare since 0.6.6: the daemon injects the local MCP itself and enroll refreshes the registration)
+- The wake fired but the session can't use brevduva tools (can't reply): compare the runner's registration with `brv mcp register --dry-run` — updates rewrite registrations (0.7.1), but runners without a registration command keep whatever snippet was pasted by hand
 - `brv status` shows `SUSPENDED — … token …`: the token was rejected (access revoked in the dashboard, or the same agent was connected on another machine). Issue a new connect code in the dashboard and run `brv init --enroll` — the daemon heals without a restart
 - `brv status` shows `WAKE UNAVAILABLE — …`: no session can run, so the daemon is staying off the channel (messages wait in the server queue) — fix the runner login (`claude login`), path, or permissions and it joins on the next re-check (within 15 minutes); to confirm right away, `brv wake test` then `brv daemon restart`
 - The runner you want is missing from `runners:` in `brv status`: it was not found on PATH or in the known install folders (npm global, `~/.local/bin`, the Codex app bundle, …), or its `--version` failed — point at it directly with `brv wake set --runner codex --command <absolute path>`

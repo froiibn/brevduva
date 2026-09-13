@@ -79,7 +79,7 @@ brv mcp register            # 탐지된 러너 전부에 로컬 MCP 등록 (--dr
 
 ## 무인 모드 — 자리를 비워도 에이전트가 일하게
 
-앱(Claude Code·Claude Desktop·claude.ai 등)을 **열고 쓰는 동안은 아무 설정도 필요 없다** — 메시지는 MCP 도구로 받고, 도구 권한은 그 자리에서 사람이 승인한다. 이 절은 "부재 중에도 이 머신의 에이전트가 메시지를 받아 일하게" 만들 때만 필요하다.
+대화 중인 세션은 이 머신의 리시버에 붙어 받고(위 절), 도구 권한은 그 자리에서 사람이 승인한다 — 리시버를 둘 수 없는 claude.ai·모바일은 서버의 원격 MCP로 직접 받는다. 이 절은 "부재 중에도 이 머신의 에이전트가 메시지를 받아 일하게" 만들 때만 필요하다.
 
 무인 모드에서는 데몬이 메시지 도착 시 headless 세션(`codex exec`·`claude -p` 등 — 데몬에게 러너는 설정에 적힌 실행 파일일 뿐이다)을 깨워 처리시킨다. 무인 세션은 권한을 물어볼 사람이 없으므로 **사전에 허용해둔 도구만** 쓸 수 있다 — 그 허용 수준을 고르는 것이 유일한 추가 설정이다.
 
@@ -127,7 +127,7 @@ server = "https://api.brevduva.dev"
 
 [wake]                                 # 머신 전역 — 실행기·권한·타임아웃 (로컬 신뢰 정책)
 command = "/home/me/.local/bin/codex"  # 절대 경로로 (서비스 환경의 PATH에는 사용자 경로가 없다) — brv wake set --runner codex 가 채운다
-args = ["exec", "--skip-git-repo-check", "{prompt}", "--approve-for-me"]  # Codex 프로필의 respond/edit (읽기 전용 샌드박스는 MCP 호출 불가)
+args = ["exec", "--skip-git-repo-check", "-", "--approve-for-me"]  # Codex 프로필의 respond/edit — 프롬프트는 표준 입력(`-`)으로 (읽기 전용 샌드박스는 MCP 호출 불가)
 timeout_s = 600                        # 깨운 세션 최대 실행 시간(초)
 
 [[binding]]                            # 바인딩(에이전트×채널)마다 하나 — 여러 개 가능
@@ -147,14 +147,14 @@ wake_command = "/home/me/.local/bin/claude"  # 이 바인딩 전용 실행 파�
 wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바인딩 전용 인자 (Claude 프로필의 respond)
 ```
 
-구버전의 단수형(톱레벨 `channel`/`agent` + `[wake]`의 `dir`/`policy`)도 그대로 읽힌다 — 바인딩 1개로 해석된다. 바인딩별 러너는 명령으로도 설정할 수 있다: `brv wake set --binding claude@my-project --runner claude`. `{prompt}` 자리에 수신 메시지 프롬프트가 치환된다. 수정 후에는 `brv wake test --binding …`으로 검증하고 데몬을 재시작한다.
+구버전의 단수형(톱레벨 `channel`/`agent` + `[wake]`의 `dir`/`policy`)도 그대로 읽힌다 — 바인딩 1개로 해석된다. 바인딩별 러너는 명령으로도 설정할 수 있다: `brv wake set --binding claude@my-project --runner claude`. `{prompt}` 자리에 수신 메시지 프롬프트가 치환되고, 그 자리가 없으면 표준 입력으로 넘긴다. 수정 후에는 `brv wake test --binding …`으로 검증하고 데몬을 재시작한다.
 
 ### 문제가 생기면
 
 - `brv wake test` 실패: 명령이 절대 경로인지, 세션 출력 로그(설정 디렉터리의 `wake.log`)에 무엇이 남았는지 확인
 - 깨우기는 됐는데 일을 못 한다: `brv wake show`의 `allow` 수준이 부족한 경우 — `brv wake set --allow edit|full`
 - 무인 세션 안에서 `brv wake set`·`binding`·`init`·`daemon`이 "refused … unattended session"으로 거부된다: 의도된 동작 — 원격 메시지가 이 머신의 로컬 정책을 바꾸지 못하게 막는다. 설정은 머신 소유자가 직접 바꾼다
-- 깨우기는 됐는데 세션이 brevduva 도구를 못 쓴다(응답 불능): Claude Code의 MCP 등록(`claude mcp get brevduva`)에 옛 `--env BREVDUVA_CONFIG=…`가 남아 있는지 확인 — **등록에 박힌 env는 데몬이 자동 전파한 값을 덮어쓴다**. 등록에서 env를 지우거나 현행 설정 경로로 갱신할 것 (0.6.6부터는 데몬이 로컬 MCP를 직접 꽂아 주고 enroll이 등록을 갱신하므로 드물다)
+- 깨우기는 됐는데 세션이 brevduva 도구를 못 쓴다(응답 불능): 러너의 등록이 옛 형식인지 `brv mcp register --dry-run`으로 비교한다 — 갱신 때 등록을 다시 쓰지만(0.7.1), 등록 명령이 없는 러너는 붙여 넣은 조각을 손으로 맞춰야 한다
 - `brv status`에 `SUSPENDED — … token …`: 토큰이 거부된 상태(대시보드에서 연결을 회수했거나 다른 머신에서 같은 에이전트를 연결한 경우). 대시보드에서 연결 코드를 다시 발급해 `brv init --enroll`하면 데몬이 재기동 없이 복구된다
 - `brv status`에 `WAKE UNAVAILABLE — …`: 세션을 못 띄워 채널에 붙지 않는 중(메시지는 서버 큐에 대기) — 러너 로그인 만료(`claude login`), 경로, 권한을 고치면 다음 재점검(최대 15분)에 스스로 접속한다. 바로 확인하려면 `brv wake test` 후 `brv daemon restart`
 - `brv status`의 `runners:`에 쓰려는 러너가 없다: PATH와 알려진 설치 폴더(npm 전역·`~/.local/bin`·Codex 앱 번들 등)에서 못 찾았거나 `--version`이 실패한 것 — `brv wake set --runner codex --command <절대 경로>`로 직접 지정한다
