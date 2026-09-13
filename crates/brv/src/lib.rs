@@ -10,17 +10,15 @@
 // 현재는 winspawn.rs(로그온한 사용자 세션에 깨우기 스폰, 2026-09-03) 하나. 그 외 전역 금지
 #![deny(unsafe_code)]
 
-mod claude_channel;
 pub mod client;
-mod codex_cli;
 pub mod config;
-pub mod connection;
 pub mod daemon;
 mod delivery;
 pub mod desktop;
 pub mod enroll;
 mod file_lock;
 pub mod hook;
+pub mod local_plane;
 pub mod manage;
 pub mod mcp;
 pub mod runners;

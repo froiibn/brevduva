@@ -14,6 +14,15 @@ brevduva-protocol = { path = "../brevduva-protocol" }
 clap = { version = "4.6.6", features = ["derive", "env"] }
 dirs = "6.0.0"
 futures-util = "0.3.34"
+# 로컬 평면 접속 자격 (2026-09-09, RECEIVER_DESIGN P3·U5): OS 난수로 토큰 발급,
+# 대조는 상수 시간으로. 둘 다 rustls 계열이 이미 끌어오던 것이라 새 공급망이 아니다
+getrandom = "0.3.4"
+# 로컬 평면의 MCP 프런트엔드 (2026-09-09, P3): 루프백 HTTP 서버. reqwest가 이미 같은
+# hyper 1.x·http-body-util을 끌어오므로 서버 기능만 켜는 셈이다 — 새 공급망이 아니다
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 keyring = "4.1.6"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,6 +30,7 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std", "io-util", "signal", "fs", "process"] }
 # rustls-tls-webpki-roots: wss:// 지원 (2026-08-27, TLS 서버 도입) — reqwest와 같은 rustls 계열로 통일
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+subtle = "2.6.1"
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

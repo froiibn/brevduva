@@ -41,7 +41,7 @@ pub struct Binding {
     #[serde(default)]
     pub description: String,
     /// 깨어난 세션의 작업 디렉터리 (해당 프로젝트 루트 — .mcp.json이 있는 곳).
-    /// 없으면 이 바인딩은 wake 불가 — 데몬 기동 시 검증한다.
+    /// 없으면 이 바인딩은 깨울 수 없고, 로컬 세션이 쥘 때만 서버에 붙어 받는다 (2026-09-11, 16단계).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_dir: Option<String>,
     /// 이 바인딩 전용 깨우기 실행 파일 — 없으면 전역 `[wake].command` 상속.
@@ -83,7 +83,7 @@ pub struct BrvConfig {
     /// 서버 베이스 URL (http/https) — WS 주소는 여기서 유도한다. 머신당 서버 하나
     /// (프로필 분리는 `BREVDUVA_CONFIG`로 — 페이즈 27 결정).
     pub server: String,
-    /// `brv daemon`의 세션 깨우기 실행기 (5.3 CLI 어댑터 규약). 없으면 daemon 기동 거부.
+    /// `brv daemon`의 세션 깨우기 실행기 (5.3 CLI 어댑터 규약). 없으면 무인 깨우기가 꺼지고, 바인딩은 로컬 세션이 쥘 때만 서버에 붙는다 (2026-09-11, 16단계 — 종전에는 기동 거부).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeConfig>,
     /// 이 머신의 바인딩들 — 데몬은 전부 동시 수신, 단일 대상 명령은 `--binding`으로 선택.
@@ -98,7 +98,8 @@ pub struct BrvConfig {
 pub struct WakeConfig {
     /// 실행 파일 (전체 경로 권장 — PATH에 없을 수 있음)
     pub command: String,
-    /// 인자 목록 — `{prompt}` 자리에 메시지 프롬프트가 치환된다
+    /// 인자 목록 — `{prompt}` 자리에 메시지 프롬프트가 치환된다. 자리표시자가 없으면 프롬프트는 표준
+    /// 입력으로 간다(2026-09-13, U7 — `.cmd` 심 감싸기가 여러 줄 인자를 자르는 문제의 근본 수정)
     #[serde(default = "default_wake_args")]
     pub args: Vec<String>,
     /// 깨운 세션의 최대 실행 시간(초) — 초과 시 강제 종료
@@ -538,7 +539,7 @@ fn write_token_file(token_id: &str, token: &str) -> anyhow::Result<PathBuf> {
 
 /// 비밀 파일의 원자적 교체: `<path>.tmp`에 쓰고 → (유닉스) 0600 → rename. 어느 단계가
 /// 실패해도 임시 파일을 치우고 `path`는 손대지 않은 채 남는다.
-fn write_secret_file(path: &Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn write_secret_file(path: &Path, content: &str) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     let staged = (|| -> anyhow::Result<()> {
         std::fs::write(&tmp, content)?;

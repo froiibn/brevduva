@@ -30,6 +30,40 @@ pub fn registered_config_path() -> Option<std::path::PathBuf> {
     registration()?.map(std::path::PathBuf::from)
 }
 
+/// 갱신 잔재 정리 (2026-09-12, RECEIVER_REBUILD_PLAN 10단계·P8) — 실행 중인 파일은 지울 수 없어 갱신은 옛 파일을
+/// 비켜 둔다(서비스 [`align_binary`]의 `brv.old`, 윈도우 설치기의 `brv.exe.old`·`brv.exe.old.<id>`). 이 실행 파일
+/// 옆의 그런 파일을 지우고 지운 것을 돌려준다. 아직 옛 프로세스(러너가 쥔 옛 `brv mcp` 등)가 쓰고 있으면 지우지
+/// 못하고 다음 기회(리시버 기동·`brv daemon restart`)에 다시 한다. 종전에는 다음 갱신 때에야 덮어썼다.
+pub fn sweep_parked_binaries(exe: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let (Some(dir), Some(name), Some(stem)) = (
+        exe.parent(),
+        exe.file_name().and_then(|n| n.to_str()),
+        exe.file_stem().and_then(|n| n.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    let parked_by_service = format!("{stem}.old");
+    let parked_by_installer = format!("{name}.old");
+    let installer_variant = format!("{parked_by_installer}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|file| {
+                    file == parked_by_service
+                        || file == parked_by_installer
+                        || file.starts_with(&installer_variant)
+                })
+        })
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
+}
+
 /// 서비스가 실제로 실행하는 바이너리 — 갱신이 이 파일에 닿아야 새 코드가 뜬다 (`align_binary`).
 pub fn registered_exe() -> Option<std::path::PathBuf> {
     registration_exe()

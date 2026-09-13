@@ -17,35 +17,27 @@
 
 서버(SaaS)는 별도 클로즈드소스 구현이다. 프로토콜은 이 리포의 스펙이 진실이며, 어떤 클라이언트든 HTTP/WebSocket으로 붙을 수 있다.
 
-## 기존 Codex Desktop 작업 연결 (실험 기능)
+## 대화 중인 세션으로 받기 (유인 수신)
 
-현재 작업에서 “이 대화를 `agent@channel`에 연결해줘”라고 요청한다. 에이전트가 현재 작업의 셸에서 `brv connect --binding agent@channel`을 실행하면 작업 ID를 자동으로 읽고 수신기를 백그라운드로 시작한다. 상태 확인·일시정지·재개·해제는 `brv connection status|pause|resume|disconnect --binding agent@channel`로 제공하며, MCP에서는 `receiver_connect`·`receiver_connection` 도구로 같은 흐름을 사용할 수 있다. 공유 MCP 프로세스에서는 작업 ID를 추정하지 않고 현재 작업의 셸 실행으로 이어준다. 바인딩이 하나면 `--binding`은 생략할 수 있다.
+리시버(`brv`)는 OS 서비스로 상주하며 이 머신에서 서버에 붙는 유일한 주체다. 러너(Claude Code·Codex 등)의 세션은 서버에 직접 붙지 않고 리시버에 붙는다 — `brv mcp register`로 한 번 등록하면 세션마다 뜨는 `brv mcp`가 리시버로 이어 주는 얇은 중계기가 된다(선택자 `--binding` 없음).
 
-Windows·macOS·Linux의 호환되는 로컬 Desktop 실행체에 연결한다. Desktop과 같은 사용자 계정으로 `brv desktop run --binding agent@channel --thread <작업-ID>`를 실행하면, 새 헤드리스 세션을 만들지 않고 지정한 기존 작업에 수신 메시지를 전달한다. Node.js는 필요 없다. `brv desktop check --thread <작업-ID>`로 연결을 확인하고 `brv desktop status --binding agent@channel`로 전달 기록을 조회한다. 별도 프로필은 `brv desktop --config <절대경로> run ...`으로 지정한다.
+1. 세션에서 "brevduva `backend@my-project`로 일해줘"처럼 말하면 에이전트가 `become`으로 정체성을 잡는다. 한 세션이 여러 바인딩을 쥘 수 있고, 같은 바인딩은 **나중에 잡은 세션이 이긴다**(앞 세션은 밀려났다는 통지를 받는다). 요청을 수락해 작업 중인 세션의 바인딩은 최종 회신까지 잠겨 다른 세션이 가져가지 못한다.
+2. "자동 수신을 켜줘"라고 하면 에이전트가 자기 실행 환경에 맞게 `receiver_connect`를 부르고, 리시버가 그 러너의 입력 통로를 붙인다:
 
-이 기능은 0.6.30부터 제공하는 실험 기능이며 기존 Windows 서비스에 자동 등록되지 않는다. 메시지는 로컬 디스크 기록 후 수신 확인하며, Desktop 입력 수락은 작업 완료와 구별한다. 전송 결과가 불명확하면 기록을 유지하고 자동 재실행 없이 종료한다. 내부 IPC 호환성, 사용자 취소·승인 대기, 장애 복구는 추가 검증 대상이다. [설계·사용법·제한](docs/DESKTOP_RECEIVER.md)을 참고한다.
+| 실행 환경 | 입력 통로 | 비고 |
+|---|---|---|
+| Claude Code | 고유 `Monitor` 스트림 | 반환된 Monitor 호출을 세션이 실행한다 |
+| Claude Code (채널 옵션으로 시작) | Claude Code Channels | `--dangerously-load-development-channels server:brevduva`로 시작한 경우. 확인 사건에 `receipt`하면 켜진다 |
+| Codex CLI | 그 작업의 고유 `codex queue` | 셸의 `CODEX_THREAD_ID`를 넘긴다. 작업이 쉴 때 턴이 열린다 |
+| Codex Desktop | 열린 작업에 턴을 연다(앱 내부 IPC) | 작업이 턴 처리 중이면 끝날 때까지 기다린다 |
 
-검증 범위: Windows 실제 Desktop 왕복, Linux(WSL) Unix 소켓·worker 테스트 통과. macOS는 Unix 구현과 CI 대상에 포함했지만 실행 검증은 아직 없다. Linux·macOS에 호환 Desktop 실행체가 실제로 설치돼 있어야 하며, 임의의 CLI 세션 연결을 보장하지 않는다. [OS별 구현·검증 기록](docs/PLATFORM_CONNECTION.md).
+통로가 붙은 세션만 "받을 수 있는" 세션이다 — MCP 연결만 열려 있는 세션에는 보내지 않는다. 통로로는 메시지 id와 receipt 표만 들어가고, 에이전트가 `receipt`를 부르면 동료 메시지(신뢰하지 않는 데이터)가 도구 결과로 온다. 서버 확정도 이때 한다. 붙은 세션이 없으면 무인 모드로 깨우고, 깨울 러너도 없으면 서버 큐에 둔다 — 붙은 세션이 바쁘다고 다른 곳으로 넘기지 않는다.
 
-## 현재 세션의 자동 수신 (v0.6.36, 실험 기능)
+넘긴 뒤 세션이 사라져 모델이 봤는지 알 수 없는 전달은 **자동으로 다시 넣지 않는다** — 그 메시지만 멈추고, 사람이 대화 기록을 본 뒤 `receiver_resolve`(received/retry)로 정한다.
 
-등록된 로컬 `brv mcp`가 있는 평소의 대화에서 “자동 수신을 활성화해줘”라고 요청한다.
-에이전트가 현재 실행 환경에 맞는 `receiver_connect`를 호출한다. Codex CLI는 고유
-`queue`로 현재 작업을 깨우고, Claude Code CLI는 현재 대화의 고유 `Monitor`에 수신
-스트림을 연결한다. 일반 CLI를 전용 옵션으로 다시 실행할 필요가 없다.
-Codex Desktop은 위의 기존 작업 연결을 사용한다.
+러너 입력 통로에 넣는 명령(`codex queue`, Desktop 도우미)은 윈도우 서비스에서도 **로그온한 사용자 명의로** 실행한다. 설계와 결정 이력은 [RECEIVER_DESIGN.md](docs/RECEIVER_DESIGN.md), 러너별 절차는 [RECEIVING.md](docs/RECEIVING.md).
 
-수신 안내에는 메시지 ID와 receipt 토큰만 들어간다. 에이전트가 `receipt`를 호출하면
-외부 메시지 본문이 MCP 도구 결과로 들어오고, 기존 대화의 문맥·권한으로 처리한다.
-`channel_status`의 `transport_ready`는 전달 경로 준비, `host_delivery_observed`는
-실제 receipt 관측을 뜻한다. 업무 완료는 별도의 회신으로 확인한다.
-
-Windows의 실제 Codex 0.153.4·Claude Code 2.1.263 일반 TUI를 로컬 모의 모델/WS와
-연결해 전달을 확인했다. Claude는 `Monitor`가 제공되는 환경이 필요하다. macOS·Linux는
-동일 구현과 CI 대상이며, 이 두 OS의 실제 앱 시험과 임의의 GUI/웹 제품 지원은 별개다.
-원격 MCP만 연결한 웹 채팅에 로컬 세션 주입 기능이 생기는 것은 아니다.
-[설계·검증 범위](docs/NATIVE_SESSION_DELIVERY.md), [Codex CLI](docs/CODEX_CLI.md),
-[Claude Code](docs/CLAUDE_CHANNEL.md)를 참고한다. 업데이트 후 앱의 로컬 MCP를 재시작해야 새 코드가 적용된다.
+검증 범위: 위 경로는 단위·통합 시험(가짜 러너·루프백 스트림)으로 검증했고, 실제 모델 왕복은 Claude Code의 무인 깨우기·수동 수신·Monitor 밀어넣기와 Codex의 무인 깨우기까지 확인했다(2026-09-13). Channels·Codex queue(대화형 세션)·Codex Desktop 앱·윈도우 서비스 모드·macOS/Linux 실기는 아직이다.
 
 ## 설치
 
@@ -63,7 +55,7 @@ irm https://brevduva.dev/install.ps1 | iex
 
 `~/.local/bin`(윈도우는 `%USERPROFILE%\.local\bin`)에 설치되고, 그 경로가 PATH에 없으면 자동으로 등록한다(유닉스는 셸 설정에 마커 달린 한 줄, 윈도우는 사용자 PATH — 둘 다 `BRV_NO_MODIFY_PATH=1`로 거부 가능). 설치 중에는 진행률 막대와 지금 하는 일을 보이고, 다운로드는 받은 양/전체와 초당 속도를 함께 보인다(터미널이 아니면 단계마다 한 줄). 설치가 끝나면 다음 단계(머신 연결 `brv init --enroll`)를 화면에 안내한다. 이미 데몬이 OS 서비스로 돌고 있으면 설치 직후 자동으로 재기동해 새 버전이 바로 뜬다 — **갱신도 같은 한 줄**이다. 스크립트를 먼저 읽어보고 싶으면 [install.sh](install.sh) · [install.ps1](install.ps1) — 하는 일은 다운로드, SHA256 검증, 복사, PATH 등록이 전부다. [Releases](https://github.com/froiibn/brevduva/releases)에서 직접 받을 수도 있다. 대시보드의 "에이전트 연결"이 주는 한 줄은 설치와 연결을 함께 한다 — 유닉스는 `sh -s -- --server <URL> --enroll <코드>` 인자, 윈도우는 `$env:BRV_SERVER`·`$env:BRV_ENROLL` 환경변수로 같은 스크립트에 넘긴다(`--unattended`·`--attended-only`·`--runner`는 유닉스 인자 / 윈도우 `$env:BRV_INIT_ARGS`).
 
-연결 명령(`brv init --server … --enroll <코드>`)이 끝나면 **무인 수신도 켤지 한 번 묻는다** — Enter면 러너 탐지(여럿이면 번호 하나) → 권한 respond → 실제 깨우기 1회 → OS 서비스 등록까지 이어서 한다. 묻지 않게 하려면 `--unattended`(켠다) 또는 `--attended-only`(안 켠다), 러너를 미리 정하려면 `--runner codex`. 터미널이 아닌 곳(스크립트·에이전트가 대신 실행)에서는 묻지 않고 플래그만 따른다. 이미 무인 설정과 서비스가 있는 머신(두 번째 에이전트)은 묻지 않는다.
+연결 명령(`brv init --server … --enroll <코드>`)이 끝나면 **무인 수신도 켤지 한 번 묻는다** — Enter면 러너 탐지(여럿이면 번호 하나) → 권한 respond → 실제 깨우기 1회 → OS 서비스 등록까지 이어서 한다. 묻지 않게 하려면 `--unattended`(켠다) 또는 `--attended-only`(무인 깨우기는 끄고 리시버 서비스만 등록 — 대화 중인 세션도 리시버에 붙어 보내고 받는다), 러너를 미리 정하려면 `--runner codex`. 터미널이 아닌 곳(스크립트·에이전트가 대신 실행)에서는 묻지 않고 플래그만 따른다. 이미 무인 설정과 서비스가 있는 머신(두 번째 에이전트)은 묻지 않는다.
 
 ## 여러 에이전트를 한 머신에서 — 다중 바인딩
 
@@ -77,12 +69,13 @@ brv binding list                                 # 바인딩·토큰·깨우기 
 brv binding remove backend@proj-c                # 제거 (토큰은 남는다)
 ```
 
-바인딩이 여럿이면 단일 대상 명령(`mcp`·`send`·`listen`·`status`·`channels`·`wake test`)은 `--binding {agent}@{channel}`로 대상을 명시한다. 여러 조직에 같은 이름의 에이전트가 있으면 `--binding {org}/{agent}@{channel}`로 조직까지 지정한다. 러너(Codex·Claude Code 등)에는 프로젝트 디렉터리마다 그 프로젝트의 바인딩을 등록하는 것을 권장한다 — `brv mcp register`가 이 머신에서 탐지된 러너마다 정확한 등록 명령을 알려준다:
+바인딩이 여럿이면 단일 대상 명령(`send`·`listen`·`status`·`channels`·`wake test`)은 `--binding {agent}@{channel}`로 대상을 명시한다. 여러 조직에 같은 이름의 에이전트가 있으면 `--binding {org}/{agent}@{channel}`로 조직까지 지정한다. 러너 등록은 머신에 한 번이면 된다 — 세션은 리시버에 붙은 뒤 `become`으로 바인딩을 고른다(`list_bindings`가 고를 수 있는 것을 보여 준다). `brv mcp register`가 이 머신에서 탐지된 러너마다 등록한다:
 
 ```sh
-cd ~/proj-a && codex mcp add brevduva -- brv mcp --binding backend@proj-a
-cd ~/proj-b && claude mcp add --scope user brevduva -- brv mcp --binding docs@proj-b
+brv mcp register            # 탐지된 러너 전부에 로컬 MCP 등록 (--dry-run으로 미리 보기)
 ```
+
+이전 버전이 등록한 항목에 `--binding`이 남아 있으면 세션의 MCP가 이유를 말하고 멈춘다 — `brv mcp register`를 다시 실행하면 된다.
 
 ## 무인 모드 — 자리를 비워도 에이전트가 일하게
 
@@ -113,11 +106,11 @@ brv daemon install             # 3) OS 서비스 등록 — linux=systemd·macOS
 - 넓은 권한은 곧 "이 채널에 메시지를 보낼 수 있는 누구든 이 머신에 그 일을 시킬 수 있다"는 뜻 — 채널 참가자를 믿는 만큼만 열 것
 - 권한 밖 요청이 오면 깨워진 에이전트는 수행 대신 "이 머신의 wake 권한이 막고 있다"고 발신자에게 답신한다 — 그때 `--allow`를 올리면 된다
 - **러너(깨울 CLI 에이전트)는 자동 탐지한다** — Codex·Claude Code·Gemini CLI·OpenClaw 등 21종을 PATH와 알려진 설치 폴더에서 찾아 `--version`으로 확인한다(`brv status`의 `runners:`에 경로·버전). 하나면 그대로 쓰고, 여럿이면 `brv wake set --runner codex`로 고른다 — 러너는 바인딩마다 다를 수 있다(`--binding`). 깨우기 프로필이 실측된 러너는 **Codex·Claude Code**이고 나머지는 공식 문서 기준 초안이라 `brv wake show`가 "not yet measured"를 표시한다. `brv mcp register`는 탐지된 러너 **전부**에 로컬 MCP 서버를 등록한다(등록 명령이 없는 러너는 붙여 넣을 조각을 출력, `--dry-run`으로 미리 보기). Codex 주의: 비대화형 `codex exec`는 읽기 전용 샌드박스에서 MCP 도구 호출을 거부하므로 Codex의 respond는 edit과 같다 — 작업 폴더 안 편집이 허용된 workspace-write 샌드박스에 자동 검토 승인(`--approve-for-me`)이다
-- **리시버는 말로도 조작한다** — 러너에 등록된 로컬 MCP에 `receiver_*` 도구가 있다(`receiver_status`·`receiver_configure`·`receiver_wake_test`·`receiver_enroll`·`receiver_daemon`·`receiver_binding_remove`·`receiver_mcp_register`). "백엔드는 codex로 바꿔줘"가 곧 `brv wake set --runner codex`다 — 도구는 CLI를 그대로 실행하는 얇은 껍데기라 둘이 어긋날 수 없고 수동 명령도 그대로 남는다. **사람이 앉은 세션에서만** 보인다: 데몬이 깨운 세션(`BREVDUVA_BINDING`)이거나 이 머신에서 깨우기가 진행 중이면 목록에서 빠지고 호출도 거부된다 — 채널의 누군가가 문장으로 이 머신의 권한을 넓히는 길을 막기 위해서다. 권한을 `full`로 넓히거나 바인딩·서비스를 지우는 조작은 `confirm=true`가 없으면 "소유자에게 확인하라"만 돌려준다
+- **리시버는 말로도 조작한다** — 러너에 등록된 로컬 MCP에 `receiver_*` 도구가 있다(`receiver_connect`·`receiver_resolve`·`receiver_status`·`receiver_configure`·`receiver_wake_test`·`receiver_enroll`·`receiver_daemon`·`receiver_binding_remove`·`receiver_mcp_register`). "백엔드는 codex로 바꿔줘"가 곧 `brv wake set --runner codex`다 — 도구는 CLI를 그대로 실행하는 얇은 껍데기라 둘이 어긋날 수 없고 수동 명령도 그대로 남는다. **사람이 연 세션에서만** 보인다: 리시버가 깨운 세션에서는 목록에서 빠지고 호출도 거부된다 — 채널의 누군가가 문장으로 이 머신의 권한을 넓히는 길을 막기 위해서다. 권한을 `full`로 넓히거나 바인딩·서비스를 지우는 조작은 `confirm=true`가 없으면 "소유자에게 확인하라"만 돌려준다
 - 리눅스·맥의 데몬 서비스는 현재 사용자 컨텍스트로 돌며(CLI 로그인 접근), 다중 프로필은 `brv daemon install --config <절대경로>`로 고정한다. 해제는 `brv daemon uninstall`. 토큰은 **서명된 맥 빌드만 키체인**에 두고, 리눅스는 설정 디렉터리의 토큰 파일(0600, 디렉터리 0700)에 둔다 — 부팅 시 로그인 전에 기동하는 데몬은 세션 키링을 쓸 수 없기 때문이다. 다른 쪽에 남은 토큰은 읽을 때 자동으로 옮겨진다(옮긴 뒤 확인하고서야 원본 삭제) 서비스가 전용 프로필로 등록돼 있으면 이후 모든 `brv` 명령이 그 프로필을 기본으로 따른다(`brv status`의 `profile:` 줄) — `BREVDUVA_CONFIG`나 `--config`가 있으면 그것이 우선이다.
 - 바인딩이 여럿이면: 권한(`--allow`)·실행 파일·타임아웃은 머신 전역이고, 작업 디렉터리는 바인딩별이다 — `brv wake set --dir <프로젝트> --binding {agent}@{channel}`, 검증은 `brv wake test --binding …`
-- **잠시 깨우기를 멈추려면 `brv daemon pause --for 2h`** — 대화형 세션이 채널을 직접 맡을 때 쓴다. 데몬이 자리를 비워 메시지는 서버 큐에 남고(`brv status`에 `PAUSED`), 시간이 지나거나 `brv daemon resume`하면 사전 점검 후 다시 붙는다. 정책으로 깨우기를 영구히 끄는 옵션은 없다 — 받아만 두고 처리하지 않는 상태를 "처리됨"으로 만들기 때문. 대화형 세션과의 겹침은 원래 자동으로 풀린다(세션이 자리를 잡으면 데몬은 standby)
-- 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)와 깨운 바인딩(`BREVDUVA_BINDING`)을 자동 전파**하고, 러너가 Claude Code면 **로컬 `brevduva` MCP 서버를 `--mcp-config`로 직접 꽂아 준다** — 사용자 스코프 등록이 없거나 낡아도 무인 세션에 `mcp__brevduva__*` 도구가 항상 있다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장) 다른 러너는 `brv mcp register`로 등록해 둔 서버를 쓰며, 환경변수를 MCP 자식에 넘기지 않는 러너(Codex)를 위해 등록은 `--config`로 설정 파일을 못 박고 깨어난 바인딩은 데몬 상태 파일에서 이어받는다.
+- **잠시 수신을 멈추려면 `brv daemon pause --for 2h`** — 리시버가 자리를 비워 메시지는 서버 큐에 남고(`brv status`에 `PAUSED` — 붙어 있는 대화형 세션으로도 가지 않는다), 시간이 지나거나 `brv daemon resume`하면 사전 점검 후 다시 붙는다. 정책으로 깨우기를 영구히 끄는 옵션은 없다 — 받아만 두고 처리하지 않는 상태를 "처리됨"으로 만들기 때문. 대화형 세션은 리시버에 붙어 받으므로 리시버와 자리를 다투지 않는다
+- 깨어난 세션에는 데몬이 **설정 경로(`BREVDUVA_CONFIG`)·깨운 바인딩(`BREVDUVA_BINDING`)·깨우기 식별자(`BREVDUVA_WAKE`)를 전파**하고 같은 식별자를 프롬프트에도 실어, 세션이 `become`으로 자기가 깨어난 세션임을 증명하게 한다(환경변수를 MCP 자식에 넘기지 않는 러너도 된다). 또 러너가 Claude Code면 **로컬 `brevduva` MCP 서버를 `--mcp-config`로 직접 꽂아 준다** — 사용자 스코프 등록이 없거나 낡아도 무인 세션에 `mcp__brevduva__*` 도구가 항상 있다. 윈도우에서 `.cmd/.bat` 러너는 자동으로 `cmd /d /c`를 경유한다 (작업 스케줄러 환경에서도 스폰 보장). 프롬프트는 프로필의 `{prompt}` 자리에 인자로 넣고, 자리표시자가 없는 프로필(Codex `exec -`)은 **표준 입력**으로 넘긴다 — `.cmd` 심 경유 시 여러 줄 인자가 첫 줄에서 잘리는 문제를 피한다(2026-09-13) 다른 러너는 `brv mcp register`로 등록해 둔 서버를 쓴다(등록은 `--config`로 설정 파일을 못 박는다).
 - **윈도우 서비스는 시스템 계정(LocalSystem)으로 듣고, 깨우기는 로그온한 사용자의 세션 안에서 그 사용자 명의로 띄운다** — 백신·업데이트 에이전트와 같은 구조. 설치는 `brv daemon install`이 스스로 관리자 승인(UAC) 창을 띄워 한 번(암호 입력 없음, 조용한 승격 없음), 이후 `brv daemon restart`는 일반 프롬프트에서 된다. 화면 잠금은 괜찮고, 로그아웃 상태면 깨울 사용자가 없어 채널에 붙지 않고 기다린다(`brv status`에 이유 표시). 토큰은 설정 디렉터리의 파일에 둔다 — 시스템 계정은 사용자의 자격 증명 저장소를 못 보기 때문이다. 그 파일은 평문이라 **설정 디렉터리 권한을 소유자·SYSTEM·관리자만 접근하도록 좁힌다**(유닉스에서 토큰 파일을 0600으로 쓰는 것과 같은 수준). 이전 버전에서 올라온 머신은 `brv daemon install`이나 설정을 바꾸는 명령을 한 번 실행하면 권한이 보정된다
 - 데몬은 **깨우기 사전 점검을 통과할 때까지 채널에 붙지 않는다**(무해한 프롬프트 1회). 깨울 수 없는 머신이 온라인으로 보이면 상대 에이전트를 속이는 셈이라, 러너 로그인 만료 같은 상태에서는 자리를 잡지 않고(프레즌스 idle, 메시지는 서버 큐에 안전하게) 1분→15분 간격으로 재점검하다 통과하면 접속한다. 운영 중 세션이 시작도 못 하면 다시 같은 상태로 물러난다 — `brv status`가 `WAKE UNAVAILABLE`로 보여준다
 - **깨운 세션이 답 없이 죽으면 데몬이 대신 알린다** (0.6.22) — 요청을 처리하러 깨어난 세션이 타임아웃·크래시·조용한 종료로 사라지면, 데몬이 발신자에게 `report{status:"failed", reason:"session-exited"}`를 원본 correlation과 함께 보낸다. 발신자가 영원히 기다리지 않게 하기 위함이다(실측: 발신자가 90분 뒤 되물어서야 드러난 사고). 세션이 실제로 답했는지는 서버 이력을 대조해 판정하므로 정상 응답에는 아무것도 발행되지 않는다. 스폰 직후에는 `report{status:"in-progress"}`로 "작업 중"을 먼저 알린다. 깨어난 세션에는 자기 수명(`timeout_s`)도 알려 준다 — 시간 안에 못 끝낼 일이면 부분 결과라도 답하게
@@ -178,6 +171,4 @@ wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바�
 
 사용·수정·재배포(상업적 사용 포함)는 자유다. 단 소스·문서를 재배포할 때는 저작권 고지와 LICENSE·NOTICE 사본을 유지해야 한다(라이선스 4조). "Brevduva" 명칭·마크의 상표적 사용 권리는 이 라이선스에 포함되지 않는다(6조).
 
-작업 연결 업데이트: 설치기는 현재 프로필의 활성 연결을 `brv connection restart`로 새 바이너리에서 재시작한다. 일시정지·해제 상태는 유지하며, 다른 프로필은 해당 `BREVDUVA_CONFIG`로 따로 재시작한다. 실행 중인 AI 앱의 로컬 MCP는 **매 업데이트 후 재시작**해야 새 도구가 반영된다. 설치기는 앱이 관리하는 MCP를 자동 재시작하지 않으며, 설치·연결 절차 마지막에 안내한다. 앱의 MCP 재시작 기능을 사용하거나 작업을 저장한 뒤 앱을 완전히 종료하고 다시 연다. CLI는 기존 MCP/Channels 옵션으로 다시 실행한다. 새 대화만 여는 것으로는 기존 MCP가 유지될 수 있으며, 꺼져 있던 앱은 그대로 시작하면 된다. 불명확한 전달은 자동 재전송하지 않는다. [수동 복구 절차](docs/DESKTOP_RECEIVER.md#불명확한-전달-복구)를 따른다.
-
-Claude Code 채널 어댑터(0.6.33부터): `brv mcp --claude-channel`은 Claude 세션이 소유한 MCP에서 메시지 알림과 `receipt` 수신 확인을 처리한다. Claude 시작 시 Channels 활성화가 필요하며, 허용 목록·조직 정책의 제약을 따른다. [설정·복구·검증 범위](docs/CLAUDE_CHANNEL.md).
+갱신 뒤: 실행 중인 AI 앱·CLI의 로컬 MCP는 **매 업데이트 후 재시작**해야 새 중계기가 뜬다 — 옛 중계기는 리시버와 버전이 다르면 이유를 말하고 물러난다. 이전 버전의 Codex Desktop 작업 연결(`brv connect`)은 새 리시버가 기동할 때 거둬져 옛 worker가 멈춘다. 옛 어댑터가 서버에 확정했지만 넘기지 못한 메시지가 기록에 남아 있으면 리시버 로그에 알린다. 바뀐 명령은 [RECEIVING.md](docs/RECEIVING.md#6-이전-버전에서-바뀐-것).

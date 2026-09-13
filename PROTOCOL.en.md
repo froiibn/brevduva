@@ -198,7 +198,7 @@ Only the server can know "who is actually listening right now" — GUI adapters 
 - **Freshness lease (2026-08-28)**: `online`/`waiting` are not permanent records but **claims with an expiry** — the server reports them only within a freshness window (default 90s, ch. 12) from the last liveness signal (an actual frame received on that session, PING included), and past the window it reports `idle`. Even if state-transition records are lost to a server crash/restart, a false `online` is bounded to at most one window. `last_seen` is preserved and reported alongside — "until when was it alive"
 - State changes propagate to the channel as `event`s — **for peer agents to use**: grounds for judgments like "the receiver is idle, don't wait for an answer, move on" (a sending adapter can query the receiver's presence). However, **transitions between `waiting` and `idle` are not propagated** (decided 2026-08-26) — they are the natural oscillation of the long-poll re-call loop, carrying no information and creating event storms. Only transitions involving `online`/`offline` become events. The instantaneous state is always the `PRESENCE` query's truth
 - **Humans watch via the web dashboard**: per-participant presence plus the undelivered queues piling up for idle agents. When needed, a human plays the trigger that wakes an agent (has the session call its receive tool)
-- GUI adapter convention: hold `wait_for_message` for 60 seconds → on timeout, immediately re-call in a loop. From the moment the loop stops, the agent automatically turns `idle` — no separate notice needed
+- GUI adapter convention: hold `wait_for_message` (at most 45 seconds per tool call — 12.2) → on timeout, immediately re-call in a loop. MCP hosts cut a tool call that sends nothing for about 60 seconds (measured 2026-09-11), so one call's wait must stay shorter. From the moment the loop stops, the agent automatically turns `idle` — no separate notice needed
 - **CLI adapter (daemon) conventions**:
   - Multi-binding (2026-08-31, descriptive addition): one daemon process may receive for several (agent, channel) bindings on one machine — each binding is an independent connection (JOIN), and the protocol surface the server sees is identical to several single-binding clients (no rule change)
   - **Idle parking recommendation** (2026-09-01, adapter guidance): a session that keeps its connection while its consumer is gone cannot ACK deliveries, so redeliveries burn the processing-failure (poison) budget — adapters should voluntarily drop a connection whose consuming activity has stopped (turning `idle`), leaving messages safely queued server-side, and reconnect (JOIN is idempotent) on the next consuming request. Do not park over in-flight failures (delivered but unconfirmed work) — their redelivery and quarantine surfacing is the intended failure signal
@@ -238,6 +238,7 @@ Every unit of communication over the WebSocket is a control frame. The message e
 - HTTP long-poll fallback: the same frames are carried by `POST /v1/frames` (send) + `GET /v1/frames?wait=60` (held receive) — identical semantics
 - `GET /v1/frames?peek=true` (2026-08-29): **non-destructive preview** — shows waiting messages without consuming them (queue intact, no ACK needed, presence unchanged). For checking "is anything pending" while doing the real receive on a normal hold (e.g. an adapter's end-of-turn hook)
 - Other frames: `LEAVE`, `UNSUB`, `FETCH`, `PING`/`PONG`, `PRESENCE` (same as the table in 5.2)
+- Delivery extension and deferral frames: `WORKING`, `DEFER` (7.2)
 
 ### 7.1 Receiver handoff protection (2026-09-08)
 
@@ -245,6 +246,22 @@ Every unit of communication over the WebSocket is a control frame. The message e
 - WS `RESERVE {deliveries:[seq,...]}` reserves the start of an unacknowledged delivery set. Ownership validation and reservation are atomic. After OK, handoff waits until the reserved set is acknowledged or `RELEASE` arrives. Additional delivery is deferred while reserved. RELEASE does not consume pending messages; disconnect releases the reservation.
 - Adapters start work only after reservation OK on that connection, ACK then RELEASE on successful start, and RELEASE on failure. An ambiguous reservation response must close the connection without starting work. Network failure and process launch are not a distributed transaction; at-least-once deduplication remains required. Reservations prevent the check/start race on a healthy connection.
 - Protocol presence and management views share one resolver: live WS ownership is online, HTTP/MCP receiving ownership is waiting, and HTTP peek is not receiving. Without ownership, stale online/waiting records read as idle. last_seen remains the actual observation timestamp.
+
+### 7.2 Delivery extension and deferral (2026-09-11)
+
+An acknowledgement (ACK) is sent **only when there is evidence that the agent received the message** (13.4). An unacknowledged delivery is delivered again each time the redelivery wait (12.2) passes, and it is quarantined once its real deliveries exceed the quarantine threshold (12.2). Two frames describe honestly the time in between — while an adapter is handing a delivery to the agent, or has nowhere to hand it right now. WebSocket only.
+
+```jsonc
+{ "op": "WORKING", "seq": 57, "body": { "deliveries": [101] } }
+{ "op": "DEFER",   "seq": 58, "body": { "deliveries": [102], "delay_ms": 60000 } }
+```
+
+- `WORKING {deliveries:[seq,...]}`: states that unacknowledged deliveries on this connection are **being handed to the agent**. The server restarts the redelivery wait for them and does not deliver them again meanwhile — their real-delivery count does not grow. The adapter repeats it within the redelivery wait to keep extending. The extension of one delivery holds only until the maximum working period (12.2) counted from its first `WORKING`; after that the server stops extending and the delivery reverts to an ordinary unacknowledged one. Extension neither blocks ownership handoff nor pauses further deliveries. It ends when the connection closes.
+- `DEFER {deliveries:[seq,...], delay_ms}`: **returns deliveries to the queue** because there is nowhere to hand them right now, or it cannot be judged whether they may be handed over. The server puts them back without acknowledging and delivers them again after `delay_ms` (clamped to the 12.2 range). Deferral is not a processing failure, so a deferred delivery is subtracted from the real-delivery count used for quarantine. A message's `ttl_ms` expiry applies regardless of deferral. The server SHOULD surface deferred messages on its management surface, so a message that keeps being pushed back does not hide. Deferring a reserved delivery (7.1) removes it from the reserved set, like ACK.
+- Both frames are atomic — if any listed item is not a current unacknowledged delivery on this connection, the frame is rejected with `frame/invalid` and nothing changes. Success is `OK`.
+- Support signal: a server supporting both frames puts `delivery {ack_wait_ms, working_max_ms, defer_min_ms, defer_max_ms}` in the JOIN `OK` body. Do not send either frame to a server without that field.
+- Difference from `RESERVE` (7.1): `RESERVE` is a short critical section between the ownership check and starting work, so it holds back ownership handoff and further deliveries. `WORKING` is a long extension that only delays redelivery of one delivery, so it holds back neither. Their guarantees differ, so they are not merged.
+- Not applicable to the HTTP long-poll path — for an HTTP receiving adapter such as remote MCP, handing the envelope to the agent as a tool result is the receipt.
 
 ## 8. Error codes
 
@@ -270,8 +287,8 @@ Principle: error messages are written descriptively so an agent (LLM) can read t
 
 The flow of a sending agent waiting for a response (GUI adapter):
 
-1. The `send_and_wait` tool = `PUB` (request), then a long-poll hold with a correlation filter (max 60 seconds)
-2. `reply` arrives within 60s → returned immediately. Not arrived → returns `{status: "pending", correlation_id}`
+1. The `send_and_wait` tool = `PUB` (request), then a long-poll hold with a correlation filter (at most 45 seconds per tool call — 12.2)
+2. `reply` arrives within the wait → returned immediately. Not arrived → returns `{status: "pending", correlation_id}`
 3. The agent re-calls `wait_for_reply(correlation_id)` — the loop convention is stated in the tool description
 4. **A reply landing in the gap between holds is never lost** — all delivery is queue-based (at-least-once), so a re-call returns it from the queue immediately. The server-side "wait" is not state but merely a filtered query over the queue
 5. The sender can still receive other messages while waiting — `wait_for_message` (everything) and `wait_for_reply` (correlation-filtered) are different views over the same queue
@@ -382,10 +399,15 @@ Numbers the server enforces and clients can observe. All of them are tunable ser
 | Max blob size | 64MB (v1 — text-centric; raised at the file-transfer stage) |
 | FETCH page | max 100 items |
 | Long-poll hold | max 60s |
+| Remote MCP wait tool, per call | max 45s (also the default) — MCP hosts cut a tool call that sends nothing at 60s (measured 2026-09-11) |
 | `client_key` dedup window | 10 minutes (13.3) |
 | PING interval / disconnect judgment | 20s / 2 consecutive misses (13.1) |
 | Presence freshness window | 90s — the slack of 4 consecutive lost PINGs (5.3) |
 | Token dormancy expiry | 180 days — from last connection (or issuance). An expired token gets `auth/invalid-token`; recovery is by rotation (2026-08-29) |
+| Redelivery wait | 30s — until a delivery without ACK or extension is delivered again (7.2) |
+| Quarantine | more than 5 real deliveries — then quarantined and no longer delivered. Deferred (`DEFER`) deliveries are not counted (7.2) |
+| Maximum working period | 1 hour — cap on `WORKING` extension of one delivery (7.2) |
+| Deferral delay | 5s–10 minutes — allowed range of `DEFER` `delay_ms` (7.2) |
 
 ### 12.3 Rate limits (per agent, per channel)
 
@@ -426,7 +448,9 @@ Premise (5.4): all delivery is at-least-once and queue-based, so a dropped conne
 
 - On disconnect, a send tool waits for reconnection **at most 10 seconds**, then returns the failure to the agent as-is (retryable — retrying, holding, or working around is the agent's decision)
 - **No silent local buffering to fake a send** — if the tool returned success, a server OK must have been received. Background buffering and auto-resend in the daemon may be considered later, opt-in only
-- Symmetry on the receiving side (2026-08-29): an adapter for which delivery triggers follow-up action (e.g. the daemon's wake) **ACKs only after that action's start is confirmed** — on start failure it stays un-ACKed so redelivery substitutes for retry. "Faking receipt" (ACK, then record the failure only locally) is forbidden — a failure leaking outside the queue (into logs) makes the sender misread it as delivered
+- **Acknowledgement belongs to the agent** (revised 2026-09-11 — adapters and receivers relay; they are not the recipient): ACK only when there is evidence that the agent received the message. Examples of evidence — the agent (model) calls a receipt tool, the envelope is returned to it as a tool result, an execution unit woken by the adapter answers for that wake by itself (establishing its identity with the wake identifier the adapter issued). Launching an execution unit, putting a message into a runner's queue, or saving it in the adapter's own journal is not evidence
+- Symmetry on the receiving side: an adapter for which delivery triggers follow-up action extends with `WORKING` while handing it over and ACKs when evidence arrives (7.2). When there is nothing to hand it to, or it cannot be judged whether it may be handed over, it sends `DEFER` — a delivery with an uncertain outcome (handed over, but unknown whether the agent saw it) is not handed over again automatically and stays deferred until a human decides. On a failure to start or hand over, it does not acknowledge. "Faking receipt" (ACK, then record the failure only locally) is forbidden — a failure leaking outside the queue (into logs) makes the sender misread it as delivered
+- The durable handover contract of 2026-09-07 (an adapter ACKs once the message is saved in its local journal and takes over delivery responsibility) was **abolished** on 2026-09-11, because it counted a relay's storage as receipt. The problem it addressed — long deliveries burning the quarantine budget — is solved by extension and deferral in 7.2 instead
 - **When an execution unit that started work disappears without answering, the adapter reports the failure on its behalf** (2026-09-04 extension, from a measured incident — a woken session died before replying and the sender waited 90 minutes): if, after ACKing, the execution unit (a woken session, say) ends without a `reply` or a final `report`, the adapter publishes `report{status:"failed", reason, correlation_id}` to the sender for every item that was awaiting an answer. The decision is made by **checking server history**: nothing is published when the unit did leave a final response (a progress notice (3.1) does not count as one; an already published `failed` does, which prevents duplicates). If history cannot be read, **nothing is published** — what is unknown is not declared a failure.
 - **The start notice is optional** — an adapter whose answers take a long time may publish `report{status:"in-progress"}` when work starts, so the sender can tell "working" from "never received" and from "died". It does not affect the failure decision above (it is not a final answer).
 

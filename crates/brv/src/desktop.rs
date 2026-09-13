@@ -1,104 +1,26 @@
 // Copyright 2026 SEIZIA (Jaeyoung Ko)
 // SPDX-License-Identifier: Apache-2.0
 
-//! 기존 Desktop 작업 전달 실험 어댑터. 공개 프로토콜·헤드리스 데몬과 독립이다.
-//! 사용자 계정으로 실행하며 내부 IPC에 의존한다. accepted는 작업 완료가 아니다.
-//! 디스크 인계 후 ACK, 전송 전 submitting 기록, 불명확하면 재실행 없이 종료한다.
+//! Codex Desktop 작업 도우미 — 리시버가 **사용자 명의로** 실행한다(RECEIVER_REBUILD_PLAN 7d).
+//! 앱의 내부 IPC(Windows `codex-ipc` 파이프, 유닉스 `CODEX_HOME/ipc/ipc.sock`)로 작업의 소유자를
+//! 확인하고(`check`), 전달 하나마다 턴을 연다(`submit`). 서버에 붙지 않고 기록도 쓰지 않는다 —
+//! 기록·확정은 리시버의 평면이 한다. 턴이 열린 것은 작업 완료가 아니다. 서버에 직접 붙어 자체
+//! 기록을 쓰던 옛 사용자 명의 worker(`desktop run`·`brv connect`)는 2026-09-11 삭제(7e).
 
-use crate::delivery::{Delivery, DeliveryState, Identity, Journal, decode, envelope_id};
-#[cfg(test)]
-use std::fs::OpenOptions;
-#[cfg(test)]
-use std::io::Write as _;
 #[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use brevduva_protocol::ClientKey;
-
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{Mutex, Notify};
-
-use crate::client::{Client, ClientOptions, RecvFilter};
-use crate::config::{self, Binding, BrvConfig};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+/// 리시버 도우미가 앱이 바쁠 때 다시 시도하는 간격.
+const BUSY_RETRY: Duration = Duration::from_secs(3);
 const BUSY: &str = "App context must wait until the current turn finishes";
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
-
-/// Explicit operator reconciliation; never guesses whether a timed-out turn ran.
-pub fn resolve(
-    cfg: &BrvConfig,
-    binding: &Binding,
-    id: &str,
-    turn: Option<&str>,
-    note: &str,
-    confirmed: bool,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        confirmed,
-        "inspect the exact task history, then pass --confirm; retry can duplicate work if the original turn ran"
-    );
-    let _guard = crate::connection::recovery_guard(cfg, binding)?;
-    let path = journal_path(binding)?;
-    anyhow::ensure!(path.exists(), "no delivery journal");
-    Journal::open(&path, identity(cfg, binding))?.resolve(id, turn, note)?;
-    status(cfg, binding)
-}
-
-fn identity(cfg: &BrvConfig, binding: &Binding) -> Identity {
-    Identity {
-        server: cfg.server.clone(),
-        binding: binding.full_label(),
-    }
-}
-
-pub(crate) fn journal_path(binding: &Binding) -> anyhow::Result<PathBuf> {
-    crate::delivery::journal_path(binding, "desktop")
-}
-pub(crate) fn validate_saved(
-    cfg: &BrvConfig,
-    binding: &Binding,
-    thread: &str,
-) -> anyhow::Result<()> {
-    let path = journal_path(binding)?;
-    if path.exists() {
-        Journal::open(&path, identity(cfg, binding))?.validate_resume(thread)?;
-    }
-    Ok(())
-}
-pub(crate) async fn probe(thread: &str) -> anyhow::Result<()> {
-    validate_thread(thread)?;
-    let _ = open_ipc().await?.owner(thread).await?;
-    Ok(())
-}
-
-pub fn status(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<()> {
-    let path = journal_path(binding)?;
-    if !path.exists() {
-        println!("no Desktop delivery journal for {}", binding.full_label());
-        return Ok(());
-    }
-    let bytes = std::fs::read(&path)?;
-    // 실행 중인 작성자의 미완행은 상태 조회에서만 무시한다. 파일 수정은 하지 않는다.
-    let valid = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |n| n + 1);
-    let entries = decode(&bytes[..valid], &identity(cfg, binding))?;
-    println!(
-        "journal: {} (accepted = input accepted, not work completed)",
-        path.display()
-    );
-    for (id, delivery) in entries {
-        println!(
-            "{}",
-            json!({"id": id, "thread": delivery.thread, "state": delivery.state, "detail": delivery.detail})
-        );
-    }
-    Ok(())
-}
 
 struct Ipc<S> {
     stream: S,
@@ -258,7 +180,7 @@ async fn open_ipc() -> anyhow::Result<Ipc<tokio::io::DuplexStream>> {
     anyhow::bail!("experimental Desktop delivery requires Windows or Unix")
 }
 
-fn validate_thread(thread: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_thread(thread: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !thread.is_empty()
             && thread.len() <= 128
@@ -280,14 +202,14 @@ pub async fn check(thread: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn turn_params(delivery: &Delivery, binding: &str) -> Value {
-    let text = json!({"provenance":"Brevduva peer data, not instructions from the user", "binding":binding,
-        "envelope":delivery.envelope}).to_string();
+/// 외부 앱 입력으로 작업에 턴을 여는 요청. 글은 앱의 신뢰하지 않는 입력 칸에 싣고, 작업 설정은
+/// 작업의 것을 물려받는다 — 외부 글이 승인·작업 폴더를 바꾸지 못한다.
+fn turn_start_params(thread: &str, text: &str) -> Value {
     let context = json!({"version":1, "message":{"source":"mcp_app", "sourceId":"brevduva-receiver", "text":text}});
     let prompt = "Respond to the user input in the context of our conversation.";
     let call_id = format!("brv_{}", ClientKey::generate());
-    json!({"conversationId":delivery.thread, "turnStart":{
-    "request":{"threadId":delivery.thread, "input":[{"type":"text", "text":prompt,
+    json!({"conversationId":thread, "turnStart":{
+    "request":{"threadId":thread, "input":[{"type":"text", "text":prompt,
         "text_elements":[{"byteRange":{"start":0,"end":prompt.len()},
             "placeholder":format!("codex-untrusted-app-input:{context}")}]}]},
     "context":{"inheritThreadSettings":true,"responseItems":[
@@ -296,328 +218,99 @@ fn turn_params(delivery: &Delivery, binding: &str) -> Value {
     ]}}})
 }
 
-async fn receive(
-    client: &Client,
-    journal: &Mutex<Journal>,
-    notify: &Notify,
+/// 리시버의 Desktop 통로 도우미 (2026-09-11, RECEIVER_REBUILD_PLAN 7d). 리시버가 **사용자 명의로**
+/// 전달마다 한 번 실행한다 — 소유자를 다시 확인하고 그 작업에 턴을 연다. 넣는 글은 Monitor와 같은
+/// 사건 한 줄이고 동료 본문은 없다(본문은 receipt 도구 결과로만). 서버에 붙지 않고 기록도 쓰지
+/// 않는다 — 기록과 확정은 리시버가 한다. 결과는 표준 출력의 JSON 한 줄이다:
+/// `started`(turn id) · `busy`(앱이 턴 처리 중, 넣지 않음) · `not_submitted`(보내기 전 실패) ·
+/// `unknown`(보냈으나 결과 불명 — 자동 재시도 금지).
+pub async fn submit(
     thread: &str,
+    message_id: &str,
+    receipt: &str,
+    busy_wait: Duration,
 ) -> anyhow::Result<()> {
+    let outcome = submit_with(open_ipc, thread, message_id, receipt, busy_wait, BUSY_RETRY).await;
+    println!("{outcome}");
+    Ok(())
+}
+
+async fn submit_with<S, F, Fut>(
+    mut open: F,
+    thread: &str,
+    message_id: &str,
+    receipt: &str,
+    busy_wait: Duration,
+    retry: Duration,
+) -> Value
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Ipc<S>>>,
+{
+    let not_submitted = |error: anyhow::Error| json!({"desktop_submit":"not_submitted","message":format!("{error:#}")});
+    if let Err(error) = validate_thread(thread) {
+        return not_submitted(error);
+    }
+    let text =
+        crate::session_delivery::monitor_event(&json!(message_id), &json!(receipt)).to_string();
+    let deadline = tokio::time::Instant::now() + busy_wait;
     loop {
-        if let Some((envelope, token)) = client
-            .recv_manual(RecvFilter::Any, Duration::from_secs(1))
+        // 턴 요청 전 단계(연결·소유자 확인)의 실패는 넣지 않은 것이 확실하다.
+        let mut ipc = match open().await {
+            Ok(ipc) => ipc,
+            Err(error) => return not_submitted(error),
+        };
+        let owner = match ipc.owner(thread).await {
+            Ok(owner) => owner,
+            Err(error) => return not_submitted(error),
+        };
+        match ipc
+            .request(
+                "thread-follower-start-turn",
+                turn_start_params(thread, &text),
+                2,
+                Some(&owner),
+            )
             .await
         {
-            let id = envelope_id(&envelope)?.to_owned();
-            journal.lock().await.ingest(thread, envelope)?;
-            // sync_all 성공 뒤에만 ACK. 디스크 실패면 함수가 종료되고 ACK하지 않는다.
-            client.confirm(token).await;
-            tracing::info!(%id, "desktop message durably received");
-            notify.notify_one();
-        }
-        anyhow::ensure!(client.is_alive(), "Desktop receiver connection stopped");
-    }
-}
-
-async fn dispatch(
-    journal: &Mutex<Journal>,
-    notify: &Notify,
-    binding: &str,
-    max: Option<usize>,
-) -> anyhow::Result<()> {
-    let mut accepted = 0;
-    loop {
-        let next = journal
-            .lock()
-            .await
-            .entries
-            .values()
-            .find(|d| d.state == DeliveryState::Pending)
-            .cloned();
-        let Some(mut delivery) = next else {
-            notify.notified().await;
-            continue;
-        };
-        // 사전 연결 실패는 아직 보내지 않은 pending으로 남기고 종료해 채널 자리를 반납한다.
-        let mut ipc = open_ipc().await?;
-        let owner = ipc.owner(&delivery.thread).await?;
-        let params = turn_params(&delivery, binding);
-        delivery.state = DeliveryState::Submitting;
-        journal.lock().await.store(delivery.clone())?;
-        let result = ipc
-            .request("thread-follower-start-turn", params, 2, Some(&owner))
-            .await;
-        match result {
-            Ok(receipt) => {
-                let turn = receipt["result"]["result"]["turn"]["id"].as_str();
-                delivery.state = if turn.is_some() {
-                    DeliveryState::Accepted
-                } else {
-                    DeliveryState::Unknown
+            Ok(response) => {
+                return match response["result"]["result"]["turn"]["id"].as_str() {
+                    Some(turn) => json!({"desktop_submit":"started","turn_id":turn}),
+                    None => {
+                        json!({"desktop_submit":"unknown","message":"success response missing turn ID"})
+                    }
                 };
-                delivery.detail = Some(
-                    turn.map_or_else(|| "success response missing turn ID".into(), str::to_owned),
-                );
-                journal.lock().await.store(delivery.clone())?;
-                anyhow::ensure!(
-                    turn.is_some(),
-                    "Desktop response missing turn ID; automatic replay refused"
-                );
-                tracing::info!(id=?delivery.envelope.id, thread=%delivery.thread, turn_id=?turn, "desktop input accepted (not completed)");
-                accepted += 1;
-                if max.is_some_and(|max| accepted >= max) {
-                    return Ok(());
-                }
             }
             Err(error) if error.busy() => {
-                delivery.state = DeliveryState::Pending;
-                delivery.detail = Some("waiting for current Desktop turn to finish".into());
-                journal.lock().await.store(delivery.clone())?;
-                tracing::info!(id=?delivery.envelope.id, "desktop busy; waiting before retry");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                if tokio::time::Instant::now() + retry > deadline {
+                    return json!({"desktop_submit":"busy","message":"the Desktop task is still running its current turn"});
+                }
+                tokio::time::sleep(retry).await;
             }
+            // 명시적 거절도 턴이 열리지 않았다고 단정하지 않는다 — 옛 경로와 같이 결과 불명.
             Err(error) => {
-                delivery.state = DeliveryState::Unknown;
-                delivery.detail = Some(error.to_string());
-                journal.lock().await.store(delivery)?;
-                anyhow::bail!(
-                    "Desktop delivery outcome requires inspection: {error}; message retained, no automatic replay"
-                );
+                return json!({"desktop_submit":"unknown","message":error.to_string()});
             }
         }
-    }
-}
-
-async fn watch_owner(thread: &str) -> anyhow::Result<()> {
-    loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        // Desktop가 닫히면 수신 자리도 반납한다. pending은 다음 실행에서 복구한다.
-        let _ = open_ipc().await?.owner(thread).await?;
-    }
-}
-
-pub async fn run(
-    cfg: &BrvConfig,
-    binding: &Binding,
-    opts: ClientOptions,
-    thread: &str,
-    max: Option<usize>,
-) -> anyhow::Result<()> {
-    run_observed(cfg, binding, opts, thread, max, &|_| Ok(())).await
-}
-
-pub(crate) async fn run_observed(
-    cfg: &BrvConfig,
-    binding: &Binding,
-    mut opts: ClientOptions,
-    thread: &str,
-    max: Option<usize>,
-    observer: &dyn Fn(&crate::client::ClientState) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    validate_thread(thread)?;
-    // 기존 실행체가 없으면 JOIN하지 않는다. 서비스의 다른 사용자 실행은 별도 범위다.
-    let _ = open_ipc().await?.owner(thread).await?;
-    let path = journal_path(binding)?;
-    let dir = path.parent().context("journal has no parent")?;
-    std::fs::create_dir_all(dir)?;
-    config::restrict_dir(dir).context("cannot protect Desktop message journal")?;
-    let journal = Journal::open(&path, identity(cfg, binding))?;
-    journal.validate_resume(thread)?;
-    let journal = Arc::new(Mutex::new(journal));
-    let notify = Notify::new();
-    // 다른 세션과 접속을 빼앗는 루프를 만들지 않는다. 기존 daemon과 같은 standby 규약.
-    opts.takeover_standby = true;
-    let client = Client::connect(opts);
-    let mut state_rx = client.state();
-    let observe = async {
-        loop {
-            observer(&state_rx.borrow_and_update())?;
-            if state_rx.changed().await.is_err() {
-                break;
-            }
-        }
-        Err::<(), anyhow::Error>(anyhow::anyhow!("receiver state stream closed"))
-    };
-    let label = binding.full_label();
-    tracing::info!(binding=%binding.full_label(), %thread, journal=%path.display(), "experimental Desktop receiver started");
-    tokio::select! {
-        result = receive(&client, &journal, &notify, thread) => result,
-        result = dispatch(&journal, &notify, &label, max) => result,
-        result = watch_owner(thread) => result,
-        result = observe => result,
-        result = tokio::signal::ctrl_c() => { result?; tracing::info!("Desktop receiver stopped; pending messages retained"); Ok(()) }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brevduva_protocol::Envelope;
-
+    #[cfg(unix)]
     struct Fixture(PathBuf);
-    impl Fixture {
-        fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("brv-desktop-test-{}", ClientKey::generate()));
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-        fn path(&self) -> PathBuf {
-            self.0.join("journal.jsonl")
-        }
-    }
+    #[cfg(unix)]
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    fn identity() -> Identity {
-        Identity {
-            server: "https://test.invalid".into(),
-            binding: "org/agent@channel".into(),
-        }
-    }
-    fn envelope() -> Envelope {
-        serde_json::from_value(
-            json!({"v":1,"id":ClientKey::generate(),"client_key":ClientKey::generate(),
-            "from":"peer","to":"agent:agent","kind":"request","expects":"reply","hops":0,
-            "content_type":"text/markdown","payload":"peer text","meta":{}}),
-        )
-        .unwrap()
-    }
 
     #[test]
-    fn journal_deduplicates_after_restart_and_preserves_task() {
-        let fixture = Fixture::new();
-        let message = envelope();
-        {
-            let mut journal = Journal::open(&fixture.path(), identity()).unwrap();
-            journal.ingest("task-a", message.clone()).unwrap();
-        }
-        let mut journal = Journal::open(&fixture.path(), identity()).unwrap();
-        journal.ingest("task-b", message).unwrap();
-        assert_eq!(journal.entries.len(), 1);
-        assert!(journal.validate_resume("task-a").is_ok());
-        assert!(journal.validate_resume("task-b").is_err());
-    }
-
-    #[test]
-    fn uncertain_submission_is_not_replayed_after_crash() {
-        let fixture = Fixture::new();
-        {
-            let mut journal = Journal::open(&fixture.path(), identity()).unwrap();
-            journal.ingest("task-a", envelope()).unwrap();
-            let mut delivery = journal.entries.values().next().unwrap().clone();
-            delivery.state = DeliveryState::Submitting;
-            journal.store(delivery).unwrap();
-        }
-        // 중간에 잘린 accepted 기록은 전송 여부 불명확인 submitting을 덮지 못한다.
-        OpenOptions::new()
-            .append(true)
-            .open(fixture.path())
-            .unwrap()
-            .write_all(b"{\"record\":")
-            .unwrap();
-        let journal = Journal::open(&fixture.path(), identity()).unwrap();
-        assert!(journal.validate_resume("task-a").is_err());
-        assert_eq!(
-            journal.entries.values().next().unwrap().state,
-            DeliveryState::Submitting
-        );
-    }
-
-    #[test]
-    fn operator_resolution_is_durable_and_keeps_exact_task() {
-        let fixture = Fixture::new();
-        let mut journal = Journal::open(&fixture.path(), identity()).unwrap();
-        let msg = envelope();
-        let id = envelope_id(&msg).unwrap().to_owned();
-        journal.ingest("task-a", msg).unwrap();
-        assert!(journal.resolve(&id, None, "checked").is_err());
-        let mut delivery = journal.entries[&id].clone();
-        delivery.state = DeliveryState::Unknown;
-        journal.store(delivery).unwrap();
-        assert!(journal.resolve(&id, None, " ").is_err());
-        journal
-            .resolve(&id, None, "verified no input in task history")
-            .unwrap();
-        assert!(journal.validate_resume("task-b").is_err());
-        assert!(journal.validate_resume("task-a").is_ok());
-        let mut delivery = journal.entries[&id].clone();
-        delivery.state = DeliveryState::Submitting;
-        journal.store(delivery).unwrap();
-        journal
-            .resolve(&id, Some("turn-verified"), "matched input and turn")
-            .unwrap();
-        drop(journal);
-        let journal = Journal::open(&fixture.path(), identity()).unwrap();
-        assert_eq!(journal.entries[&id].state, DeliveryState::Accepted);
-        assert!(
-            journal.entries[&id]
-                .detail
-                .as_ref()
-                .unwrap()
-                .contains("turn-verified")
-        );
-        assert!(journal.validate_resume("task-b").is_ok());
-    }
-
-    #[test]
-    fn accepted_message_is_never_added_as_pending_again() {
-        let fixture = Fixture::new();
-        let mut journal = Journal::open(&fixture.path(), identity()).unwrap();
-        let message = envelope();
-        journal.ingest("task-a", message.clone()).unwrap();
-        let mut delivery = journal.entries.values().next().unwrap().clone();
-        delivery.state = DeliveryState::Accepted;
-        delivery.detail = Some("turn-a".into());
-        journal.store(delivery).unwrap();
-        journal.ingest("task-b", message).unwrap();
-        assert_eq!(
-            journal.entries.values().next().unwrap().state,
-            DeliveryState::Accepted
-        );
-        assert!(journal.validate_resume("task-b").is_ok());
-    }
-
-    #[test]
-    fn journal_blocks_second_owner_and_wrong_identity() {
-        let fixture = Fixture::new();
-        let journal = Journal::open(&fixture.path(), identity()).unwrap();
-        assert!(Journal::open(&fixture.path(), identity()).is_err());
-        // 상태 조회는 실행 중인 저널을 읽을 수 있어야 한다 (Windows 잠금 회귀).
-        assert!(decode(&std::fs::read(fixture.path()).unwrap(), &identity()).is_ok());
-        drop(journal);
-        let mut wrong = identity();
-        wrong.server = "https://other.invalid".into();
-        assert!(Journal::open(&fixture.path(), wrong).is_err());
-    }
-
-    #[test]
-    fn missing_id_and_corrupt_complete_records_fail_closed() {
-        let fixture = Fixture::new();
-        let mut journal = Journal::open(&fixture.path(), identity()).unwrap();
-        let mut message = envelope();
-        message.id = None;
-        assert!(journal.ingest("task", message).is_err());
-        drop(journal);
-        OpenOptions::new()
-            .append(true)
-            .open(fixture.path())
-            .unwrap()
-            .write_all(b"bad record\n")
-            .unwrap();
-        assert!(Journal::open(&fixture.path(), identity()).is_err());
-    }
-
-    #[test]
-    fn external_payload_does_not_override_local_task_settings() {
-        let delivery = Delivery {
-            thread: "chosen-task".into(),
-            envelope: envelope(),
-            state: DeliveryState::Pending,
-            detail: None,
-        };
-        let params = turn_params(&delivery, "org/agent@channel");
+    fn external_text_does_not_override_local_task_settings() {
+        let params = turn_start_params("chosen-task", "peer text");
         assert_eq!(params["conversationId"], "chosen-task");
         assert_eq!(
             params["turnStart"]["context"]["inheritThreadSettings"],
@@ -701,6 +394,148 @@ mod tests {
             .unwrap();
         assert_eq!(response["result"]["result"]["turn"]["id"], "turn-a");
         peer.await.unwrap();
+    }
+
+    /// 리시버 도우미가 만날 Desktop 소유자의 턴 요청 응답.
+    #[derive(Clone, Copy)]
+    enum OwnerAnswer {
+        Turn,
+        Busy,
+        NoExternalInput,
+        HangUp,
+    }
+
+    /// 연결 하나를 흉내 낸다 — 턴 요청을 받았으면 그 요청을 돌려준다.
+    fn desktop_peer(
+        answer: OwnerAnswer,
+    ) -> (
+        Ipc<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Option<Value>>,
+    ) {
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
+        let peer = tokio::spawn(async move {
+            let init = read_request(&mut server).await;
+            send_response(&mut server, &init, json!({"clientId":"receiver"})).await;
+            let discover = read_request(&mut server).await;
+            let external = !matches!(answer, OwnerAnswer::NoExternalInput);
+            send_response(
+                &mut server,
+                &discover,
+                json!({"supportsUntrustedAppInput": external}),
+            )
+            .await;
+            if !external {
+                return None;
+            }
+            let start = read_request(&mut server).await;
+            match answer {
+                OwnerAnswer::Turn => {
+                    send_response(
+                        &mut server,
+                        &start,
+                        json!({"result":{"turn":{"id":"turn-7"}}}),
+                    )
+                    .await
+                }
+                OwnerAnswer::Busy => {
+                    let bytes = serde_json::to_vec(&json!({"type":"response",
+                        "requestId":start["requestId"],"resultType":"error","error":BUSY}))
+                    .unwrap();
+                    server.write_u32_le(bytes.len() as u32).await.unwrap();
+                    server.write_all(&bytes).await.unwrap();
+                }
+                OwnerAnswer::HangUp | OwnerAnswer::NoExternalInput => {}
+            }
+            Some(start)
+        });
+        (
+            Ipc {
+                stream: client,
+                client_id: "initializing-client".into(),
+            },
+            peer,
+        )
+    }
+
+    async fn helper_outcome(
+        connections: Vec<Ipc<tokio::io::DuplexStream>>,
+        thread: &str,
+        busy_wait: Duration,
+    ) -> Value {
+        let mut connections = connections.into_iter();
+        submit_with(
+            || {
+                let next = connections.next();
+                async move { next.context("no further Desktop connection") }
+            },
+            thread,
+            "msg-1",
+            "token-1",
+            busy_wait,
+            Duration::from_millis(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_receiver_helper_opens_a_turn_carrying_only_the_receipt_event() {
+        let (ipc, peer) = desktop_peer(OwnerAnswer::Turn);
+        let outcome = helper_outcome(vec![ipc], "task-a", Duration::ZERO).await;
+        assert_eq!(
+            outcome,
+            json!({"desktop_submit":"started","turn_id":"turn-7"})
+        );
+        let start = peer.await.unwrap().expect("turn request");
+        assert_eq!(start["targetClientId"], "owner-a");
+        assert_eq!(start["params"]["conversationId"], "task-a");
+        let turn = start["params"]["turnStart"].to_string();
+        assert!(turn.contains("token-1") && turn.contains("msg-1"), "{turn}");
+        assert!(turn.contains("brevduva_message"), "{turn}");
+        assert!(
+            !turn.contains("payload") && !turn.contains("provenance"),
+            "동료 본문(봉투)은 넣지 않는다 — receipt로만: {turn}"
+        );
+        assert_eq!(
+            start["params"]["turnStart"]["context"]["inheritThreadSettings"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn the_receiver_helper_waits_out_a_busy_task_then_reports_busy() {
+        let (busy, _first) = desktop_peer(OwnerAnswer::Busy);
+        let (ready, second) = desktop_peer(OwnerAnswer::Turn);
+        let outcome = helper_outcome(vec![busy, ready], "task-a", Duration::from_secs(5)).await;
+        assert_eq!(outcome["desktop_submit"], "started");
+        assert!(second.await.unwrap().is_some());
+
+        let (busy, _peer) = desktop_peer(OwnerAnswer::Busy);
+        let outcome = helper_outcome(vec![busy], "task-a", Duration::ZERO).await;
+        assert_eq!(
+            outcome["desktop_submit"], "busy",
+            "넣지 않았다고 확실히 말한다"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_receiver_helper_separates_not_sent_from_unknown() {
+        let (ipc, peer) = desktop_peer(OwnerAnswer::NoExternalInput);
+        let outcome = helper_outcome(vec![ipc], "task-a", Duration::ZERO).await;
+        assert_eq!(outcome["desktop_submit"], "not_submitted", "{outcome}");
+        assert!(peer.await.unwrap().is_none(), "턴 요청을 보내지 않았다");
+
+        let outcome = helper_outcome(Vec::new(), "task-a", Duration::ZERO).await;
+        assert_eq!(outcome["desktop_submit"], "not_submitted");
+
+        let outcome = helper_outcome(Vec::new(), "../other", Duration::ZERO).await;
+        assert_eq!(outcome["desktop_submit"], "not_submitted");
+
+        let (ipc, _peer) = desktop_peer(OwnerAnswer::HangUp);
+        let outcome = helper_outcome(vec![ipc], "task-a", Duration::ZERO).await;
+        assert_eq!(
+            outcome["desktop_submit"], "unknown",
+            "보낸 뒤 끊기면 결과 불명: {outcome}"
+        );
     }
 
     #[tokio::test]

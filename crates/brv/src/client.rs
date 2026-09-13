@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use brevduva_protocol::{
-    Address, Capabilities, ClientFrame, ClientKey, ClientOp, Envelope, ErrBody, ErrorCode, Expects,
-    Ident, Kind, MessageId, OkBody, PresenceEntry, ServerFrame, ServerOp,
+    Address, Capabilities, ClientFrame, ClientKey, ClientOp, DeliveryTerms, Envelope, ErrBody,
+    ErrorCode, Expects, Ident, Kind, MessageId, OkBody, PresenceEntry, ServerFrame, ServerOp,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Map, Value};
@@ -70,6 +70,11 @@ pub enum ClientState {
     WakeUnavailable {
         reason: String,
         retry_in_s: u64,
+    },
+    /// 데몬이 접속하지 않고 기다린다 — 받을 곳이 없다 (2026-09-11, 16단계): 이 바인딩을 깨울 러너가 없고
+    /// 쥔 로컬 세션도 없다. 메시지는 서버 큐에 남고 프레즌스는 정직하다. 세션이 쥐면 접속한다.
+    Dormant {
+        reason: String,
     },
     /// 운영자 일시정지 (`brv daemon pause`, 2026-09-03) — 데몬이 자리를 내려놓아 메시지는
     /// 서버 큐에 남는다. 대화형 세션이 채널을 직접 맡을 때 쓰는 정직한 수단 (구 `never` 대체).
@@ -220,6 +225,12 @@ enum Cmd {
     Recv(RecvFilter, bool, oneshot::Sender<(Envelope, u64)>),
     // recv_manual로 받은 전달의 확인 — 깨우기 성공 등 "처리 보장" 시점에 호출
     Confirm(u64),
+    // recv_manual 전달의 연장(defer=None) 또는 연기 (PROTOCOL 7.2)
+    Delivery {
+        tokens: Vec<u64>,
+        defer: Option<Duration>,
+        resp: oneshot::Sender<Result<(), String>>,
+    },
     Reserve(Vec<u64>, oneshot::Sender<Result<(), String>>),
     ReleaseReservation,
     Fetch {
@@ -245,6 +256,8 @@ pub struct Client {
     token: String,
     state_rx: tokio::sync::watch::Receiver<ClientState>,
     receiver_rx: tokio::sync::watch::Receiver<Option<Value>>,
+    /// 현재 연결의 전달 연장·연기 조건 (PROTOCOL 7.2) — 재접속 중·옛 서버면 None.
+    terms_rx: tokio::sync::watch::Receiver<Option<DeliveryTerms>>,
 }
 
 impl Client {
@@ -252,12 +265,13 @@ impl Client {
         let (tx, rx) = mpsc::channel(64);
         let (state_tx, state_rx) = tokio::sync::watch::channel(ClientState::Connecting);
         let (receiver_tx, receiver_rx) = tokio::sync::watch::channel(None);
+        let (terms_tx, terms_rx) = tokio::sync::watch::channel(None);
         let (server, channel, token) = (
             opts.server.clone(),
             opts.channel.clone(),
             opts.token.clone(),
         );
-        let actor = tokio::spawn(actor(opts, rx, state_tx, receiver_tx)).abort_handle();
+        let actor = tokio::spawn(actor(opts, rx, state_tx, receiver_tx, terms_tx)).abort_handle();
         Self {
             cmds: tx,
             actor,
@@ -266,6 +280,7 @@ impl Client {
             token,
             state_rx,
             receiver_rx,
+            terms_rx,
         }
     }
 
@@ -321,6 +336,55 @@ impl Client {
                     if changed.is_err() { return Err("connection-closed: receiver stopped".into()); }
                 }
             }
+        }
+    }
+
+    /// 서버가 JOIN에서 알린 전달 연장·연기 조건 (PROTOCOL 7.2, 2026-09-11). None이면 이 연결의 서버는
+    /// `WORKING`·`DEFER`를 모른다(옛 서버) — 호출자는 종전처럼 확인을 미룰 수밖에 없다.
+    pub fn delivery_terms(&self) -> Option<DeliveryTerms> {
+        *self.terms_rx.borrow()
+    }
+
+    /// 확인 유보 전달(`recv_manual`)을 **에이전트에게 넘기는 중**이라고 알린다 (PROTOCOL 7.2) — 서버가
+    /// 재전송 대기를 연장한다. 수신 확인은 에이전트가 받았을 때만 하므로(13.4), 넘기는 동안은 이것으로
+    /// 격리 판정 예산을 태우지 않는다. 재전송 대기(`delivery_terms().ack_wait_ms`) 안에 반복한다.
+    pub async fn working(&self, tokens: Vec<u64>) -> Result<(), String> {
+        self.delivery_request(tokens, None).await
+    }
+
+    /// 지금 넘길 곳이 없어 서버 큐로 **되돌린다** (PROTOCOL 7.2) — `delay`(서버 범위로 잘림) 뒤 다시
+    /// 전달되고, 처리 실패가 아니므로 격리 판정에서 빠진다. 성공하면 그 토큰은 더 쓸 수 없다.
+    pub async fn defer(&self, tokens: Vec<u64>, delay: Duration) -> Result<(), String> {
+        self.delivery_request(tokens, Some(delay)).await
+    }
+
+    async fn delivery_request(
+        &self,
+        tokens: Vec<u64>,
+        defer: Option<Duration>,
+    ) -> Result<(), String> {
+        if let Some(error) = self.receive_error() {
+            return Err(error);
+        }
+        if self.delivery_terms().is_none() {
+            return Err(
+                "delivery/unsupported: this server does not accept WORKING/DEFER (PROTOCOL 7.2)"
+                    .into(),
+            );
+        }
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Delivery {
+                tokens,
+                defer,
+                resp: tx,
+            })
+            .await
+            .map_err(|_| "connection-closed".to_owned())?;
+        match timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(result)) => result,
+            // 응답 유실은 치명이 아니다 — 연장이 안 됐으면 서버가 다시 보내고, 연기가 됐으면 나중에 다시 온다.
+            _ => Err("connection-closed: delivery extension outcome unknown".into()),
         }
     }
 
@@ -557,6 +621,8 @@ struct OutboxEntry {
 
 enum Pending {
     Reserve(Vec<u64>, oneshot::Sender<Result<(), String>>),
+    /// WORKING(false)·DEFER(true)의 응답 대기 — 연기가 성공하면 토큰을 거둔다.
+    Delivery(Vec<u64>, bool, oneshot::Sender<Result<(), String>>),
     Pub(ClientKey),
     Fetch(oneshot::Sender<Result<Vec<Envelope>, String>>),
     Presence(oneshot::Sender<Result<Vec<PresenceEntry>, String>>),
@@ -589,6 +655,7 @@ struct Actor {
     /// 접속 상태 발행 (2026-09-02) — `Client::state()`가 구독.
     state_tx: tokio::sync::watch::Sender<ClientState>,
     receiver_tx: tokio::sync::watch::Sender<Option<Value>>,
+    terms_tx: tokio::sync::watch::Sender<Option<DeliveryTerms>>,
 }
 
 impl Actor {
@@ -846,6 +913,36 @@ impl Actor {
             Cmd::Confirm(seq) => {
                 self.handle_confirm(ws, seq).await;
             }
+            Cmd::Delivery {
+                tokens,
+                defer,
+                resp,
+            } => {
+                if tokens.is_empty() || tokens.iter().any(|t| !self.unacked.contains_key(t)) {
+                    let _ = resp.send(Err("agent/session-conflict: delivery tokens no longer belong to this connection".into()));
+                } else {
+                    let seq = self.next_seq();
+                    let deliveries = tokens.iter().map(|t| self.unacked[t].0).collect();
+                    let op = match defer {
+                        None => ClientOp::Working { deliveries },
+                        Some(delay) => ClientOp::Defer {
+                            deliveries,
+                            delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        },
+                    };
+                    self.pending
+                        .insert(seq, Pending::Delivery(tokens, defer.is_some(), resp));
+                    let _ = send_frame(
+                        ws,
+                        &ClientFrame {
+                            seq: Some(seq),
+                            re: None,
+                            op,
+                        },
+                    )
+                    .await;
+                }
+            }
             Cmd::Fetch { query, resp } => {
                 let seq = self.next_seq();
                 self.pending.insert(seq, Pending::Fetch(resp));
@@ -886,6 +983,15 @@ impl Actor {
                     Err("agent/session-conflict: receiver generation changed".into())
                 });
             }
+            Some(Pending::Delivery(tokens, deferred, resp)) => {
+                if deferred {
+                    // 서버 큐로 돌아갔다 — 나중에 새 전달로 다시 온다. 이 토큰은 끝났다.
+                    for token in &tokens {
+                        self.unacked.remove(token);
+                    }
+                }
+                let _ = resp.send(Ok(()));
+            }
             Some(Pending::Pub(key)) => {
                 if let Some(pos) = self.outbox.iter().position(|e| e.client_key == key) {
                     let mut entry = self.outbox.remove(pos);
@@ -906,7 +1012,7 @@ impl Actor {
 
     fn resolve_err(&mut self, re: u64, body: ErrBody) {
         match self.pending.remove(&re) {
-            Some(Pending::Reserve(_, resp)) => {
+            Some(Pending::Reserve(_, resp)) | Some(Pending::Delivery(_, _, resp)) => {
                 let _ = resp.send(Err(format!("{}: {}", body.code, body.message)));
             }
             Some(Pending::Pub(key)) => {
@@ -931,6 +1037,7 @@ impl Actor {
     /// 연결 유실 시: 응답 없는 PUB는 outbox에 남아 재발행되고, 조회성 요청은 오류로 해소.
     fn on_disconnect(&mut self) {
         self.receiver_tx.send_replace(None);
+        self.terms_tx.send_replace(None);
         // 확인 유보분은 이 연결의 seq에 묶여 있었다 — 재전달이 새 seq로 다시 온다
         self.unacked.clear();
         self.inbox.clear();
@@ -940,6 +1047,11 @@ impl Actor {
             match pending {
                 Pending::Reserve(_, resp) => {
                     let _ = resp.send(Err("connection-closed: ownership check interrupted".into()));
+                }
+                Pending::Delivery(_, _, resp) => {
+                    let _ = resp.send(Err(
+                        "connection-closed: delivery extension interrupted".into()
+                    ));
                 }
                 Pending::Pub(_) => {} // outbox가 진실 — 재발행된다
                 Pending::Fetch(resp) => {
@@ -987,6 +1099,7 @@ async fn actor(
     mut cmds: mpsc::Receiver<Cmd>,
     state_tx: tokio::sync::watch::Sender<ClientState>,
     receiver_tx: tokio::sync::watch::Sender<Option<Value>>,
+    terms_tx: tokio::sync::watch::Sender<Option<DeliveryTerms>>,
 ) {
     let mut state = Actor {
         opts,
@@ -1003,6 +1116,7 @@ async fn actor(
         last_pong: Instant::now(),
         state_tx,
         receiver_tx,
+        terms_tx,
     };
     let mut attempt: u32 = 0;
     let mut fatal_attempt: u32 = 0;
@@ -1501,6 +1615,8 @@ async fn connect_and_join(state: &mut Actor) -> anyhow::Result<(Ws, Vec<ServerFr
                 state
                     .receiver_tx
                     .send_replace(body.extra.get("receiver").cloned());
+                // 전달 연장·연기 조건 (PROTOCOL 7.2) — 없으면 옛 서버
+                state.terms_tx.send_replace(body.delivery);
                 state.last_pong = Instant::now();
                 // 미확인 PUB 재발행 (13.3 — 같은 client_key)
                 let mut frames = Vec::new();
@@ -1776,6 +1892,106 @@ mod tests {
                 .contains("agent/session-conflict")
         );
         server.await.unwrap();
+    }
+
+    /// PROTOCOL 7.2 (2026-09-11): 확인 유보 전달의 연장·연기 — 서버가 조건을 알린 연결에서만 보내고,
+    /// 연기가 끝난 토큰은 더 쓸 수 없으며, 조건이 없는 옛 서버에는 아무것도 보내지 않는다.
+    #[tokio::test]
+    async fn delivery_extension_and_deferral_follow_the_server_terms() {
+        for terms in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let join = ws.next().await.unwrap().unwrap();
+                let join: Value = serde_json::from_str(join.to_text().unwrap()).unwrap();
+                let body = if terms {
+                    serde_json::json!({"delivery":{"ack_wait_ms":30000,"working_max_ms":3600000,"defer_min_ms":5000,"defer_max_ms":600000}})
+                } else {
+                    serde_json::json!({})
+                };
+                ws.send(WsMessage::Text(
+                    serde_json::json!({"op":"OK","re":join["seq"],"body":body})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(WsMessage::Text(serde_json::json!({"op":"DELIVER","seq":7,"body":{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","client_key":"01ARZ3NDEKTSV4RRFFQ69G5FAV","from":"b","to":"agent:a","kind":"message","hops":0,"content_type":"text/plain","payload":"pending","meta":{}}}).to_string().into())).await.unwrap();
+                let mut seen = Vec::new();
+                while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    match frame["op"].as_str() {
+                        Some("WORKING") | Some("DEFER") => {
+                            seen.push(frame.clone());
+                            ws.send(WsMessage::Text(
+                                serde_json::json!({"op":"OK","re":frame["seq"],"body":{}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        Some("PING") => {
+                            ws.send(WsMessage::Text(
+                                serde_json::json!({"op":"PONG","re":frame["seq"]})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                seen
+            });
+            let client = Client::connect(ClientOptions::new(url, "c", "a", "fake"));
+            let (_, token) = client
+                .recv_manual(RecvFilter::Any, Duration::from_secs(5))
+                .await
+                .unwrap();
+            if terms {
+                assert_eq!(client.delivery_terms().map(|t| t.ack_wait_ms), Some(30000));
+                client.working(vec![token]).await.unwrap();
+                client
+                    .defer(vec![token], Duration::from_secs(60))
+                    .await
+                    .unwrap();
+                assert!(
+                    client
+                        .working(vec![token])
+                        .await
+                        .unwrap_err()
+                        .contains("agent/session-conflict"),
+                    "a deferred token is finished"
+                );
+            } else {
+                assert_eq!(client.delivery_terms(), None);
+                assert!(
+                    client
+                        .working(vec![token])
+                        .await
+                        .unwrap_err()
+                        .contains("delivery/unsupported")
+                );
+            }
+            client.stop();
+            let seen = timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            if terms {
+                assert_eq!(seen.len(), 2);
+                assert_eq!(seen[0]["op"], "WORKING");
+                assert_eq!(seen[0]["body"]["deliveries"], serde_json::json!([7]));
+                assert_eq!(seen[1]["op"], "DEFER");
+                assert_eq!(seen[1]["body"]["delay_ms"], 60000);
+            } else {
+                assert!(seen.is_empty(), "nothing is sent to a server without terms");
+            }
+        }
     }
 
     #[test]

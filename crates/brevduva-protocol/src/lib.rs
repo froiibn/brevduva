@@ -32,7 +32,8 @@ pub use envelope::{
 pub use errcode::ErrorCode;
 pub use error::ParseError;
 pub use frame::{
-    ClientFrame, ClientOp, ErrBody, OkBody, PresenceEntry, PresenceState, ServerFrame, ServerOp,
+    ClientFrame, ClientOp, DeliveryTerms, ErrBody, OkBody, PresenceEntry, PresenceState,
+    ServerFrame, ServerOp,
 };
 pub use ident::{IDENT_MAX_LEN, Ident};
 pub use ids::{ClientKey, MessageId, Timestamp};

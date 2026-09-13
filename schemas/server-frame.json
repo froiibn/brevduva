@@ -10,6 +10,41 @@
       "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$",
       "type": "string"
     },
+    "DeliveryTerms": {
+      "description": "전달 연장·연기 조건 (PROTOCOL.md 7.2·12.2) — JOIN `OK`에 실린다. 수치는 서버 설정이다.",
+      "properties": {
+        "ack_wait_ms": {
+          "description": "확인·연장 없는 전달을 다시 전달하기까지의 대기. `WORKING`은 이 안에 반복한다.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "defer_max_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "defer_min_ms": {
+          "description": "`DEFER`의 `delay_ms` 허용 범위.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "working_max_ms": {
+          "description": "한 전달의 `WORKING` 연장 상한 — 첫 연장부터 센다.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ack_wait_ms",
+        "working_max_ms",
+        "defer_min_ms",
+        "defer_max_ms"
+      ],
+      "type": "object"
+    },
     "Envelope": {
       "description": "메시지 엔벨로프 (PROTOCOL.md 3장).",
       "properties": {
@@ -226,6 +261,17 @@
       "additionalProperties": true,
       "description": "OK body — 조작별 결과 필드의 합집합 (없는 필드는 생략).",
       "properties": {
+        "delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryTerms"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "JOIN 성공 시 전달 연장·연기 조건 (7.2) — 이 필드가 있는 서버만 `WORKING`·`DEFER`를 받는다."
+        },
         "id": {
           "anyOf": [
             {

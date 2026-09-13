@@ -28,7 +28,7 @@ $tmp = Join-Path $env:TEMP ("brv-install-" + [guid]::NewGuid().ToString("n"))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 
 # ---- 진행 표시 ----
-$script:steps = 7
+$script:steps = 6
 $script:step = 0
 # 막대를 그리지 않는 호스트인가 — 진행 표시가 꺼져 있거나(SilentlyContinue) 대화형 세션이 아니면
 # Write-Progress는 보이지 않으므로 텍스트로 대신한다
@@ -145,9 +145,6 @@ Step "restarting the daemon if one is registered"
 $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
 & $exe daemon restart 2>$null
 $ErrorActionPreference = $eap
-Step "restarting saved task connections"
-& $exe connection restart
-if ($LASTEXITCODE -ne 0) { throw "brv installed, but task connection restart failed. Inspect brv connection status before resuming." }
 Write-Progress -Id 1 -Activity "Installing brv" -Status "done" -PercentComplete 100
 Write-Progress -Id 1 -Activity "Installing brv" -Completed
 if ($enroll) {

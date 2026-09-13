@@ -70,6 +70,15 @@ pub enum ClientOp {
     /// 착수 예약 해제. 미확인 전달을 소비하지 않는다.
     #[serde(rename = "RELEASE")]
     Release,
+    /// 미확인 전달을 에이전트에게 넘기는 중 — 재전송 대기를 연장한다 (7.2, 2026-09-11).
+    /// 수신 확인(ACK)은 에이전트가 받았다는 증거가 있을 때만 보내므로, 넘기는 동안의 대기를
+    /// 정직하게 표현한다. 연장은 첫 WORKING부터 `DeliveryTerms::working_max_ms`까지.
+    #[serde(rename = "WORKING")]
+    Working { deliveries: Vec<u64> },
+    /// 넘길 곳이 없거나 넘겨도 되는지 판단할 수 없어 큐로 되돌린다 (7.2, 2026-09-11).
+    /// `delay_ms`(서버 범위로 잘림) 뒤 다시 전달되며, 처리 실패가 아니므로 격리 판정에서 뺀다.
+    #[serde(rename = "DEFER")]
+    Defer { deliveries: Vec<u64>, delay_ms: u64 },
     /// 히스토리 조회 — 시간·ID 커서 기반, 페이지 최대 100건 (12.2).
     #[serde(rename = "FETCH")]
     Fetch {
@@ -148,9 +157,24 @@ pub struct OkBody {
     /// FETCH 결과 페이지.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Envelope>>,
+    /// JOIN 성공 시 전달 연장·연기 조건 (7.2) — 이 필드가 있는 서버만 `WORKING`·`DEFER`를 받는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryTerms>,
     /// 전방 호환 — 알 수 없는 결과 필드는 보존.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// 전달 연장·연기 조건 (PROTOCOL.md 7.2·12.2) — JOIN `OK`에 실린다. 수치는 서버 설정이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeliveryTerms {
+    /// 확인·연장 없는 전달을 다시 전달하기까지의 대기. `WORKING`은 이 안에 반복한다.
+    pub ack_wait_ms: u64,
+    /// 한 전달의 `WORKING` 연장 상한 — 첫 연장부터 센다.
+    pub working_max_ms: u64,
+    /// `DEFER`의 `delay_ms` 허용 범위.
+    pub defer_min_ms: u64,
+    pub defer_max_ms: u64,
 }
 
 /// ERR body. 원칙(8장): message는 에이전트(LLM)가 읽고 스스로 정정할 수 있게 서술적으로.
@@ -223,6 +247,59 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ok.op, ServerOp::Ok(_)));
+    }
+
+    /// PROTOCOL.md 7.2 예시 프레임과 JOIN OK의 조건 표시 (2026-09-11).
+    #[test]
+    fn delivery_extension_frames_parse() {
+        let working: ClientFrame = serde_json::from_str(
+            r#"{ "op": "WORKING", "seq": 57, "body": { "deliveries": [101] } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            working.op,
+            ClientOp::Working {
+                deliveries: vec![101]
+            }
+        );
+        let defer: ClientFrame = serde_json::from_str(
+            r#"{ "op": "DEFER", "seq": 58, "body": { "deliveries": [102], "delay_ms": 60000 } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            defer.op,
+            ClientOp::Defer {
+                deliveries: vec![102],
+                delay_ms: 60000
+            }
+        );
+
+        let joined: ServerFrame = serde_json::from_str(
+            r#"{ "op": "OK", "re": 1, "body": { "receiver": {}, "delivery": { "ack_wait_ms": 30000, "working_max_ms": 3600000, "defer_min_ms": 5000, "defer_max_ms": 600000 } } }"#,
+        )
+        .unwrap();
+        match joined.op {
+            ServerOp::Ok(body) => {
+                assert_eq!(
+                    body.delivery,
+                    Some(DeliveryTerms {
+                        ack_wait_ms: 30000,
+                        working_max_ms: 3_600_000,
+                        defer_min_ms: 5000,
+                        defer_max_ms: 600_000,
+                    })
+                );
+                assert!(body.extra.contains_key("receiver"), "다른 결과 필드는 보존");
+            }
+            other => panic!("expected OK, got {other:?}"),
+        }
+        // 두 프레임을 모르는 서버의 JOIN OK — 클라이언트는 보내지 않는다
+        let old: ServerFrame =
+            serde_json::from_str(r#"{ "op": "OK", "re": 1, "body": {} }"#).unwrap();
+        match old.op {
+            ServerOp::Ok(body) => assert_eq!(body.delivery, None),
+            other => panic!("expected OK, got {other:?}"),
+        }
     }
 
     #[test]

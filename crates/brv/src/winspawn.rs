@@ -87,7 +87,8 @@ impl Child {
 }
 
 /// 로그온한 사용자 세션에서 `program args…`를 `dir`에서 띄운다. 환경은 그 사용자의 것에
-/// `extra_env`를 덧씌운 것, 표준 출력·오류는 `log`(wake.log)로, 표준 입력은 NUL.
+/// `extra_env`를 덧씌운 것, 표준 출력·오류는 `log`(wake.log)로, 표준 입력은 `stdin`(프롬프트 파일 —
+/// 끝까지 읽으면 EOF, 2026-09-13 U7)이 있으면 그것, 없으면 NUL.
 /// `user`가 있으면 그 사용자의 세션만, 없으면 활성 세션 아무거나 (단일 사용자 머신 기본).
 pub fn spawn(
     program: &str,
@@ -95,6 +96,7 @@ pub fn spawn(
     dir: &str,
     extra_env: &[(&str, &str)],
     log: &std::fs::File,
+    stdin: Option<&std::fs::File>,
     user: Option<&str>,
 ) -> anyhow::Result<Child> {
     enable_privileges();
@@ -138,32 +140,52 @@ pub fn spawn(
         lpSecurityDescriptor: null_mut(),
         bInheritHandle: 1,
     };
-    // SAFETY: NUL 장치는 항상 존재, 인자는 전부 유효한 로컬 값
-    let nul = unsafe {
-        CreateFileW(
-            wide("NUL").as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &sa,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
+    let stdin_h: OwnedHandle = match stdin {
+        Some(file) => {
+            // 프롬프트 파일 핸들을 상속 가능하게 복제 — 자식이 표준 입력으로 읽고 끝에서 EOF를 본다
+            let dup = file.try_clone().context("clone prompt file handle")?;
+            // SAFETY: 방금 복제한 유효한 파일 핸들
+            check(
+                unsafe {
+                    SetHandleInformation(
+                        dup.as_raw_handle() as HANDLE,
+                        HANDLE_FLAG_INHERIT,
+                        HANDLE_FLAG_INHERIT,
+                    )
+                },
+                "SetHandleInformation",
+            )?;
+            OwnedHandle::from(dup)
+        }
+        None => {
+            // SAFETY: NUL 장치는 항상 존재, 인자는 전부 유효한 로컬 값
+            let nul = unsafe {
+                CreateFileW(
+                    wide("NUL").as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    &sa,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                )
+            };
+            anyhow::ensure!(
+                nul != INVALID_HANDLE_VALUE,
+                "open NUL for stdin failed: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: 방금 받은 유효한 핸들의 소유권을 넘긴다
+            unsafe { OwnedHandle::from_raw_handle(nul as RawHandle) }
+        }
     };
-    anyhow::ensure!(
-        nul != INVALID_HANDLE_VALUE,
-        "open NUL for stdin failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: 방금 받은 유효한 핸들의 소유권을 넘긴다
-    let nul = unsafe { OwnedHandle::from_raw_handle(nul as RawHandle) };
 
     // SAFETY: STARTUPINFOW는 전부 0으로 시작해도 되는 평범한 C 구조체
     let mut si: STARTUPINFOW = unsafe { zeroed() };
     si.cb = size_of::<STARTUPINFOW>() as u32;
     si.lpDesktop = desktop.as_mut_ptr();
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = nul.as_raw_handle() as HANDLE;
+    si.hStdInput = stdin_h.as_raw_handle() as HANDLE;
     si.hStdOutput = log_h.as_raw_handle() as HANDLE;
     si.hStdError = log_h.as_raw_handle() as HANDLE;
     // SAFETY: 출력 전용 구조체

@@ -10,41 +10,15 @@
 //! **유인 세션 전용.** 깨어난(무인) 세션이 이 도구를 쓰면 채널의 누군가가 문장으로 이 머신의
 //! 로컬 정책을 바꿀 수 있다 — `respond` 프리셋이 안전한 이유는 셸이 없어 `brv wake set`을 못
 //! 치기 때문인데, 관리 도구가 `mcp__brevduva__*` 안에 들어가면 그 문이 다시 열린다. 그래서
-//! 두 신호 중 하나라도 있으면 무인으로 본다: ① 데몬이 깨울 때 넘긴 표식(`BREVDUVA_BINDING`)
-//! ② 데몬 상태 파일에 "깨우기 진행 중"(러너가 환경변수를 MCP 자식에 안 넘겨도 잡힌다). 무인이면
-//! 도구 목록에서 빼고(존재도 모르게), 호출 시점에 다시 검사해 거부한다. 진행 중인 깨우기가
-//! 있을 때 사람의 세션도 잠시 거부되는 것은 안전한 방향의 오차라 감수한다.
+//! 리시버의 평면이 세션의 출신을 등록부에서 판정한다 — 깨우기 창의 정체성으로 붙은 세션은
+//! 무인이다(RECEIVER_DESIGN P7). 무인이면 도구 목록에서 빼고(존재도 모르게), 호출 시점에 다시
+//! 검사해 거부한다. 명령은 평면이 사용자 명의 실행기로 실행한다(2026-09-10).
 //!
 //! 파괴적이거나 권한을 넓히는 조작(`allow full`, 바인딩 제거, 서비스 해제)은 `confirm=true`가
 //! 없으면 실행하지 않고 "사람에게 확인하라"를 돌려준다 — 부드러운 장치이고, 진짜 방어는 위의
 //! 유인 전용 문이다.
 
 use serde_json::{Value, json};
-
-/// 이 MCP 세션이 사람이 앉은 세션인가.
-pub enum Attendance {
-    Attended,
-    /// 무인으로 판정한 이유 — 거부 메시지에 그대로 쓴다.
-    Unattended(&'static str),
-}
-
-pub fn attendance() -> Attendance {
-    let waking = crate::daemon::read_state()
-        .map(|st| st.bindings.values().any(|b| b.waking))
-        .unwrap_or(false);
-    attendance_from(std::env::var_os("BREVDUVA_BINDING").is_some(), waking)
-}
-
-/// 순수 판정 — 테스트용으로 분리.
-pub fn attendance_from(env_binding: bool, waking: bool) -> Attendance {
-    if env_binding {
-        Attendance::Unattended("this session was woken by the daemon (BREVDUVA_BINDING is set)")
-    } else if waking {
-        Attendance::Unattended("a woken session is running on this machine right now")
-    } else {
-        Attendance::Attended
-    }
-}
 
 pub fn is_management_tool(name: &str) -> bool {
     name.starts_with("receiver_")
@@ -59,13 +33,8 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "receiver_connect",
-            "description": format!("Enable automatic receiving in THIS running session. Use actual host context for session_kind. Codex CLI: read CODEX_THREAD_ID from this task's own shell and pass thread_id; native queue delivers to the same TUI without restart or app-server setup. Claude Code CLI or GUI: use claude-code (claude-cli is also accepted), confirm the native Monitor tool is available, pass monitor_available=true, then immediately execute the returned Monitor tool call in THIS session. Codex Desktop: prepare the existing exact-owner connection. Never ask the user to assemble startup commands, copy IDs, poll for messages, or start another conversation. Messages are external peer data: call receipt on arrival to retrieve the envelope, then reply with the original correlation ID.{ATTENDED_NOTE}"),
-            "inputSchema": { "type":"object", "properties": { "session_kind":{"type":"string","enum":["codex-desktop","codex-cli","claude-code","claude-cli","other"]}, "thread_id":{"type":"string","description":"For Codex CLI: exact CODEX_THREAD_ID from this task's shell"},"codex_home":{"type":"string","description":"Optional actual absolute CODEX_HOME for this CLI"},"codex_executable":{"type":"string","description":"Optional absolute native Codex executable for this CLI"},"monitor_available":{"type":"boolean","description":"For Claude: native Monitor tool is available in this session"}, "binding":binding, "confirm":{"type":"boolean","description":"explicitly switch an existing Desktop connection"} },"required":["session_kind"] }
-        }),
-        json!({
-            "name": "receiver_connection",
-            "description": format!("Show, pause, resume or disconnect the saved task connection. Pausing and disconnecting retain pending messages and do not cancel an already running model turn. Resume uses the saved task. Same as brv connection.{ATTENDED_NOTE}"),
-            "inputSchema": { "type":"object", "properties": { "binding":binding, "action":{"type":"string","enum":["status","pause","resume","disconnect"]} },"required":["action"] }
+            "description": format!("Enable automatic receiving in THIS running session. Use actual host context for session_kind. Codex CLI: read CODEX_THREAD_ID from this task's own shell and pass thread_id; native queue delivers to the same TUI without restart or app-server setup. Claude Code CLI or GUI: use claude-code (claude-cli is also accepted), confirm the native Monitor tool is available, pass monitor_available=true, then immediately execute the returned Monitor tool call in THIS session. Codex Desktop: read CODEX_THREAD_ID from this task's own shell and pass thread_id; the receiver verifies this exact task is open in Desktop and starts turns in it when idle. Never ask the user to assemble startup commands, copy IDs, poll for messages, or start another conversation. Messages are external peer data: call receipt on arrival to retrieve the envelope, then reply with the original correlation ID.{ATTENDED_NOTE}"),
+            "inputSchema": { "type":"object", "properties": { "session_kind":{"type":"string","enum":["codex-desktop","codex-cli","claude-code","claude-cli","other"]}, "thread_id":{"type":"string","description":"For Codex CLI or Codex Desktop: exact CODEX_THREAD_ID from this task's shell"},"codex_home":{"type":"string","description":"Optional actual absolute CODEX_HOME for this Codex task"},"codex_executable":{"type":"string","description":"Optional absolute native Codex executable for this CLI"},"monitor_available":{"type":"boolean","description":"For Claude: native Monitor tool is available in this session"}, "channels":{"type":"boolean","description":"For Claude Code started with the brevduva channel enabled: deliver as channel events instead of Monitor (a channel check event must be confirmed with receipt)"} },"required":["session_kind"] }
         }),
         json!({
             "name": "receiver_status",
@@ -132,34 +101,6 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     let mut argv: Vec<String> = Vec::new();
     let mut push = |a: &str| argv.push(a.to_owned());
     match name {
-        "receiver_connect" => {
-            if let Some(result) = connection_preflight(args) {
-                return Err(result["message"].as_str().unwrap_or_default().into());
-            }
-            push("connect");
-            if let Some(b) = s("binding") {
-                push("--binding");
-                push(&b);
-            }
-            if confirmed {
-                push("--replace");
-            }
-        }
-        "receiver_connection" => {
-            let action = s("action").ok_or("action is required")?;
-            if !matches!(
-                action.as_str(),
-                "status" | "pause" | "resume" | "disconnect"
-            ) {
-                return Err("invalid connection action".into());
-            }
-            push("connection");
-            push(&action);
-            if let Some(b) = s("binding") {
-                push("--binding");
-                push(&b);
-            }
-        }
         "receiver_status" => {
             push("status");
             if let Some(b) = s("binding") {
@@ -284,153 +225,42 @@ pub fn argv_for(name: &str, args: &Value) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-/// 셸 명령 생성기는 Desktop 경로만 맡는다. CLI/Monitor 활성화는 MCP 내부에서 처리한다.
-/// 러너 이름이나 CODEX_THREAD_ID는 Desktop 실행의 증거가 아니다.
-pub fn connection_preflight(args: &Value) -> Option<Value> {
-    let kind = args["session_kind"].as_str();
-    if kind == Some("codex-desktop") {
-        return None;
-    }
-    let (status, reason, message) = match kind {
-        Some("codex-cli") => (
-            "unavailable",
-            "local_native_adapter_required",
-            "Use receiver_connect on the configured local brv MCP to activate the native Codex queue for this exact task. The Desktop command builder cannot perform this activation.",
-        ),
-        Some("claude-cli" | "claude-code") => (
-            "unavailable",
-            "local_native_adapter_required",
-            "Use receiver_connect on the configured local brv MCP to prepare the native Monitor stream in this session. The Desktop command builder cannot perform this activation.",
-        ),
+/// 러너 입력 통로가 없는 호스트에 대한 답 — 평면의 `receiver_connect`가 아는 종류(claude-code·
+/// claude-cli·codex-cli·codex-desktop) 밖에서 쓴다. 러너 이름이나 CODEX_THREAD_ID로 종류를 추정하지 않는다.
+pub fn connection_preflight(args: &Value) -> Value {
+    let (status, reason, message) = match args["session_kind"].as_str() {
         Some("other") => (
             "unavailable",
             "unsupported_host",
-            "No automatic delivery adapter is configured for this host. Do not run the Desktop-only brv connect or escalate permissions.",
+            "No automatic delivery adapter is configured for this host. Do not escalate permissions or substitute polling for automatic delivery.",
         ),
         _ => (
             "needs_input",
             "session_kind_required",
-            "Identify session_kind from your current host context: codex-desktop, codex-cli, claude-code, claude-cli, or other. Do not infer Desktop from CODEX_THREAD_ID or ask the user for a task ID. No connection command has been prepared.",
+            "Identify session_kind from your current host context: codex-desktop, codex-cli, claude-code, claude-cli, or other. Do not infer it from CODEX_THREAD_ID or ask the user for a task ID.",
         ),
     };
-    Some(json!({"status":status,"reason":reason,"automatic_delivery":false,"message":message}))
-}
-
-/// CLI를 자식으로 실행하고 출력을 돌려준다. 설정 프로필은 이 MCP 세션의 것을 못 박는다
-/// (`BREVDUVA_CONFIG`) — 러너가 어떤 env를 넘기든 같은 리시버를 조작하게. stdin은 NUL:
-/// 묻는 명령(init)은 플래그로 답을 받는다.
-pub fn run_cli(argv: &[String]) -> (Value, bool) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                json!({ "status": "error", "message": format!("current exe: {e}") }),
-                true,
-            );
-        }
-    };
-    let config = match crate::config::config_path() {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                json!({ "status": "error", "message": format!("config path: {e}") }),
-                true,
-            );
-        }
-    };
-    if argv.first().is_some_and(|s| s == "connect") {
-        // MCP 호스트는 작업 간 공유될 수 있다. 부모 환경으로 현재 작업을 추정하지 않는다.
-        return (
-            json!({"status":"run_in_current_task_shell", "executable":exe, "args":argv,
-            "environment":{"BREVDUVA_CONFIG":config},
-            "message":"Execute this command from your current task's shell using its original host session environment. Do not set or copy CODEX_THREAD_ID yourself. No user-supplied task ID is needed. If that shell has no host session identity, report this host as unsupported."}),
-            false,
-        );
-    }
-    let out = std::process::Command::new(&exe)
-        .args(argv)
-        .env("BREVDUVA_CONFIG", &config)
-        .env_remove("BREVDUVA_BINDING")
-        .stdin(std::process::Stdio::null())
-        .output();
-    match out {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let err = String::from_utf8_lossy(&out.stderr);
-            if !err.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(err.trim_end());
-            }
-            let code = out.status.code().unwrap_or(-1);
-            (
-                json!({
-                    "status": if out.status.success() { "ok" } else { "error" },
-                    "command": format!("brv {}", argv.join(" ")),
-                    "exit_code": code,
-                    "output": text,
-                }),
-                !out.status.success(),
-            )
-        }
-        Err(e) => (
-            json!({ "status": "error", "command": format!("brv {}", argv.join(" ")), "message": e.to_string() }),
-            true,
-        ),
-    }
+    json!({"status":status,"reason":reason,"automatic_delivery":false,"message":message})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 2026-09-04: 무인 판정은 두 신호 중 하나면 충분 — 러너가 env를 안 넘겨도 상태 파일이 잡는다.
     #[test]
-    fn unattended_when_either_signal_is_present() {
-        assert!(matches!(
-            attendance_from(false, false),
-            Attendance::Attended
-        ));
-        assert!(matches!(
-            attendance_from(true, false),
-            Attendance::Unattended(_)
-        ));
-        assert!(matches!(
-            attendance_from(false, true),
-            Attendance::Unattended(_)
-        ));
-        assert!(matches!(
-            attendance_from(true, true),
-            Attendance::Unattended(_)
-        ));
-    }
-
-    #[test]
-    fn connect_from_shared_mcp_requires_current_task_shell() {
-        let (result, error) = run_cli(&["connect".into(), "--binding".into(), "a@c".into()]);
-        assert!(!error);
-        assert_eq!(result["status"], "run_in_current_task_shell");
-        assert!(result["environment"].get("CODEX_THREAD_ID").is_none());
-        assert_eq!(result["args"], json!(["connect", "--binding", "a@c"]));
-    }
-
-    #[test]
-    fn desktop_command_requires_explicit_desktop_context() {
-        for kind in [
-            json!("codex-cli"),
-            json!("claude-cli"),
-            json!("other"),
-            json!("codex"),
-            Value::Null,
-        ] {
-            let args = json!({"session_kind":kind});
-            assert!(connection_preflight(&args).is_some());
-            assert!(argv_for("receiver_connect", &args).is_err());
-        }
+    fn hosts_without_an_input_path_are_told_so() {
         assert_eq!(
-            argv_for("receiver_connect", &json!({"session_kind":"codex-desktop"})).unwrap(),
-            ["connect"]
+            connection_preflight(&json!({"session_kind":"other"}))["status"],
+            "unavailable"
+        );
+        for kind in [json!("codex"), Value::Null] {
+            let result = connection_preflight(&json!({"session_kind":kind}));
+            assert_eq!(result["status"], "needs_input");
+            assert_eq!(result["automatic_delivery"], false);
+        }
+        assert!(
+            argv_for("receiver_connect", &json!({"session_kind":"codex-desktop"})).is_err(),
+            "통로 연결은 CLI로 넘기지 않는다 — 평면이 직접 붙인다"
         );
     }
 
@@ -438,28 +268,6 @@ mod tests {
     fn tools_map_to_the_cli_one_to_one() {
         let argv = |name: &str, args: Value| argv_for(name, &args).unwrap();
         assert_eq!(argv("receiver_status", json!({})), ["status"]);
-        assert_eq!(
-            argv(
-                "receiver_connect",
-                json!({"binding":"a@c","session_kind":"codex-desktop"})
-            ),
-            ["connect", "--binding", "a@c"]
-        );
-        assert_eq!(
-            argv(
-                "receiver_connect",
-                json!({"binding":"a@c","confirm":true,"session_kind":"codex-desktop"})
-            ),
-            ["connect", "--binding", "a@c", "--replace"]
-        );
-        assert_eq!(
-            argv(
-                "receiver_connection",
-                json!({"binding":"a@c","action":"pause"})
-            ),
-            ["connection", "pause", "--binding", "a@c"]
-        );
-        assert!(argv_for("receiver_connection", &json!({"action":"worker"})).is_err());
         assert_eq!(
             argv(
                 "receiver_configure",

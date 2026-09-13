@@ -503,6 +503,72 @@
       "type": "object"
     },
     {
+      "description": "미확인 전달을 에이전트에게 넘기는 중 — 재전송 대기를 연장한다 (7.2, 2026-09-11).\n수신 확인(ACK)은 에이전트가 받았다는 증거가 있을 때만 보내므로, 넘기는 동안의 대기를\n정직하게 표현한다. 연장은 첫 WORKING부터 `DeliveryTerms::working_max_ms`까지.",
+      "properties": {
+        "body": {
+          "properties": {
+            "deliveries": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "deliveries"
+          ],
+          "type": "object"
+        },
+        "op": {
+          "const": "WORKING",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "넘길 곳이 없거나 넘겨도 되는지 판단할 수 없어 큐로 되돌린다 (7.2, 2026-09-11).\n`delay_ms`(서버 범위로 잘림) 뒤 다시 전달되며, 처리 실패가 아니므로 격리 판정에서 뺀다.",
+      "properties": {
+        "body": {
+          "properties": {
+            "delay_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "deliveries": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "deliveries",
+            "delay_ms"
+          ],
+          "type": "object"
+        },
+        "op": {
+          "const": "DEFER",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "body"
+      ],
+      "type": "object"
+    },
+    {
       "description": "히스토리 조회 — 시간·ID 커서 기반, 페이지 최대 100건 (12.2).",
       "properties": {
         "body": {

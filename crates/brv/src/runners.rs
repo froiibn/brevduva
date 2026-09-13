@@ -19,8 +19,9 @@
 //!
 //! 깨우기 프로필은 **실측한 러너만** `wake_measured`다. 나머지는 문서 기준 초안으로, `wake set
 //! --runner`가 경고를 붙이고 `wake show`에 "unmeasured"로 표시한다 — 문서 확인은 실측이 아니다.
-//! 이 플래그는 **새 한 턴 실행(깨우기)만** 보증한다 — "이미 떠 있는 대화형 세션에 넣을 수 있다"는
-//! 별개의 능력(`attended`)이고, 지금은 어느 러너도 즉시 주입을 실측하지 않았다 (2026-09-05).
+//! 이 플래그는 **새 한 턴 실행(깨우기)만** 보증한다 — "대화 중인 세션에 밀어 넣을 수 있다"는
+//! 별개의 능력(`attended_cli`·`attended_gui` — RECEIVER_DESIGN §3의 세 칸)이고, 밀어넣기 통로의 실제 모델 왕복은
+//! Claude Code Monitor만 실측했다 (2026-09-12, 12단계 — claude -p 2.1.263 실제 전달→receipt→reply).
 //! MCP 등록은 러너에 `mcp add` 계열 명령이 있으면 그 명령으로(러너가 자기 파일을 책임진다),
 //! 설정 파일만 있는 러너는 붙여 넣을 조각을 출력한다 — 형식이 제각각(JSON·TOML·YAML·JSONC·
 //! crushrc)이라 brv가 사용자 파일을 직접 고치면 파손 위험이 편의보다 크다.
@@ -33,7 +34,9 @@ use std::time::{Duration, Instant};
 
 /// 깨우기 프로필 — 한 턴 실행 인자와 권한 수준 대응.
 pub struct WakeProfile {
-    /// 기본 인자 — `{prompt}` 자리에 메시지 프롬프트가 들어간다 (별도 argv 원소여야 한다).
+    /// 기본 인자 — `{prompt}` 자리에 메시지 프롬프트가 들어간다 (별도 argv 원소여야 한다). `{prompt}`가
+    /// 없으면 프롬프트는 **표준 입력**으로 간다(2026-09-13, U7): 윈도우의 `.cmd` 심을 `cmd.exe`로 감싸면 인자
+    /// 속 여러 줄 프롬프트가 첫 줄에서 잘리므로, 표준 입력을 읽는 러너는 그 길을 쓴다.
     pub args: &'static [&'static str],
     /// 권한 수준(respond/edit/full) → 덧붙일 인자. None이면 이 러너는 실행 인자로 권한을
     /// 표현하지 않는다 — "러너 자체 설정을 따른다"고 안내한다.
@@ -43,23 +46,45 @@ pub struct WakeProfile {
 /// 권한 수준(respond/edit/full) → 덧붙일 인자.
 pub type AllowFn = fn(&str) -> Option<Vec<&'static str>>;
 
-/// 일반 실행 모드의 유인 전달 분류. 새 headless 실행(`WakeProfile`)과 구분한다.
-/// Desktop·Claude Channels·Codex 공유 app-server는 별도 연결 조건을 가진 어댑터다.
-/// 그 준비 상태는 러너 이름만으로 판단하지 않고 receiver_session_status에서 확인한다.
+/// 대화 중인 세션에 밀어 넣는 통로 한 칸 (RECEIVER_DESIGN §3, 2026-09-12 11단계). 새 headless 실행(`WakeProfile`)과
+/// 구분한다. 통로는 리시버가 세션에 붙이고 준비 여부는 세션마다 `receiver_connect`·`list_bindings`가 보인다 — 이
+/// 표는 러너가 **어떤 통로를 가질 수 있는가**다. 2026-09-05의 `attended`(turn-end hook / passive) 분류를 대체했다 —
+/// Stop 훅은 밀어넣기가 아니라 세션이 스스로 가져가라는 안내라 칸이 아니다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttendedDelivery {
-    /// 턴이 끝날 때 러너의 훅이 큐를 살펴 같은 세션이 이어서 처리한다 (`brv hook stop`).
-    /// 데몬이 밀어 넣는 것이 아니라 세션이 스스로 가져가는 경로 — 이미 코드에 있다.
-    TurnEndHook,
-    /// 일반 실행만으로 자동 전달되지 않는다. 별도 어댑터를 활성화하거나 수신 도구를 호출한다.
-    Passive,
+pub enum Push {
+    /// 밀어 넣을 통로가 없다 — 대화 중인 세션은 수동 수신(`wait_for_message`)으로 받는다.
+    None,
+    /// 통로들이 코드로 있다 — 통로마다 실측 여부가 다르다(2026-09-12: Claude의 Monitor는 실측, Channels는 아님).
+    Paths(&'static [PushPath]),
 }
 
-impl AttendedDelivery {
-    pub fn describe(self) -> &'static str {
+/// 밀어넣기 통로 하나.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushPath {
+    pub via: &'static str,
+    /// 실제 러너로 전달→모델 수락 왕복을 확인했다.
+    pub measured: bool,
+}
+
+impl Push {
+    pub fn describe(self) -> String {
         match self {
-            Self::TurnEndHook => "turn-end hook",
-            Self::Passive => "passive",
+            Self::None => "manual receive only".to_owned(),
+            Self::Paths(paths) => paths
+                .iter()
+                .map(|path| {
+                    format!(
+                        "{} ({})",
+                        path.via,
+                        if path.measured {
+                            "measured"
+                        } else {
+                            "not yet measured"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
         }
     }
 }
@@ -86,10 +111,12 @@ pub struct RunnerSpec {
     pub version_marker: Option<&'static str>,
     pub wake: Option<WakeProfile>,
     /// 깨우기 프로필이 실측됐는가 (한 턴 실행 + MCP 도구 호출까지). 문서 확인만이면 false.
-    /// **깨우기만** 보증한다 — 떠 있는 세션 전달(`attended`)의 실측과는 별개.
+    /// **깨우기만** 보증한다 — 대화 중인 세션에 밀어 넣기(`attended_cli`·`attended_gui`)의 실측과는 별개.
     pub wake_measured: bool,
-    /// 떠 있는 대화형 세션에 전달하는 방법 — 코드로 확인된 경로만 (2026-09-05).
-    pub attended: AttendedDelivery,
+    /// 대화 중인 CLI 세션에 밀어 넣는 통로 (RECEIVER_DESIGN §3, 2026-09-12).
+    pub attended_cli: Push,
+    /// 대화 중인 GUI 앱 세션에 밀어 넣는 통로.
+    pub attended_gui: Push,
     pub mcp: McpRegistration,
     /// 이 러너가 MCP 도구를 모델에 보여주는 이름 형식 — 표시·문서용.
     pub tool_prefix: &'static str,
@@ -216,8 +243,19 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_claude),
         }),
         wake_measured: true,
-        // Stop 훅(hook.rs)이 턴 종료 시 큐를 peek해 같은 세션이 처리한다 — 데몬 push가 아니다
-        attended: AttendedDelivery::TurnEndHook,
+        // Monitor(기본)·Channels(선택) 통로 — 리시버 소유(7a·7c). Monitor는 실제 왕복 실측(2026-09-12 12단계,
+        // claude -p 2.1.263: 전달→receipt 2초→reply). Channels는 확인 사건 전에 -p 턴이 끝나 대화형 세션에서만 잴 수 있다
+        attended_cli: Push::Paths(&[
+            PushPath {
+                via: "Monitor",
+                measured: true,
+            },
+            PushPath {
+                via: "Channels",
+                measured: false,
+            },
+        ]),
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -247,11 +285,21 @@ pub static RUNNERS: &[RunnerSpec] = &[
             // 실측(2026-09-04, 이 머신, codex-cli 0.153.0): stdin NUL·stdout 파일로도 한 턴 정상
             // 종료(exit 0), `--approve-for-me`로 로컬 MCP 도구 호출 완주(list_channels 왕복).
             // `-c mcp_servers.*` 실행 시 주입은 **안 됨** → 영구 등록 필수 (brv mcp register)
-            args: &["exec", "--skip-git-repo-check", "{prompt}"],
+            // 프롬프트는 표준 입력(`-`)으로 (2026-09-13 U7, 0.153.4 실측: 직접·`cmd /c codex.cmd` 감싸기 모두
+            // 여러 줄을 끝까지 받고 입력을 닫으면 종료) — 인자로 넘기면 npm `.cmd` 심에서 첫 줄만 남는다
+            args: &["exec", "--skip-git-repo-check", "-"],
             allow: Some(allow_codex),
         }),
         wake_measured: true, // 한 턴 실행 + MCP 도구 호출 실측. 데몬 경유 E2E(깨움→답신)는 별도
-        attended: AttendedDelivery::Passive,
+        // 작업 대기열(7b)·Desktop 작업(7d) 통로 — `codex queue` 동작과 실행 명의는 실측, 모델 왕복·Desktop 앱은 12단계
+        attended_cli: Push::Paths(&[PushPath {
+            via: "codex queue",
+            measured: false,
+        }]),
+        attended_gui: Push::Paths(&[PushPath {
+            via: "Codex Desktop",
+            measured: false,
+        }]),
         mcp: McpRegistration::Command(&[
             "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
             "{host}",
@@ -270,7 +318,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -300,7 +349,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_gemini),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "-s", "user", "brevduva", "{brv}", "mcp", "--config", "{config}",
             "--host", "{host}",
@@ -319,7 +369,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_copilot),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -348,7 +399,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_cursor),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.cursor/mcp.json",
             body: MCP_SNIPPET_JSON,
@@ -367,7 +419,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.config/opencode/opencode.json",
             body: r#"{"mcp":{"brevduva":{"type":"local","command":["{brv}","mcp","--config","{config}","--host","{host}"],"enabled":true}}}"#,
@@ -395,7 +448,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.config/goose/config.yaml",
             body: "extensions:\n  brevduva:\n    name: brevduva\n    type: stdio\n    cmd: {brv}\n    args: [mcp, --config, {config}, --host, {host}]\n    enabled: true\n    timeout: 300",
@@ -414,7 +468,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_qwen),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "-s", "user", "brevduva", "{brv}", "mcp", "--config", "{config}",
             "--host", "{host}",
@@ -433,7 +488,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.kiro/settings/mcp.json",
             body: MCP_SNIPPET_JSON,
@@ -452,7 +508,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
             "{host}",
@@ -471,7 +528,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -495,7 +553,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_droid),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp",
             "add",
@@ -518,7 +577,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.config/crush/crushrc",
             body: "mcp add brevduva --command {brv} --args mcp --args --config --args {config} --args --host --args {host}",
@@ -538,7 +598,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp", "install", "brevduva", "--", "{brv}", "mcp", "--config", "{config}", "--host",
             "{host}",
@@ -557,7 +618,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.junie/mcp/mcp.json",
             body: MCP_SNIPPET_JSON,
@@ -576,7 +638,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_vibe),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.vibe/config.toml",
             body: "[[mcp_servers]]\nname = \"brevduva\"\ntransport = \"stdio\"\ncommand = \"{brv}\"\nargs = [\"mcp\", \"--config\", \"{config}\", \"--host\", \"{host}\"]",
@@ -595,7 +658,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_grok),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.grok/config.toml",
             body: "[mcp_servers.brevduva]\ncommand = \"{brv}\"\nargs = [\"mcp\", \"--config\", \"{config}\", \"--host\", \"{host}\"]\nenabled = true",
@@ -614,7 +678,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_continue),
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.continue/config.yaml",
             body: "mcpServers:\n  - name: brevduva\n    type: stdio\n    command: {brv}\n    args: [mcp, --config, {config}, --host, {host}]\n    allowHeadless: true",
@@ -633,7 +698,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: None,
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Snippet {
             file: "~/.config/kilo/kilo.jsonc",
             body: r#"{"mcp":{"brevduva":{"type":"local","command":["{brv}","mcp","--config","{config}","--host","{host}"],"enabled":true}}}"#,
@@ -652,7 +718,8 @@ pub static RUNNERS: &[RunnerSpec] = &[
             allow: Some(allow_claude), // Claude Code와 같은 --allowedTools 체계
         }),
         wake_measured: false,
-        attended: AttendedDelivery::Passive,
+        attended_cli: Push::None,
+        attended_gui: Push::None,
         mcp: McpRegistration::Command(&[
             "mcp", "add", "--scope", "user", "brevduva", "--", "{brv}", "mcp", "--config",
             "{config}", "--host", "{host}",
@@ -662,12 +729,24 @@ pub static RUNNERS: &[RunnerSpec] = &[
     },
 ];
 
+impl RunnerSpec {
+    /// 세 칸의 첫째 — 무인 깨우기 (RECEIVER_DESIGN §3).
+    pub fn wake_capability(&self) -> &'static str {
+        match (&self.wake, self.wake_measured) {
+            (None, _) => "none",
+            (Some(_), true) => "measured",
+            (Some(_), false) => "profile only (not yet measured)",
+        }
+    }
+}
+
 impl std::fmt::Debug for RunnerSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunnerSpec")
             .field("id", &self.id)
             .field("wake_measured", &self.wake_measured)
-            .field("attended", &self.attended)
+            .field("attended_cli", &self.attended_cli)
+            .field("attended_gui", &self.attended_gui)
             .finish_non_exhaustive()
     }
 }
@@ -929,17 +1008,23 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_has_exactly_one_prompt_slot_as_its_own_argument() {
-        // `{prompt}`는 별도 argv 원소여야 한다 — 다른 글자와 붙으면 치환은 되지만 인용이 깨진다
+    fn every_profile_passes_the_prompt_once_as_an_argument_or_through_stdin() {
+        // `{prompt}`는 별도 argv 원소여야 한다 — 다른 글자와 붙으면 치환은 되지만 인용이 깨진다.
+        // 자리표시자가 없는 프로필은 표준 입력으로 넘긴다(U7) — 지금은 Codex(`-`)뿐이다
         for r in RUNNERS {
             let Some(w) = &r.wake else { continue };
             let slots = w.args.iter().filter(|a| a.contains("{prompt}")).count();
-            assert_eq!(slots, 1, "{}: prompt slot count", r.id);
-            assert!(
-                w.args.contains(&"{prompt}"),
-                "{}: prompt must be its own argument",
-                r.id
-            );
+            if r.id == "codex" {
+                assert_eq!(slots, 0, "codex reads the prompt from stdin");
+                assert!(w.args.contains(&"-"), "codex needs the stdin marker");
+            } else {
+                assert_eq!(slots, 1, "{}: prompt slot count", r.id);
+                assert!(
+                    w.args.contains(&"{prompt}"),
+                    "{}: prompt must be its own argument",
+                    r.id
+                );
+            }
             for level in ["respond", "edit", "full"] {
                 assert!(wake_args(r, level).is_some(), "{}: level {level}", r.id);
             }
@@ -977,22 +1062,35 @@ mod tests {
         assert!(spec_for_command("/opt/tools/aider").is_none());
     }
 
-    /// 2026-09-05 (대화형 세션 우선 전달 1단계): 깨우기 실측과 유인 전달 능력은 별개다.
-    /// 별도 endpoint/Channels 준비를 일반 실행의 기본 능력으로 표시하지 않는다.
+    /// 2026-09-12(11·12단계, RECEIVER_DESIGN §3): 세 칸은 서로 독립이다 — 깨우기 실측이 밀어넣기 실측을 뜻하지 않고,
+    /// 통로가 코드로 있는 러너만 칸이 채워지며, 통로마다 실제 모델 왕복을 확인한 것만 measured다(12단계: Monitor).
     #[test]
-    fn attended_delivery_is_separate_from_wake_measurement() {
-        for r in RUNNERS {
-            let expected = if r.id == "claude" {
-                AttendedDelivery::TurnEndHook
-            } else {
-                AttendedDelivery::Passive
-            };
-            assert_eq!(r.attended, expected, "{}", r.id);
+    fn capability_columns_are_separate_and_honest() {
+        let claude = spec("claude").expect("claude");
+        let codex = spec("codex").expect("codex");
+        assert!(claude.wake_measured && codex.wake_measured);
+        assert_eq!(claude.wake_capability(), "measured");
+        assert_eq!(
+            claude.attended_cli.describe(),
+            "Monitor (measured), Channels (not yet measured)"
+        );
+        assert_eq!(claude.attended_gui, Push::None);
+        assert_eq!(claude.attended_gui.describe(), "manual receive only");
+        assert_eq!(
+            codex.attended_cli.describe(),
+            "codex queue (not yet measured)"
+        );
+        assert_eq!(
+            codex.attended_gui.describe(),
+            "Codex Desktop (not yet measured)"
+        );
+        for r in RUNNERS
+            .iter()
+            .filter(|r| r.id != "claude" && r.id != "codex")
+        {
+            assert_eq!(r.attended_cli, Push::None, "{}", r.id);
+            assert_eq!(r.attended_gui, Push::None, "{}", r.id);
         }
-        // 실측된 깨우기가 곧 유인 전달을 뜻하지 않는다 — codex가 그 반례
-        let codex = spec("codex").unwrap();
-        assert!(codex.wake_measured);
-        assert_eq!(codex.attended, AttendedDelivery::Passive);
     }
 
     #[test]

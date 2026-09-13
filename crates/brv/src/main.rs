@@ -3,17 +3,17 @@
 
 //! brv — Brevduva 리시버 CLI.
 //!
-//! `init`(셋업 일괄) · `binding`(다중 바인딩 관리) · `status` · `send` · `listen`(수신 출력) ·
-//! `mcp`(로컬 MCP 서버) · `daemon`(상주 수신+깨우기) · `wake` · `hook`.
+//! `init`(셋업 일괄) · `binding`(다중 바인딩 관리) · `status` · `send` · `listen`(리시버 관찰) ·
+//! `mcp`(러너 → 리시버 stdio 브리지) · `daemon`(상주 수신+깨우기) · `wake` · `hook`.
 //!
 //! **다중 바인딩 (페이즈 27)**: 설정은 여러 (에이전트, 채널) 바인딩을 담고, 데몬은 전부
-//! 동시 수신한다. 단일 대상 명령(mcp·send·listen·status·channels·wake test)은 바인딩이
+//! 동시 수신한다. 단일 대상 명령(send·status·channels·wake test)은 바인딩이
 //! 하나면 그것, 여럿이면 `--binding {agent}@{channel}` 명시를 요구한다 — 조용한 오발신 방지.
+//! 세션(`mcp`)은 바인딩을 고르지 않는다 — 리시버에 붙어 `become`으로 정한다(RECEIVER_DESIGN P3).
 
 use std::time::Duration;
 
 use anyhow::Context as _;
-use brv::client::{Client, ClientOptions, PublishSpec, RecvFilter};
 use brv::config::{self, Binding, BrvConfig};
 use clap::{Parser, Subcommand};
 
@@ -36,19 +36,6 @@ enum Cmd {
         address: String,
         #[arg(long)]
         ticket: String,
-    },
-    /// Connect the current Codex Desktop task (not a standalone CLI session)
-    Connect {
-        #[arg(long)]
-        binding: Option<String>,
-        /// Explicitly replace another connected task (pending work is never reassigned)
-        #[arg(long)]
-        replace: bool,
-    },
-    /// Show, pause, resume or disconnect this machine's task connection
-    Connection {
-        #[command(subcommand)]
-        action: ConnectionCmd,
     },
     /// Connect an agent — with a one-time code (--enroll, recommended) or an admin
     /// API key. Bindings are **added** to an existing config (same agent@channel updates it)
@@ -88,7 +75,7 @@ enum Cmd {
         /// Set up unattended receiving without asking (wake runner, one test wake, OS service)
         #[arg(long, conflicts_with = "attended_only")]
         unattended: bool,
-        /// Do not offer unattended receiving — attended use only
+        /// Attended use only: register the receiver service and leave unattended wake off
         #[arg(long)]
         attended_only: bool,
     },
@@ -125,36 +112,24 @@ enum Cmd {
         #[arg(long)]
         binding: Option<String>,
     },
-    /// Print received messages as line-delimited JSON (for manual testing, Ctrl+C to stop)
+    /// Watch what this machine's receiver does with incoming messages — where each went (a session, manual receive, an unattended wake, deferred). Takes nothing; Ctrl+C to stop
     Listen {
-        /// Receiving binding — required when multiple bindings exist
+        /// Only this binding (org/agent@channel or agent@channel)
         #[arg(long)]
         binding: Option<String>,
-    },
-    /// Experimental existing Codex Desktop delivery (local user, Windows/macOS/Linux)
-    Desktop {
-        /// Config file used by this receiver
+        /// Print the raw event lines (JSON)
         #[arg(long)]
-        config: Option<String>,
+        json: bool,
+    },
+    /// Codex Desktop task helpers the receiver runs as the logged-on user
+    Desktop {
         #[command(subcommand)]
         action: DesktopCmd,
     },
-    /// Local MCP server (stdio) for agent runners — or `brv mcp register` to add it to the runners on this machine
+    /// Local MCP bridge (stdio) from agent runners to this machine's receiver — or `brv mcp register` to add it to the runners on this machine
     Mcp {
-        /// Experimental Claude Code Channels mode; requires Channels enabled at Claude startup
-        #[arg(long)]
-        claude_channel: bool,
-        /// Experimental shared app-server delivery; requires the TUI to use this loopback endpoint
-        #[arg(long, conflicts_with = "claude_channel")]
-        codex_cli_endpoint: Option<String>,
-        /// Optional exact loaded thread UUID; otherwise connect using the session MCP tool
-        #[arg(long, requires = "codex_cli_endpoint")]
-        codex_cli_thread: Option<String>,
-        /// Environment variable containing the shared app-server bearer token (optional)
-        #[arg(long, requires = "codex_cli_endpoint")]
-        codex_cli_token_env: Option<String>,
-        /// Binding for this session — required when multiple bindings exist (pin it in each project's .mcp.json)
-        #[arg(long)]
+        /// Removed (2026-09-09): sessions take an identity with `become` — kept only to explain stale registrations
+        #[arg(long, hide = true)]
         binding: Option<String>,
         /// Absolute path to the config file (default: BREVDUVA_CONFIG env, then the OS path) — runner registrations pin it
         #[arg(long)]
@@ -165,7 +140,7 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<McpCmd>,
     },
-    /// Resident daemon — receives on all bindings at once and wakes a session per message (needs [wake] in config)
+    /// Resident receiver — holds the channel slot for every binding and delivers to local sessions; wakes a session per message when [wake] is configured
     Daemon {
         // 서비스가 아닌 실행 표면(작업 스케줄러 로그온 작업 등)에서 프로필을 고정하는 통로
         // — 2026-09-01, 윈도우 PIN 전용 사용자의 무암호 상주 경로에서 필요 실측
@@ -188,71 +163,23 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
-enum ConnectionCmd {
-    /// Restart saved connected workers with this binary (paused connections stay paused)
-    Restart,
-    Status {
-        #[arg(long)]
-        binding: Option<String>,
-    },
-    Pause {
-        #[arg(long)]
-        binding: Option<String>,
-    },
-    Resume {
-        #[arg(long)]
-        binding: Option<String>,
-    },
-    Disconnect {
-        #[arg(long)]
-        binding: Option<String>,
-    },
-    #[command(hide = true)]
-    Worker {
-        #[arg(long)]
-        binding: String,
-        #[arg(long)]
-        generation: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum DesktopCmd {
-    /// Resolve an uncertain delivery after inspecting the exact task history; pause first
-    Resolve {
-        #[arg(long)]
-        binding: Option<String>,
-        #[arg(long)]
-        id: String,
-        #[arg(long, required_unless_present = "retry", conflicts_with = "retry")]
-        accepted_turn: Option<String>,
-        #[arg(long)]
-        retry: bool,
-        #[arg(long)]
-        note: String,
-        #[arg(long)]
-        confirm: bool,
-    },
-    /// Receive continuously into one explicitly selected existing Desktop task
-    Run {
-        #[arg(long)]
-        binding: Option<String>,
-        /// Exact existing task ID; never inferred from the latest task
-        #[arg(long)]
-        thread: String,
-        /// Stop after this many accepted inputs (acceptance is not completion)
-        #[arg(long)]
-        max_deliveries: Option<std::num::NonZeroUsize>,
-    },
-    /// Inspect durable delivery states without joining the channel
-    Status {
-        #[arg(long)]
-        binding: Option<String>,
-    },
     /// Check the existing Desktop owner without sending input or joining
     Check {
         #[arg(long)]
         thread: String,
+    },
+    /// Receiver-internal: start one turn in a Desktop task for one delivery (runs as the logged-on user)
+    #[command(hide = true)]
+    Submit {
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        receipt: String,
+        #[arg(long, default_value_t = 45)]
+        busy_wait_secs: u64,
     },
 }
 
@@ -323,14 +250,6 @@ enum WakeCmd {
 /// 별개다(그건 바인딩당 하나, `brv wake set --runner`).
 #[derive(Subcommand)]
 enum McpCmd {
-    /// Print session-owned MCP configuration and startup instructions; never changes runner settings
-    Setup {
-        #[arg(long, value_parser = ["codex", "claude"])]
-        runner: String,
-        /// Shared local Codex app-server endpoint (required for Codex)
-        #[arg(long)]
-        endpoint: Option<String>,
-    },
     /// Register the local `brv mcp` server in every agent runner detected on this machine
     Register {
         /// Only this runner (codex, claude, gemini, …) — default: all detected
@@ -450,18 +369,6 @@ fn changes_local_policy(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Init { .. }
-            | Cmd::Connect { .. }
-            | Cmd::Connection {
-                action: ConnectionCmd::Pause { .. }
-                    | ConnectionCmd::Restart
-                    | ConnectionCmd::Resume { .. }
-                    | ConnectionCmd::Disconnect { .. }
-                    | ConnectionCmd::Worker { .. }
-            }
-            | Cmd::Desktop {
-                action: DesktopCmd::Run { .. } | DesktopCmd::Resolve { .. },
-                ..
-            }
             | Cmd::Binding {
                 action: BindingCmd::Add { .. } | BindingCmd::Remove { .. },
             }
@@ -495,34 +402,6 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
         );
     }
     match cmd {
-        Cmd::Connect { binding, replace } => {
-            crate_connection("connect", binding.as_deref(), replace).await
-        }
-        Cmd::Connection { action } => match action {
-            ConnectionCmd::Restart => {
-                if config::config_path()?.try_exists()? {
-                    brv::connection::restart_connected(&config::load()?).await
-                } else {
-                    Ok(()) // Fresh installation has no saved workers.
-                }
-            }
-            ConnectionCmd::Status { binding } => {
-                crate_connection("status", binding.as_deref(), false).await
-            }
-            ConnectionCmd::Pause { binding } => {
-                crate_connection("pause", binding.as_deref(), false).await
-            }
-            ConnectionCmd::Resume { binding } => {
-                crate_connection("resume", binding.as_deref(), false).await
-            }
-            ConnectionCmd::Disconnect { binding } => {
-                crate_connection("disconnect", binding.as_deref(), false).await
-            }
-            ConnectionCmd::Worker {
-                binding,
-                generation,
-            } => brv::connection::worker(&binding, &generation).await,
-        },
         Cmd::Init {
             server,
             enroll,
@@ -579,66 +458,28 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             reply_to,
             binding,
         } => send(to, payload, expects_ack, reply_to, binding.as_deref()).await,
-        Cmd::Listen { binding } => listen(binding.as_deref()).await,
+        Cmd::Listen { binding, json } => listen(binding.as_deref(), json).await,
         Cmd::SessionStream { address, ticket } => {
             brv::session_delivery::stream(&address, &ticket).await
         }
-        Cmd::Desktop {
-            config: path,
-            action,
-        } => {
-            if let Some(path) = path {
-                let path = std::path::PathBuf::from(path);
-                anyhow::ensure!(path.is_absolute(), "--config must be an absolute path");
-                config::set_path_override(path);
+        Cmd::Desktop { action } => match action {
+            DesktopCmd::Check { thread } => brv::desktop::check(&thread).await,
+            DesktopCmd::Submit {
+                thread,
+                message_id,
+                receipt,
+                busy_wait_secs,
+            } => {
+                brv::desktop::submit(
+                    &thread,
+                    &message_id,
+                    &receipt,
+                    Duration::from_secs(busy_wait_secs),
+                )
+                .await
             }
-            match action {
-                DesktopCmd::Check { thread } => brv::desktop::check(&thread).await,
-                DesktopCmd::Resolve {
-                    binding,
-                    id,
-                    accepted_turn,
-                    retry: _,
-                    note,
-                    confirm,
-                } => {
-                    let cfg = config::load()?;
-                    let selected = cfg.select(binding.as_deref())?;
-                    brv::desktop::resolve(
-                        &cfg,
-                        selected,
-                        &id,
-                        accepted_turn.as_deref(),
-                        &note,
-                        confirm,
-                    )
-                }
-                DesktopCmd::Status { binding } => {
-                    let cfg = config::load()?;
-                    brv::desktop::status(&cfg, cfg.select(binding.as_deref())?)
-                }
-                DesktopCmd::Run {
-                    binding,
-                    thread,
-                    max_deliveries,
-                } => {
-                    let (cfg, binding, opts) = options_from_config(binding.as_deref())?;
-                    brv::desktop::run(
-                        &cfg,
-                        &binding,
-                        opts,
-                        &thread,
-                        max_deliveries.map(|n| n.get()),
-                    )
-                    .await
-                }
-            }
-        }
+        },
         Cmd::Mcp {
-            claude_channel,
-            codex_cli_endpoint,
-            codex_cli_thread,
-            codex_cli_token_env,
             binding,
             config,
             host,
@@ -650,39 +491,10 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
                 config::set_path_override(p);
             }
             match action {
-                Some(McpCmd::Setup { runner, endpoint }) => {
-                    let cfg = config::load()?;
-                    let selected = cfg.select(binding.as_deref())?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&brv::mcp::session_setup(
-                            &runner,
-                            &std::env::current_exe()?,
-                            &config::config_path()?,
-                            &selected.full_label(),
-                            endpoint.as_deref()
-                        )?)?
-                    );
-                    Ok(())
-                }
                 Some(McpCmd::Register { runner, dry_run }) => {
-                    anyhow::ensure!(
-                        !claude_channel && codex_cli_endpoint.is_none(),
-                        "configure session delivery in the session-owned MCP entry, not mcp register"
-                    );
                     mcp_register(&config::load()?, runner.as_deref(), dry_run)
                 }
-                None => {
-                    mcp(
-                        binding.as_deref(),
-                        host,
-                        claude_channel,
-                        codex_cli_endpoint,
-                        codex_cli_thread,
-                        codex_cli_token_env,
-                    )
-                    .await
-                }
+                None => mcp(binding.as_deref(), host).await,
             }
         }
         Cmd::Daemon { config, action } => match action {
@@ -772,33 +584,6 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             }
         },
     }
-}
-
-/// 선택된 바인딩의 접속 옵션 — 단일 대상 명령들의 공통 진입.
-fn options_from_config(
-    selector: Option<&str>,
-) -> anyhow::Result<(BrvConfig, Binding, ClientOptions)> {
-    let cfg = config::load()?;
-    let binding = cfg.select(selector)?.clone();
-    let token = config::load_token(&cfg, &binding)?;
-    let mut opts = ClientOptions::new(&cfg.server, &binding.channel, &binding.agent, token);
-    opts.description = binding.description.clone();
-    Ok((cfg, binding, opts))
-}
-
-async fn crate_connection(
-    action: &str,
-    selector: Option<&str>,
-    replace: bool,
-) -> anyhow::Result<()> {
-    let cfg = config::load()?;
-    let binding = cfg.select(selector)?;
-    brv::connection::command(&cfg, binding, action, replace).await
-}
-
-fn connect_from_config(selector: Option<&str>) -> anyhow::Result<(Binding, Client)> {
-    let (_, binding, opts) = options_from_config(selector)?;
-    Ok((binding, Client::connect(opts)))
 }
 
 /// PATH에서 실행 파일 탐색 — 설정에는 항상 절대 경로로 저장하기 위함.
@@ -1064,9 +849,17 @@ fn wake_show() -> anyhow::Result<()> {
     }
     println!("command  : {} (global)", wake.command);
     println!("timeout  : {}s", wake.timeout_s);
+    if let Some(warning) = script_prompt_warning(&wake.command, &wake.args) {
+        println!("warning  : {warning}");
+    }
     println!("bindings :");
     for b in &cfg.bindings {
         let eff = brv::daemon::effective_wake(wake, b);
+        if (b.wake_command.is_some() || b.wake_args.is_some())
+            && let Some(warning) = script_prompt_warning(&eff.command, &eff.args)
+        {
+            println!("  warning: {} — {warning}", b.full_label());
+        }
         let runner = if b.wake_command.is_some() || b.wake_args.is_some() {
             let (id, level) = describe(&eff.command, &eff.args);
             format!("runner {id} / allow {level} (override)")
@@ -1080,6 +873,19 @@ fn wake_show() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// 윈도우 `.cmd`·`.bat` 러너에 프롬프트를 인자로 넘기는 설정의 경고 (2026-09-13, U7): `cmd.exe` 감싸기가
+/// 여러 줄 프롬프트를 첫 줄에서 자른다. 사전 점검·`wake test`의 한 줄 프롬프트는 통과하므로 여기서 말해야 한다.
+fn script_prompt_warning(command: &str, args: &[String]) -> Option<String> {
+    (cfg!(windows)
+        && brv::daemon::is_script_runner(command)
+        && !brv::daemon::prompt_via_stdin(args))
+    .then(|| {
+        format!(
+            "{command} is a .cmd/.bat script and these args pass the prompt as an argument — on Windows cmd.exe cuts a multi-line prompt at the first line, so real wakes lose the message. Use a profile that reads the prompt from stdin (`brv wake set --runner codex` does) or point the command at the runner's native executable"
+        )
+    })
 }
 
 /// `brv wake test` — 실제 깨우기와 같은 스폰 경로로 1회 실행해 환경을 검증한다.
@@ -1119,6 +925,8 @@ async fn wake_test(binding_sel: Option<&str>) -> anyhow::Result<()> {
         &binding.full_label(),
         prompt,
         &brv::daemon::WakeSpawn::Direct,
+        // 점검용 깨우기라 잠글 작업이 없다 — 깨우기 창 식별자도 없다.
+        None,
     )
     .await?;
     println!("spawn OK — waiting for the session to exit...");
@@ -1146,6 +954,10 @@ async fn wake_test(binding_sel: Option<&str>) -> anyhow::Result<()> {
         "WAKE TEST OK ({:.1}s) — session output appended to {log_hint:?}",
         started.elapsed().as_secs_f32()
     );
+    // 한 줄 점검 프롬프트로는 드러나지 않는 결함 (U7) — 여기서 알린다
+    if let Some(warning) = script_prompt_warning(&capped.command, &capped.args) {
+        println!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -1274,7 +1086,8 @@ async fn enroll_init(
     restart_daemon(false)?;
     // 무인 수신 통합 흐름 (2026-09-04, 온보딩 재설계 2): 종전엔 세 명령을 안내만 했다 —
     // 이제 질문 하나로 잇는다. 이미 무인 설정+서비스가 있는 머신(두 번째 에이전트)은 묻지 않는다
-    if cfg.wake.is_some() && brv::service::registered() {
+    let service = brv::service::registered();
+    if cfg.wake.is_some() && service {
         println!(
             "unattended receiving is already set up on this machine — the daemon picked up the new binding"
         );
@@ -1294,18 +1107,35 @@ async fn enroll_init(
             true,
         )?
     };
-    if !go {
-        println!();
-        println!("attended use is ready. For unattended receiving later:");
-        println!("  brv init --server … --enroll … --unattended   # or step by step:");
-        println!(
-            "  brv wake set --allow respond   # unattended-session allowance (respond|edit|full)"
-        );
-        println!("  brv wake test                  # verify one wake actually works");
-        println!("  brv daemon install             # register the resident OS service");
-        return Ok(());
+    if go {
+        return setup_unattended(&cfg, runner, interactive).await;
     }
-    setup_unattended(&cfg, runner, interactive).await
+    // 유인 전용도 리시버 서비스는 필요하다 (2026-09-11 번복, 16단계): 세션은 리시버에 붙어 보내고 받는다 —
+    // `--attended-only`는 "서비스 없음"이 아니라 "서비스는 등록하되 무인 깨우기는 끔"이다. 깨우기 설정이 없는
+    // 리시버는 세션이 바인딩을 쥘 때만 서버에 붙는다. 터미널 밖에서 플래그 없이 실행되면 관리자 승인 창을
+    // 띄우지 않도록 등록하지 않고 안내만 한다.
+    println!();
+    if service {
+        println!("attended use is ready — the receiver service picked up the new binding");
+    } else if attended_only || interactive {
+        match brv::service::install(None) {
+            Ok(()) => println!(
+                "attended use is ready — sessions attach to the receiver service (unattended wake stays off)"
+            ),
+            Err(e) => println!(
+                "receiver service registration failed: {e:#}\n  sessions attach to the receiver — run `brv daemon install` later"
+            ),
+        }
+    } else {
+        println!(
+            "sessions attach to this machine's receiver — register it with `brv daemon install`"
+        );
+    }
+    println!("For unattended receiving later:");
+    println!("  brv init --server … --enroll … --unattended   # or step by step:");
+    println!("  brv wake set --allow respond   # unattended-session allowance (respond|edit|full)");
+    println!("  brv wake test                  # verify one wake actually works");
+    Ok(())
 }
 
 /// 무인 수신 셋업 — 러너 결정 → 권한 respond → 실제 깨우기 1회 → OS 서비스. 어느 단계가 막히면
@@ -1780,6 +1610,16 @@ fn restart_daemon(explicit: bool) -> anyhow::Result<()> {
         Ok(false) => {}
         Err(e) => println!("daemon restart failed — restart it yourself: {e}"),
     }
+    // 갱신 잔재 정리 (10단계, P8) — 설치기가 이 실행 파일 옆에 비켜 둔 옛 파일
+    if let Ok(exe) = std::env::current_exe() {
+        let removed = brv::service::sweep_parked_binaries(&exe);
+        if !removed.is_empty() {
+            println!(
+                "removed {} binary file(s) left over from a previous update",
+                removed.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1832,19 +1672,14 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
     } else {
         println!("runners:");
         for d in &runners {
-            // attended = 떠 있는 대화형 세션에 넣는 방법 (2026-09-05, 1단계): "깨우기가 된다"와
-            // "기존 세션에 넣을 수 있다"를 한 줄에서 구분해 보여준다
+            // 세 칸 (RECEIVER_DESIGN §3, 2026-09-12 11단계): 무인 깨우기 / CLI 유인 밀어넣기 / GUI 유인 밀어넣기를
+            // 실측 여부와 함께 — 서버 리포 RUNNERS.md와 같은 표다
+            println!("  {:10} {:26} {}", d.spec.id, d.version, d.path.display());
             println!(
-                "  {:10} {:26} {}  attended: {}{}",
-                d.spec.id,
-                d.version,
-                d.path.display(),
-                d.spec.attended.describe(),
-                if d.spec.wake_measured {
-                    ""
-                } else {
-                    "  (wake profile not yet measured)"
-                }
+                "             wake: {} · CLI push: {} · GUI push: {}",
+                d.spec.wake_capability(),
+                d.spec.attended_cli.describe(),
+                d.spec.attended_gui.describe()
             );
         }
     }
@@ -1871,6 +1706,22 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
         }
         None => println!("daemon: no state file (not running here, or older than 0.6.6)"),
     }
+    // 이전 리시버가 서버에 확정했지만 넘기지 못한 메시지 (10단계) — 종전에는 리시버 로그에만 있었다
+    for leftover in brv::daemon::legacy_leftovers(&cfg) {
+        match &leftover.unfinished {
+            Ok(messages) => println!(
+                "previous receiver: {} ({}) — {} message(s) were confirmed to the server but never handed over; they are not re-delivered. Inspect {}",
+                leftover.binding,
+                leftover.adapter,
+                messages.len(),
+                leftover.journal.display()
+            ),
+            Err(error) => println!(
+                "previous receiver: could not read {} — {error}",
+                leftover.journal.display()
+            ),
+        }
+    }
     if let Some(until) = brv::daemon::read_pause() {
         println!(
             "daemon: PAUSED by operator — {} min left (brv daemon resume ends it early)",
@@ -1889,27 +1740,136 @@ async fn status(binding_sel: Option<&str>) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    // 프레즌스 조회는 JOIN을 동반한다(순간 online 표시) — 전 바인딩 순회는 프레즌스 노이즈라
-    // 단일 결정이 가능할 때만 (바인딩 1개 또는 --binding 지정)
-    match cfg.select(binding_sel) {
-        Ok(binding) => {
-            let (_, client) = connect_from_config(Some(&binding.label()))?;
-            match client.presence(Duration::from_secs(10)).await {
-                Ok(entries) => {
-                    println!("channel {} presence:", binding.channel);
-                    for e in entries {
-                        println!("  {:10} {:?}", e.agent.as_str(), e.state);
-                    }
-                }
-                Err(e) => println!("presence query failed: {e}"),
+    // 조회는 **리시버에게 묻는다** (2026-09-09, P2): 종전에는 이 명령이 자기 토큰으로 JOIN해
+    // 프레즌스를 물었고 그 JOIN이 데몬·대화형 세션의 자리를 빼앗았다(2026-09-08 실측).
+    // 이제 서버에 붙는 것은 리시버뿐이고, 여기서는 이미 붙어 있는 그 접속의 답을 받는다.
+    report_local_plane(binding_sel).await;
+    Ok(())
+}
+
+/// 로컬 리시버에게 세션·바인딩·프레즌스를 묻는다. 리시버가 없으면 그 사실만 알린다.
+async fn report_local_plane(binding_sel: Option<&str>) {
+    let endpoint = match brv::local_plane::Endpoint::load() {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            println!(
+                "local sessions: no receiver endpoint on this machine — sessions cannot attach. Register the service with `brv daemon install`"
+            );
+            return;
+        }
+    };
+    let request = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client")
+        .get(format!("http://{}/status", endpoint.addr))
+        .bearer_auth(endpoint.token.expose())
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await;
+    let report: serde_json::Value = match request {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(value) => value,
+            Err(e) => {
+                println!("local sessions: receiver answered but the report was unreadable — {e}");
+                return;
+            }
+        },
+        Ok(response) => {
+            println!(
+                "local sessions: receiver refused the status query ({})",
+                response.status()
+            );
+            return;
+        }
+        Err(e) => {
+            println!("local sessions: receiver endpoint unreachable — {e}");
+            return;
+        }
+    };
+    if report["receiver_version"].as_str() != Some(env!("CARGO_PKG_VERSION")) {
+        println!(
+            "local sessions: receiver is {} but this CLI is {} — restart the service so both match",
+            report["receiver_version"].as_str().unwrap_or("unknown"),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    let sessions = report["sessions"].as_array().cloned().unwrap_or_default();
+    if sessions.is_empty() {
+        println!("local sessions: none attached");
+    } else {
+        println!("local sessions:");
+        for session in &sessions {
+            println!(
+                "  {:10} {:8} {:9} {}",
+                session["host"].as_str().unwrap_or("unknown"),
+                session["origin"].as_str().unwrap_or("?"),
+                if session["receiving"] == serde_json::json!(true) {
+                    "receiving"
+                } else {
+                    "no-push"
+                },
+                session["bindings"]
+                    .as_array()
+                    .map(|b| b
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    for binding in report["bindings"].as_array().unwrap_or(&Vec::new()) {
+        let label = binding["binding"].as_str().unwrap_or_default();
+        if binding_sel.is_some_and(|sel| !label.contains(sel)) {
+            continue;
+        }
+        let held = binding["held_by_work"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        println!(
+            "  binding {label}: {}{}{}",
+            if binding["connected"] == serde_json::json!(true) {
+                "connected"
+            } else {
+                "not connected"
+            },
+            match binding["holder"].as_str() {
+                Some(_) if binding["receiving"] == serde_json::json!(true) =>
+                    ", a session is receiving",
+                Some(_) => ", held by a session that cannot receive",
+                None => ", no session holds it (deliveries wake one)",
+            },
+            if held.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", locked by work {}",
+                    held.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+        if let Some(entries) = report["presence"][label].as_array() {
+            let listening: Vec<String> = entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{} {}",
+                        e["agent"].as_str().unwrap_or("?"),
+                        e["state"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect();
+            if !listening.is_empty() {
+                println!("    channel presence: {}", listening.join(", "));
             }
         }
-        Err(_) if !cfg.bindings.is_empty() => {
-            println!("(channel presence is shown with --binding {{agent}}@{{channel}})");
-        }
-        Err(e) => return Err(e),
     }
-    Ok(())
 }
 
 async fn send(
@@ -1919,91 +1879,187 @@ async fn send(
     reply_to: Option<String>,
     binding_sel: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (_, client) = connect_from_config(binding_sel)?;
-    let mut spec = PublishSpec::message(
-        if to == "broadcast" || to.contains(':') {
-            to
-        } else {
-            format!("agent:{to}")
-        },
-        payload,
+    use anyhow::Context as _;
+    // 리시버에게 맡긴다 (2026-09-10, P2·8단계): 종전에는 이 명령이 자기 토큰으로 JOIN해 보내며
+    // 데몬·대화형 세션의 자리를 잠깐씩 빼앗았다. 이제 서버에 붙는 것은 리시버뿐이다.
+    // --reply-to (2026-09-02, 실사용 보고)는 그대로다 — kind=reply + correlation으로 보낸다.
+    let cfg = config::load()?;
+    let binding = cfg.select(binding_sel)?;
+    let endpoint = brv::local_plane::Endpoint::load().context(
+        "no local receiver is running on this machine — start it with `brv daemon install`; the CLI no longer connects to the server itself",
+    )?;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
+        .post(format!("http://{}/publish", endpoint.addr))
+        .bearer_auth(endpoint.token.expose())
+        .timeout(Duration::from_secs(20))
+        .json(&serde_json::json!({
+            "binding": binding.full_label(),
+            "to": to,
+            "payload": payload,
+            "expects_ack": expects_ack,
+            "reply_to": reply_to,
+            // 리시버가 깨운 프로세스면 그 깨우기로 받았다는 증거가 된다 (2026-09-11)
+            "wake": std::env::var("BREVDUVA_WAKE").ok().filter(|w| !w.is_empty()),
+        }))
+        .send()
+        .await
+        .context("the local receiver did not answer")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "the local receiver refused the publish ({})",
+        response.status()
     );
-    if expects_ack {
-        spec.expects = Some(brevduva_protocol::Expects::Ack);
-    }
-    // --reply-to (2026-09-02, 실사용 보고): CLI 회신이 kind=reply + correlation을 실어야
-    // 발신자의 wait_for_reply가 해소된다 — 본문에 "re: <id>"를 손으로 적는 우회를 없앤다
-    if let Some(id) = reply_to {
-        spec.kind = brevduva_protocol::Kind::Reply;
-        spec.correlation_id = Some(id);
-    }
-    match tokio::time::timeout(Duration::from_secs(10), client.publish(spec)).await {
-        Ok(Ok(id)) => println!("sent {id}"),
-        Ok(Err(e)) => anyhow::bail!("rejected: {} — {}", e.code, e.message),
-        Err(_) => anyhow::bail!("unconfirmed after 10s — will republish on reconnect (13.3)"),
+    let result: serde_json::Value = response.json().await?;
+    match result["status"].as_str() {
+        Some("sent") => println!("sent {}", result["id"].as_str().unwrap_or_default()),
+        Some("unconfirmed") => {
+            anyhow::bail!("unconfirmed after 10s — the receiver republishes on reconnect (13.3)")
+        }
+        _ => anyhow::bail!(
+            "{}",
+            result["message"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| result.to_string())
+        ),
     }
     Ok(())
 }
 
-async fn listen(binding_sel: Option<&str>) -> anyhow::Result<()> {
-    let (binding, client) = connect_from_config(binding_sel)?;
-    eprintln!("listening as {} — Ctrl+C to stop", binding.label());
-    loop {
-        if let Some(env) = client.recv(RecvFilter::Any, Duration::from_secs(60)).await {
-            println!("{}", serde_json::to_string(&env)?);
+/// 리시버 관찰 (2026-09-11 확정, 17단계) — 리시버의 `/listen`을 읽기만 한다. 옛 `listen`은 서버에 JOIN해 받은
+/// 메시지를 소비했다: 켜는 순간 리시버와 수신 자리를 다투고, 받은 것은 에이전트에게 가지 않았다(P2 위반).
+/// 리시버가 없으면 그렇다고 말하고 끝난다 — 서버 직접 접속으로 대신하지 않는다.
+async fn listen(binding: Option<&str>, raw: bool) -> anyhow::Result<()> {
+    let endpoint = brv::local_plane::auth::Endpoint::load().context(
+        "no local receiver is running on this machine — `brv listen` watches the receiver; start it with `brv daemon install` (or `brv daemon`)",
+    )?;
+    let http = reqwest::Client::builder().no_proxy().build()?;
+    let mut response = http
+        .get(format!("http://{}/listen", endpoint.addr))
+        .bearer_auth(endpoint.token.expose())
+        .send()
+        .await
+        .context("the local receiver did not answer")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "the local receiver refused the watch stream ({}) — is it an older version? restart it after updating",
+        response.status()
+    );
+    eprintln!(
+        "watching the receiver at {} — nothing is taken; Ctrl+C to stop",
+        endpoint.addr
+    );
+    // 줄 경계는 바이트로 자른다 — 조각 경계에 걸린 여러 바이트 글자가 깨지지 않게.
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("the watch stream broke")? {
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=end).collect();
+            let Ok(event) = serde_json::from_slice::<serde_json::Value>(line.trim_ascii()) else {
+                continue; // 유휴 줄
+            };
+            if let (Some(selector), Some(bound)) = (binding, event["binding"].as_str())
+                && bound != selector
+                && !bound.ends_with(&format!("/{selector}"))
+            {
+                continue;
+            }
+            if raw {
+                println!("{event}");
+            } else {
+                println!("{}", describe_tap(&event));
+            }
         }
     }
+    eprintln!("the receiver closed the watch stream (it stopped or restarted)");
+    Ok(())
 }
 
-async fn mcp(
-    binding_sel: Option<&str>,
-    host: Option<String>,
-    claude_channel: bool,
-    codex_cli_endpoint: Option<String>,
-    codex_cli_thread: Option<String>,
-    codex_cli_token_env: Option<String>,
-) -> anyhow::Result<()> {
-    // 선택자 폴백: --binding → BREVDUVA_BINDING env — 데몬이 깨운 세션의 MCP가 "누가
-    // 깨웠는지"를 이어받는 통로 (2026-09-02). 바인딩이 여럿인 머신에서도 깨운 세션이
-    // 올바른 정체성으로 붙는다 (플래그 없는 user-scope 등록 + 다중 바인딩 = select 불가였음)
-    let env_sel = std::env::var("BREVDUVA_BINDING").ok();
-    // 셋째 폴백 (2026-09-04): 데몬 상태 파일의 "깨우기 진행 중" 바인딩 — Codex처럼 MCP 자식에
-    // 환경변수를 넘기지 않는 러너의 정적 등록(`brv mcp register`)이 다중 바인딩 머신에서도
-    // 깨운 바인딩으로 붙는 길. 정확히 하나가 깨어 있을 때만 쓴다
-    let state_sel = match (binding_sel, &env_sel) {
-        (None, None) => brv::daemon::read_state()
-            .and_then(|st| brv::daemon::waking_binding(&st).map(str::to_owned)),
-        _ => None,
+/// 관찰 사건 한 줄 — 사람이 읽는 형태. 시각은 UTC.
+fn describe_tap(event: &serde_json::Value) -> String {
+    let text = |key: &str| event[key].as_str().unwrap_or_default().to_owned();
+    let when = event["at_ms"]
+        .as_u64()
+        .map(|ms| {
+            let secs = ms / 1000;
+            format!(
+                "{:02}:{:02}:{:02}Z",
+                (secs / 3600) % 24,
+                (secs / 60) % 60,
+                secs % 60
+            )
+        })
+        .unwrap_or_default();
+    let binding = text("binding");
+    let what = match text("event").as_str() {
+        "received" => {
+            let whither = match text("route").as_str() {
+                "handed_to_session" => format!("→ session {}", text("session")),
+                "held_for_manual_receive" => {
+                    format!("→ held for manual receive by session {}", text("session"))
+                }
+                "unattended" => "→ unattended path".to_owned(),
+                "deferred" => format!("→ deferred {}s: {}", event["delay_s"], text("reason")),
+                "consumed" => format!("→ handled by the receiver: {}", text("reason")),
+                other => format!("→ {other}"),
+            };
+            let (kind, id, from) = (text("kind"), text("message_id"), text("from"));
+            let preview = text("preview").replace('\n', " ");
+            if preview.is_empty() {
+                format!("{kind} {id} from {from} {whither}")
+            } else {
+                format!("{kind} {id} from {from} {whither}\n    {preview}")
+            }
+        }
+        "accepted" => format!(
+            "{} confirmed — the agent received it ({})",
+            text("message_id"),
+            text("via")
+        ),
+        "uncertain" => format!(
+            "{} outcome uncertain — {} (decide with receiver_resolve)",
+            text("message_id"),
+            text("reason")
+        ),
+        "wake_started" => format!(
+            "woke a session for {} (wake {})",
+            event["message_ids"],
+            text("wake")
+        ),
+        "wake_proven" => format!(
+            "the woken session proved it received the batch — confirmed (wake {})",
+            text("wake")
+        ),
+        "wake_unproven" => format!(
+            "the woken session ended without proving receipt (wake {})",
+            text("wake")
+        ),
+        "wake_failed" => format!("a wake could not start: {}", text("reason")),
+        "deferred" => format!(
+            "{} deferred {}s: {}",
+            event["message_ids"],
+            event["delay_s"],
+            text("reason")
+        ),
+        "lagged" => format!(
+            "… {} events were dropped (this watcher fell behind)",
+            event["missed"]
+        ),
+        other => other.to_owned(),
     };
-    let binding_sel = binding_sel.or(env_sel.as_deref()).or(state_sel.as_deref());
-    // lazy-JOIN: 여기서 접속하지 않는다 — 첫 도구 호출 때 McpServer가 접속 (플랩 방지)
-    let (cfg, binding, mut opts) = options_from_config(binding_sel)?;
-    // 유휴 파킹 (2026-09-01): 도구 호출이 끊긴 세션은 자리를 내려놓는다 — 방치된 대화형
-    // 세션의 버퍼로 배달돼 미소비 재전달 끝에 격리되는 유실을 원천 차단. 다음 도구 호출이
-    // lazy-JOIN과 같은 경로로 자리를 되찾는다
-    opts.idle_park = Some(brv::client::DEFAULT_IDLE_PARK);
-    tracing::info!(binding = %binding.label(), "brv mcp server on stdio");
-    if let Some(endpoint) = codex_cli_endpoint {
-        anyhow::ensure!(
-            host.as_deref().is_none_or(|h| h == "codex"),
-            "Codex CLI delivery requires the Codex host"
-        );
-        brv::mcp::run_codex_cli(
-            opts,
-            &cfg,
-            &binding,
-            &endpoint,
-            codex_cli_thread.as_deref(),
-            codex_cli_token_env,
-        )
-        .await
-    } else if claude_channel {
-        anyhow::ensure!(
-            host.as_deref().is_none_or(|h| h == "claude"),
-            "Claude channel mode requires the Claude host"
-        );
-        brv::mcp::run_claude_channel(opts, &cfg, &binding).await
-    } else {
-        brv::mcp::run_local(opts, host, &cfg, &binding).await
-    }
+    format!("{when} {binding} {what}")
+}
+
+async fn mcp(binding_sel: Option<&str>, host: Option<String>) -> anyhow::Result<()> {
+    // **로컬 리시버로의 브리지**다 (2026-09-09, RECEIVER_DESIGN P2·P3): 이 프로세스는 서버에
+    // JOIN하지 않고 바인딩을 고르지도 않는다 — 정체성은 리시버의 등록부가 정한다. 그래서 바인딩이
+    // 여럿인 머신에서도 대화형 세션이 그대로 붙는다(0.6.39 검토 1번의 근본 수정). 러너별 전달
+    // 어댑터(`--claude-channel`·`--codex-cli-endpoint`)는 리시버 소유로 옮겨져 삭제됐다(2026-09-11, 7e).
+    anyhow::ensure!(
+        binding_sel.is_none(),
+        "--binding is not used any more: sessions attach to this machine's receiver and take an identity with the `become` tool (list_bindings shows what is available) — re-run `brv mcp register` to refresh this runner's entry"
+    );
+    brv::local_plane::bridge::run(host).await
 }
