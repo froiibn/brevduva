@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod client;
+pub mod codex_registration;
 pub mod config;
 pub mod daemon;
 mod delivery;

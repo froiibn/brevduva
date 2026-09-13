@@ -24,7 +24,8 @@
 //! Claude Code Monitor만 실측했다 (2026-09-12, 12단계 — claude -p 2.1.263 실제 전달→receipt→reply).
 //! MCP 등록은 러너에 `mcp add` 계열 명령이 있으면 그 명령으로(러너가 자기 파일을 책임진다),
 //! 설정 파일만 있는 러너는 붙여 넣을 조각을 출력한다 — 형식이 제각각(JSON·TOML·YAML·JSONC·
-//! crushrc)이라 brv가 사용자 파일을 직접 고치면 파손 위험이 편의보다 크다.
+//! crushrc)이라 brv가 사용자 파일을 직접 고치면 파손 위험이 편의보다 크다. 유일한 예외는 Codex의
+//! `brevduva` 항목 아래 도구 승인 표 보존(`codex_registration.rs`, 2026-09-14) — `codex mcp add`가 지우기 때문.
 //!
 //! 등록 서버명은 전부 `brevduva`. 깨우기 프롬프트는 서버명과 맨 도구 이름만 쓰므로 러너별
 //! 접두어(`mcp__s__t`, `mcp_s_t`, `s__t`, `s_t`, `@s/t`, `t_s`, 없음)에 영향받지 않는다.

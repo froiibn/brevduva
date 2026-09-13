@@ -1291,7 +1291,8 @@ fn refresh_registrations_after_update() {
 
 /// 탐지된 러너 전부에 로컬 `brv mcp`를 등록한다 (2026-09-04 — 유인용, 깨우기 러너와 별개).
 /// 러너에 등록 명령이 있으면 실행하고, 없으면 붙여 넣을 조각을 출력한다 — brv가 사용자의
-/// 러너 설정 파일을 직접 고치지 않는다(형식이 제각각이라 파손 위험 > 편의).
+/// 러너 설정 파일을 직접 고치지 않는다(형식이 제각각이라 파손 위험 > 편의). 예외는 Codex 항목의 도구 승인 표
+/// 보존(`codex_registration`) — `codex mcp add`가 지우므로 되돌려 넣는다(2026-09-14, 수칙 9).
 /// 등록은 `--config`로 이 설정 파일을 못 박는다 — 러너가 MCP 자식에 환경변수를 넘기지 않아도
 /// (Codex는 허용 목록만 전달) 같은 프로필을 본다.
 /// 실제로 등록을 돌린 뒤에는 표시 파일에 지금 버전을 적는다 — 다음 갱신까지 `brv daemon restart`가 다시 쓰지 않는다.
@@ -1327,10 +1328,36 @@ fn mcp_register(runner: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
                     println!("{}: would run\n  {shown}", d.spec.display);
                     continue;
                 }
+                // Codex는 `mcp add`가 같은 이름 항목을 하위 승인 표까지 통째로 덮어쓴다(0.154.0 실측) — 이미 지금
+                // 값이면 건드리지 않고, 다시 써야 하면 사용자의 "Always allow" 표를 읽어 두었다가 되돌린다(수칙 9)
+                let codex_config = (d.spec.id == "codex")
+                    .then(brv::codex_registration::config_path)
+                    .flatten();
+                if let Some(config) = &codex_config
+                    && brv::codex_registration::is_current(config, &filled)
+                {
+                    println!(
+                        "{}: brevduva MCP registration already current",
+                        d.spec.display
+                    );
+                    continue;
+                }
+                let approvals = codex_config
+                    .as_deref()
+                    .and_then(brv::codex_registration::saved_tool_approvals);
                 let run = || std::process::Command::new(&d.path).args(&filled).output();
                 match run() {
                     Ok(out) if out.status.success() => {
                         println!("{}: brevduva MCP registered", d.spec.display);
+                        if let (Some(config), Some(tools)) = (&codex_config, approvals) {
+                            match brv::codex_registration::restore_tool_approvals(config, tools) {
+                                Ok(()) => println!("  tool approvals kept"),
+                                Err(e) => println!(
+                                    "  could not restore the tool approvals in {} ({e}) — Codex will ask once per tool again",
+                                    config.display()
+                                ),
+                            }
+                        }
                     }
                     Ok(out) => {
                         let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
