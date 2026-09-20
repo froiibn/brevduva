@@ -384,11 +384,15 @@ pub enum TokenStore {
 }
 
 fn token_file(token_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(token_file_in(
+        config_path()?.parent().expect("config has parent"),
+        token_id,
+    ))
+}
+
+fn token_file_in(dir: &Path, token_id: &str) -> PathBuf {
     // 파일명에 '/'는 불가 — org 구분자를 '-'로 (org·agent는 케밥 식별자라 안전)
-    Ok(config_path()?
-        .parent()
-        .expect("config has parent")
-        .join(format!("token-{}", token_id.replace('/', "-"))))
+    dir.join(format!("token-{}", token_id.replace('/', "-")))
 }
 
 /// 설정 디렉터리를 소유자·SYSTEM·관리자만 접근하도록 좁힌다 (2026-09-03, 사용자 지시).
@@ -617,16 +621,32 @@ pub fn store_token(server: &str, binding: &Binding, token: &str) -> anyhow::Resu
         && let Ok(entry) = keyring_entry(server, &id)
         && entry.set_password(token).is_ok()
     {
-        for stale in token_ids(binding).iter().filter_map(|c| token_file(c).ok()) {
-            if stale.exists()
-                && let Err(e) = std::fs::remove_file(&stale)
-            {
-                eprintln!("warning: could not remove the superseded token file {stale:?}: {e}");
-            }
-        }
+        remove_token_files(binding);
         return Ok(TokenStore::Keyring);
     }
     Ok(TokenStore::File(write_token_file(&id, token)?))
+}
+
+/// 키체인이 주 저장소가 된 바인딩의 토큰 파일을 **현행·구형 이름 모두** 지운다 — 주 저장소는
+/// 하나여야 한다. 하나만 지우면 남은 파일을 다음 읽기가 "이전할 토큰"으로 집어 키체인의 새
+/// 토큰을 옛 것으로 덮어쓴다 (2026-09-21 맥 실기 직전 발견: 재enroll 전의 구형 `token-<agent>`와
+/// 현행 `token-<org>-<agent>`가 서로 다른 값으로 함께 남아 있었다 — 서명판 갱신 뒤 두 번째
+/// 읽기에서 연결이 끊기고 올바른 토큰이 어디에도 남지 않을 뻔했다).
+fn remove_token_files(binding: &Binding) {
+    match config_path() {
+        Ok(path) => remove_token_files_in(path.parent().expect("config has parent"), binding),
+        Err(e) => eprintln!("warning: could not locate the token files to remove: {e:#}"),
+    }
+}
+
+fn remove_token_files_in(dir: &Path, binding: &Binding) {
+    for stale in token_ids(binding).iter().map(|c| token_file_in(dir, c)) {
+        if stale.exists()
+            && let Err(e) = std::fs::remove_file(&stale)
+        {
+            eprintln!("warning: could not remove the superseded token file {stale:?}: {e}");
+        }
+    }
 }
 
 /// 파일 → 키체인 이전 (키체인이 주 저장소가 된 시점 — 무서명 빌드에서 서명 빌드로 갱신).
@@ -711,10 +731,13 @@ pub fn load_token(cfg: &BrvConfig, binding: &Binding) -> anyhow::Result<String> 
     };
     if keychain_is_reliable() {
         if let Some((path, t)) = from_files() {
-            if let Err(e) = migrate_file_to_keychain(&cfg.server, &id, &path, &t) {
-                eprintln!(
+            // 이전이 성공했으면 같은 바인딩의 나머지 파일(우선순위가 낮아 선택되지 않은 구형)도
+            // 지운다 — 남기면 다음 읽기가 그것을 키체인에 덮어쓴다. 실패했으면 아무것도 지우지 않는다
+            match migrate_file_to_keychain(&cfg.server, &id, &path, &t) {
+                Ok(()) => remove_token_files(binding),
+                Err(e) => eprintln!(
                     "warning: token file {path:?} could not be moved into the keychain (kept as is, will retry next time): {e:#}"
-                );
+                ),
             }
             return Ok(t);
         }
@@ -965,6 +988,39 @@ mod tests {
         let custom = vec!["-p".to_owned(), "{prompt}".to_owned()];
         assert_eq!(wake_preset_of(&custom), None);
         assert_eq!(wake_allowed_tools(&custom), None);
+    }
+
+    /// 회귀 (2026-09-21, 맥 실기 직전 발견): 키체인으로 이전한 뒤에는 그 바인딩의 토큰 파일이
+    /// 현행·구형 이름 모두 없어야 한다 — 구형이 남으면 다음 읽기가 그것을 키체인에 덮어쓴다.
+    /// 다른 바인딩의 파일은 건드리지 않는다.
+    #[test]
+    fn removing_token_files_clears_current_and_legacy_names_of_that_binding_only() {
+        let dir = std::env::temp_dir().join(format!("brv-token-files-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = Binding {
+            org: Some("personal".into()),
+            ..binding("macbookmc", "saju-engine")
+        };
+        let current = dir.join("token-personal-macbookmc");
+        let legacy = dir.join("token-macbookmc");
+        let other = dir.join("token-personal-brvmac");
+        std::fs::write(&current, "new-token").unwrap();
+        std::fs::write(&legacy, "old-token-from-before-the-re-enroll").unwrap();
+        std::fs::write(&other, "someone-else").unwrap();
+
+        remove_token_files_in(&dir, &mine);
+
+        assert!(!current.exists(), "the migrated file must be gone");
+        assert!(
+            !legacy.exists(),
+            "a legacy file left behind is migrated over the keychain entry on the next read"
+        );
+        assert!(
+            other.exists(),
+            "another binding's token must not be touched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn binding(agent: &str, channel: &str) -> Binding {
