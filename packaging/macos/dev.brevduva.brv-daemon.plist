@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Brevduva.app/Contents/Library/LaunchAgents/ 에 들어가는 서비스 정의 (2026-09-21, 시험용).
+  SMAppService가 이 파일을 등록한다 — 그래야 시스템 설정의 백그라운드 항목에 앱 이름
+  "Brevduva"로 표시된다 (~/Library/LaunchAgents의 plist는 AssociatedBundleIdentifiers를 넣어도
+  이름이 서명 개발자 이름으로 나온다 — 2026-09-21 맥북 실측).
+  서명된 묶음 안의 파일이라 사용자별 값(홈 경로·설치자 PATH·로그 경로)을 담을 수 없다 —
+  PATH는 고정 후보만 두고, 로그 경로는 두지 않는다 (제품 구현 때 데몬이 스스로 열어야 한다).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.brevduva.brv-daemon</string>
+  <key>BundleProgram</key><string>Contents/MacOS/brv</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>brv</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>

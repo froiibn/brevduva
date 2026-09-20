@@ -49,6 +49,13 @@ security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr 
 identity="$(security find-identity -v -p codesigning "$kc" | awk '/Developer ID Application/ {print $2; exit}')"
 test -n "$identity" || { echo "::error::Developer ID Application identity not found in the imported .p12"; exit 1; }
 
+# 묶음 안의 보조 실행 파일은 묶음보다 먼저 서명한다 (묶음 서명이 그것들을 봉인한다)
+if [ -d "$bin" ]; then
+  for extra in "$bin"/Contents/MacOS/*; do
+    [ "$(basename "$extra")" = "brv" ] && continue
+    codesign --force --sign "$identity" --options runtime --timestamp       --identifier "dev.brevduva.brv.$(basename "$extra")" "$extra"
+  done
+fi
 codesign --force --sign "$identity" --options runtime --timestamp --identifier dev.brevduva.brv "$bin"
 if [ -d "$bin" ]; then
   codesign --verify --deep --strict --verbose=2 "$bin"

@@ -28,7 +28,7 @@ jobs:
       - name: build
         run: cargo build --release --locked -p brv --target ${{ matrix.target }}
       - name: bundle (Brevduva.app)
-        run: bash .github/macos_bundle.sh "target/${{ matrix.target }}/release/brv" dist
+        run: bash .github/macos_bundle.sh "target/${{ matrix.target }}/release/brv" dist "${{ matrix.target }}"
       - name: sign + notarize + staple
         env:
           P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
