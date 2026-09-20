@@ -29,8 +29,12 @@ decode_secret() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9+/=' | base64 --d
 # 같은 이유로 글자 값(암호·Key ID·Issuer ID)은 끝의 CR·LF만 뗀다
 strip_eol() { local v="$1"; v="${v%$'\n'}"; v="${v%$'\r'}"; printf '%s' "$v"; }
 P12_PASSWORD="$(strip_eol "$P12_PASSWORD")"
-API_KEY_ID="$(strip_eol "$API_KEY_ID")"
-API_ISSUER_ID="$(strip_eol "$API_ISSUER_ID")"
+# 식별자는 허용 문자가 정해져 있다 — 앞에 붙은 BOM까지 걸러 내고, 그래도 형식이 틀리면 값은
+# 찍지 않고 글자 수만 알린다 (잘못된 값이 들어간 것 — Secret을 다시 넣어야 한다)
+API_KEY_ID="$(printf '%s' "$API_KEY_ID" | LC_ALL=C tr -cd 'A-Za-z0-9')"
+API_ISSUER_ID="$(printf '%s' "$API_ISSUER_ID" | LC_ALL=C tr -cd '0-9a-fA-F-')"
+[[ "$API_KEY_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "::error::APPLE_API_KEY_ID is not a 10-character key id (length ${#API_KEY_ID})"; exit 1; }
+[[ "$API_ISSUER_ID" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]] || { echo "::error::APPLE_API_ISSUER_ID is not a UUID (length ${#API_ISSUER_ID} after filtering, expected 36)"; exit 1; }
 
 decode_secret "$P12_BASE64" > "$RUNNER_TEMP/cert.p12"
 security create-keychain -p "$kc_pw" "$kc"
