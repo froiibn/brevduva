@@ -1,0 +1,46 @@
+# macOS 서명·공증 시험: 릴리스를 공개하지 않고 서명 경로만 돌린다 (2026-09-21).
+#
+# release.yml은 버전 태그에서만 돌고 끝에 latest로 공개한다 — 인증서·공증 키가 통하는지,
+# 서명된 빌드가 맥에서 어떻게 동작하는지(토큰 저장소가 키체인으로 바뀐다)를 공개 전에 보려면
+# 따로 돌릴 길이 필요하다. 산출물은 실행 아티팩트로만 남는다 — 맥 실기 확인용.
+name: macos-sign-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: ${{ matrix.target }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v5
+      - name: target 추가
+        run: rustup target add ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked -p brv --target ${{ matrix.target }}
+      - name: sign + notarize
+        env:
+          P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: bash .github/macos_sign.sh "target/${{ matrix.target }}/release/brv"
+      - name: package
+        run: |
+          mkdir stage
+          cp "target/${{ matrix.target }}/release/brv" LICENSE stage/
+          tar -czf "brv-${{ matrix.target }}-signed-trial.tar.gz" -C stage .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brv-${{ matrix.target }}-signed-trial
+          path: brv-${{ matrix.target }}-signed-trial.tar.gz
+          if-no-files-found: error
+          retention-days: 7

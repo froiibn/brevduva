@@ -48,6 +48,9 @@ jobs:
             target: aarch64-unknown-linux-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+    env:
+      # secrets 컨텍스트는 step의 if에서 못 쓴다 — env로 옮겨 조건에 쓴다
+      MACOS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -66,6 +69,24 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: build
         run: cargo build --release --locked -p brv --target ${{ matrix.target }}
+
+      # macOS: Developer ID 서명 + 공증 (.github/macos_sign.sh). Secrets가 없는 포크는 건너뛰고
+      # 애드혹 서명 그대로 묶는다. 본 리포에서 빠지면 실패시킨다 — 서명 릴리스 뒤에 미서명
+      # 릴리스가 나가면 맥의 토큰 저장소가 키체인에서 파일로 되돌아가기 때문이다.
+      - name: 서명 Secrets 확인 (macOS)
+        if: runner.os == 'macOS' && env.MACOS_SIGNING != 'true' && github.repository == 'froiibn/brevduva'
+        run: |
+          echo "::error::macOS signing secrets are missing"
+          exit 1
+      - name: sign + notarize (macOS)
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: bash .github/macos_sign.sh "target/${{ matrix.target }}/release/brv"
 
       - name: package (unix)
         if: runner.os != 'Windows'
