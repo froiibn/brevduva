@@ -73,6 +73,14 @@ jobs:
           mkdir stage
           cp "target/${{ matrix.target }}/release/brv" LICENSE stage/
           tar -czf "brv-${{ matrix.target }}.tar.gz" -C stage .
+      # build.rs는 리소스 컴파일러가 없어도 빌드를 막지 않는다 — 릴리스 exe에서 빠진 것은 여기서 잡는다
+      - name: 아이콘·버전 정보 확인 (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $info = (Get-Item "target/${{ matrix.target }}/release/brv.exe").VersionInfo
+          if ($info.ProductName -ne 'Brevduva') { throw "windows resources missing from brv.exe" }
+
       - name: package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
