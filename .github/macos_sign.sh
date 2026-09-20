@@ -23,7 +23,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+# Secret은 base64 문자만 걸러서 푼다 — 윈도우 PowerShell에서 `… | gh secret set`으로 넣으면 끝에 CR(LF),
+# 환경에 따라 앞에 BOM이 붙고 macOS base64는 그런 바이트에서 거부한다 (2026-09-21 첫 시험 실행에서 실측)
+decode_secret() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9+/=' | base64 --decode; }
+# 같은 이유로 글자 값(암호·Key ID·Issuer ID)은 끝의 CR·LF만 뗀다
+strip_eol() { local v="$1"; v="${v%$'\n'}"; v="${v%$'\r'}"; printf '%s' "$v"; }
+P12_PASSWORD="$(strip_eol "$P12_PASSWORD")"
+API_KEY_ID="$(strip_eol "$API_KEY_ID")"
+API_ISSUER_ID="$(strip_eol "$API_ISSUER_ID")"
+
+decode_secret "$P12_BASE64" > "$RUNNER_TEMP/cert.p12"
 security create-keychain -p "$kc_pw" "$kc"
 security set-keychain-settings -lut 21600 "$kc"
 security unlock-keychain -p "$kc_pw" "$kc"
@@ -38,7 +47,7 @@ codesign --force --sign "$identity" --options runtime --timestamp --identifier d
 codesign --verify --strict --verbose=2 "$bin"
 codesign -dv "$bin" 2>&1 | grep -E "^(Identifier|TeamIdentifier|Authority|Timestamp|flags)" || true
 
-echo "$API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+decode_secret "$API_KEY_P8_BASE64" > "$RUNNER_TEMP/AuthKey.p8"
 ditto -c -k "$bin" "$RUNNER_TEMP/brv-notarize.zip"
 # notarytool은 거절(Invalid)에도 0으로 끝날 수 있다 — 상태를 직접 확인하고, 거절이면 사유 로그를 남긴다
 xcrun notarytool submit "$RUNNER_TEMP/brv-notarize.zip" \
