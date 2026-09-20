@@ -3,6 +3,8 @@
 # release.yml은 버전 태그에서만 돌고 끝에 latest로 공개한다 — 인증서·공증 키가 통하는지,
 # 서명된 빌드가 맥에서 어떻게 동작하는지(토큰 저장소가 키체인으로 바뀐다)를 공개 전에 보려면
 # 따로 돌릴 길이 필요하다. 산출물은 실행 아티팩트로만 남는다 — 맥 실기 확인용.
+# 산출물은 Brevduva.app 묶음이다 (2026-09-21 — 시스템 설정에 개발자 이름 대신 "Brevduva"로
+# 표시되게 하는 설치 형태의 실측용). release.yml은 그 실측과 제품 쪽 구현이 끝날 때까지 단독 실행 파일을 낸다.
 name: macos-sign-check
 
 on:
@@ -25,22 +27,21 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: build
         run: cargo build --release --locked -p brv --target ${{ matrix.target }}
-      - name: sign + notarize
+      - name: bundle (Brevduva.app)
+        run: bash .github/macos_bundle.sh "target/${{ matrix.target }}/release/brv" dist
+      - name: sign + notarize + staple
         env:
           P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
           API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
           API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-        run: bash .github/macos_sign.sh "target/${{ matrix.target }}/release/brv"
+        run: bash .github/macos_sign.sh dist/Brevduva.app
       - name: package
-        run: |
-          mkdir stage
-          cp "target/${{ matrix.target }}/release/brv" LICENSE stage/
-          tar -czf "brv-${{ matrix.target }}-signed-trial.tar.gz" -C stage .
+        run: tar -czf "Brevduva-${{ matrix.target }}-app-trial.tar.gz" -C dist Brevduva.app
       - uses: actions/upload-artifact@v4
         with:
-          name: brv-${{ matrix.target }}-signed-trial
-          path: brv-${{ matrix.target }}-signed-trial.tar.gz
+          name: Brevduva-${{ matrix.target }}-app-trial
+          path: Brevduva-${{ matrix.target }}-app-trial.tar.gz
           if-no-files-found: error
           retention-days: 7

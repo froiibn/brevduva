@@ -2,14 +2,16 @@
 # Copyright 2026 SEIZIA (Jaeyoung Ko)
 # SPDX-License-Identifier: Apache-2.0
 #
-# macOS 실행 파일을 Developer ID로 서명하고 Apple 공증을 받는다 (2026-09-21).
+# macOS 실행 파일 또는 앱 묶음(.app)을 Developer ID로 서명하고 Apple 공증을 받는다 (2026-09-21).
 # Gatekeeper의 "확인되지 않은 개발자" 차단을 없앤다. release.yml과 macos-sign-check.yml이 같이 쓴다.
 #
-#   .github/macos_sign.sh <실행 파일 경로>
+#   .github/macos_sign.sh <실행 파일 경로 | Brevduva.app 경로>
 #
 # 환경변수(전부 GitHub Secrets에서): P12_BASE64 P12_PASSWORD API_KEY_P8_BASE64 API_KEY_ID API_ISSUER_ID
 #
-# - 맨 실행 파일에는 공증 티켓을 붙일(staple) 수 없다 — Gatekeeper가 첫 실행 때 온라인으로 조회한다
+# - 맨 실행 파일에는 공증 티켓을 붙일(staple) 수 없다 — Gatekeeper가 첫 실행 때 온라인으로 조회한다.
+#   앱 묶음에는 붙인다 — 오프라인에서도 검증된다
+# - 서명 식별자는 둘 다 dev.brevduva.brv — 키체인 항목의 접근 허용이 이 식별자에 묶여 있다
 # - 서명된 빌드는 TeamIdentifier를 가지므로 brv의 토큰 주 저장소가 키체인으로 바뀐다
 #   (crates/brv/src/config.rs keychain_is_reliable)
 set -euo pipefail
@@ -48,11 +50,19 @@ identity="$(security find-identity -v -p codesigning "$kc" | awk '/Developer ID 
 test -n "$identity" || { echo "::error::Developer ID Application identity not found in the imported .p12"; exit 1; }
 
 codesign --force --sign "$identity" --options runtime --timestamp --identifier dev.brevduva.brv "$bin"
-codesign --verify --strict --verbose=2 "$bin"
+if [ -d "$bin" ]; then
+  codesign --verify --deep --strict --verbose=2 "$bin"
+else
+  codesign --verify --strict --verbose=2 "$bin"
+fi
 codesign -dv "$bin" 2>&1 | grep -E "^(Identifier|TeamIdentifier|Authority|Timestamp|flags)" || true
 
 decode_secret "$API_KEY_P8_BASE64" > "$RUNNER_TEMP/AuthKey.p8"
-ditto -c -k "$bin" "$RUNNER_TEMP/brv-notarize.zip"
+if [ -d "$bin" ]; then
+  ditto -c -k --keepParent "$bin" "$RUNNER_TEMP/brv-notarize.zip"
+else
+  ditto -c -k "$bin" "$RUNNER_TEMP/brv-notarize.zip"
+fi
 # notarytool은 거절(Invalid)에도 0으로 끝날 수 있다 — 상태를 직접 확인하고, 거절이면 사유 로그를 남긴다
 xcrun notarytool submit "$RUNNER_TEMP/brv-notarize.zip" \
   --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
@@ -62,4 +72,9 @@ if [ "$(jq -r .status "$RUNNER_TEMP/notary.json")" != "Accepted" ]; then
     --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" || true
   echo "::error::notarization was not accepted"
   exit 1
+fi
+if [ -d "$bin" ]; then
+  xcrun stapler staple "$bin"
+  xcrun stapler validate "$bin"
+  spctl -a -vv "$bin" || true
 fi

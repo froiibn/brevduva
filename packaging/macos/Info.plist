@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Brevduva.app — brv를 담는 macOS 앱 묶음 (2026-09-21).
+  단독 실행 파일은 이름을 담을 자리가 없어 시스템 설정에 인증서의 개발자 이름으로 표시된다.
+  앱 묶음 안에 두면 macOS가 백그라운드 항목·권한 창에 "Brevduva"와 아이콘을 쓴다.
+  CFBundleIdentifier는 단독 실행 파일 시절의 서명 식별자와 같아야 한다 — 키체인 항목의
+  접근 허용이 그 식별자에 묶여 있다. __VERSION__은 .github/macos_bundle.sh가 채운다.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIdentifier</key><string>dev.brevduva.brv</string>
+  <key>CFBundleName</key><string>Brevduva</string>
+  <key>CFBundleDisplayName</key><string>Brevduva</string>
+  <key>CFBundleExecutable</key><string>brv</string>
+  <key>CFBundleIconFile</key><string>Brevduva</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+  <key>CFBundleVersion</key><string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHumanReadableCopyright</key><string>Copyright 2026 SEIZIA (Jaeyoung Ko). Apache-2.0.</string>
+</dict>
+</plist>
