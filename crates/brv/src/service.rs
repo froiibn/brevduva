@@ -482,6 +482,10 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     // 앱 묶음 설치: SMAppService로 등록한다. 같은 이름의 옛 방식 등록이 남아 있으면 먼저 내린다 —
     // 둘이 동시에 있으면 launchd가 어느 쪽을 띄울지 알 수 없고 시스템 설정에는 개발자 이름이 남는다
     let legacy = remove_legacy_registration();
+    // 이미 새 방식으로 돌고 있었는가 — 그러면 등록은 아무것도 다시 띄우지 않아 방금 적은 표지(PATH·프로필)가
+    // 다음 재기동까지 적용되지 않는다 (2026-09-22 맥북 실측). 옛 방식 install은 내렸다 올려서 바로 적용됐다
+    let already_running = legacy.is_none()
+        && crate::macos_bundle::status(&helper) == crate::macos_bundle::HelperStatus::Enabled;
     if let Err(e) = crate::macos_bundle::register(
         &helper,
         &crate::macos_bundle::ServiceEnv {
@@ -491,6 +495,9 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     ) {
         restore_legacy_registration(legacy);
         return Err(e);
+    }
+    if already_running {
+        kickstart()?;
     }
     println!(
         "registered: Brevduva background service {LAUNCHD_LABEL} (starts at login, logs: ~/Library/Logs/brv-daemon.log)"
