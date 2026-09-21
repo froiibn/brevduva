@@ -9,6 +9,12 @@
 # 설치 경로가 PATH에 없으면 셸 설정에 마커 달린 한 줄을 추가한다
 # (BRV_NO_MODIFY_PATH=1 로 거부 가능 — 그때는 안내만 출력). 그 외에는 건드리지 않는다.
 #
+# macOS (2026-09-22): 릴리스 자산이 앱 묶음 Brevduva.app이면 그것을
+# ~/Library/Application Support/brevduva/ 에 두고(BRV_APP_DIR로 변경 가능) ~/.local/bin/brv는 묶음 안
+# 실행 파일로 가는 심볼릭 링크로 만든다. 이유: 서명한 단독 실행 파일은 시스템 설정의 백그라운드 항목에
+# 개발자 이름으로 나오고, 앱 묶음 안의 서비스를 macOS의 등록 API로 올려야 "Brevduva"로 나온다
+# (crates/brv/src/macos_bundle.rs). 서비스 등록의 이전은 아래 `brv daemon restart`가 한다.
+#
 # 진행 표시 (2026-09-05, 사용자 지적 "텍스트만 나와서 설치 중에 멈춘 것처럼 보인다"): 터미널이면
 # 단계 진척률 막대 + 지금 하는 일을 한 줄로 갱신하고, 다운로드는 받은 양/전체와 초당 속도를 보인다.
 # 터미널이 아니면(CI·로그 파이프) 단계마다 한 줄씩만 남긴다. 막대는 stderr, 결과 메시지는 stdout.
@@ -137,8 +143,31 @@ line "checksum verified"
 step "installing to $dest"
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$dest"
-install -m 755 "$tmp/brv" "$dest/brv"
-line "installed: $dest/brv — $("$dest/brv" --version)"
+if [ -d "$tmp/Brevduva.app" ]; then
+  # macOS 앱 묶음. 갱신은 묶음째 교체다 — 서명으로 봉인된 묶음 안의 파일을 하나씩 바꾸면 서명이 깨진다.
+  # 새 묶음을 옆에 다 놓은 뒤 이름만 바꾼다: 돌고 있는 데몬은 옛 파일을 끝까지 쓰고(제자리 덮어쓰기는
+  # macOS가 실행 중인 프로세스를 강제 종료시킨다 — 2026-09-21 실측 OS_REASON_CODESIGNING), 아래 재기동에서 새 것이 뜬다
+  appdir="${BRV_APP_DIR:-$HOME/Library/Application Support/brevduva}"
+  app="$appdir/Brevduva.app"
+  if command -v codesign > /dev/null 2>&1; then
+    codesign --verify --deep --strict "$tmp/Brevduva.app" || { echo "the downloaded app failed signature verification" >&2; exit 1; }
+  fi
+  mkdir -p "$appdir"
+  rm -rf "$appdir/Brevduva.app.new" "$appdir"/Brevduva.app.old.*
+  mv "$tmp/Brevduva.app" "$appdir/Brevduva.app.new"
+  if [ -e "$app" ]; then mv "$app" "$appdir/Brevduva.app.old.$$"; fi
+  mv "$appdir/Brevduva.app.new" "$app"
+  rm -rf "$appdir"/Brevduva.app.old.*
+  # 종전 설치의 단독 실행 파일이 이 자리에 있으면 링크로 바뀐다 (ln -f가 지우고 만든다)
+  ln -sfn "$app/Contents/MacOS/brv" "$dest/brv"
+  line "installed: $app (brv → $dest/brv) — $("$dest/brv" --version)"
+else
+  # 단독 실행 파일 자산. 이 자리가 앱 묶음 안으로 가는 링크면 먼저 지운다 — install이 링크를 따라가
+  # 서명으로 봉인된 묶음 안의 파일을 덮어쓰면 그 묶음은 실행이 막힌다
+  if [ -L "$dest/brv" ]; then rm -f "$dest/brv"; fi
+  install -m 755 "$tmp/brv" "$dest/brv"
+  line "installed: $dest/brv — $("$dest/brv" --version)"
+fi
 
 # PATH 자동 등록 (2026-09-02, 실측 UX: 새 서버 첫 설치마다 수동 추가를 요구하던 것을 흡수).
 # rustup/uv 관행을 따른다: 마커 달린 한 줄을 셸 설정에 추가, 이미 있으면 건너뜀(멱등).

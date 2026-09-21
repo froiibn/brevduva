@@ -5,6 +5,8 @@
 # 리눅스는 musl 정적 링크 — 배포 대상의 glibc 버전에 의존하지 않는다.
 # aarch64 리눅스는 공개 리포 무료 arm64 러너로 네이티브 빌드 (크로스 컴파일 배제).
 # macOS x86_64만 arm 러너에서 크로스 (Intel 러너 은퇴 대비 — SDK가 양쪽 아치를 지원).
+# macOS 자산의 내용물은 앱 묶음 Brevduva.app이다 (2026-09-22) — 단독 실행 파일은 서명해도 시스템 설정에
+# 개발자 이름으로 나온다. 자산 이름은 그대로라 install.sh의 고정 URL과 검증 목록이 바뀌지 않는다.
 name: release
 
 on:
@@ -70,8 +72,12 @@ jobs:
       - name: build
         run: cargo build --release --locked -p brv --target ${{ matrix.target }}
 
-      # macOS: Developer ID 서명 + 공증 (.github/macos_sign.sh). Secrets가 없는 포크는 건너뛰고
-      # 애드혹 서명 그대로 묶는다. 본 리포에서 빠지면 실패시킨다 — 서명 릴리스 뒤에 미서명
+      - name: bundle (macOS — Brevduva.app)
+        if: runner.os == 'macOS'
+        run: bash .github/macos_bundle.sh "target/${{ matrix.target }}/release/brv" dist "${{ matrix.target }}"
+
+      # macOS: Developer ID 서명 + 공증 + 증명 첨부 (.github/macos_sign.sh). Secrets가 없는 포크는 건너뛰고
+      # 서명 없는 묶음 그대로 묶는다 (그 묶음은 SMAppService 등록이 거부될 수 있고, brv는 옛 방식으로 등록한다). 본 리포에서 빠지면 실패시킨다 — 서명 릴리스 뒤에 미서명
       # 릴리스가 나가면 맥의 토큰 저장소가 키체인에서 파일로 되돌아가기 때문이다.
       - name: 서명 Secrets 확인 (macOS)
         if: runner.os == 'macOS' && env.MACOS_SIGNING != 'true' && github.repository == 'froiibn/brevduva'
@@ -86,10 +92,13 @@ jobs:
           API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
           API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-        run: bash .github/macos_sign.sh "target/${{ matrix.target }}/release/brv"
+        run: bash .github/macos_sign.sh dist/Brevduva.app
 
-      - name: package (unix)
-        if: runner.os != 'Windows'
+      - name: package (macOS)
+        if: runner.os == 'macOS'
+        run: tar -czf "brv-${{ matrix.target }}.tar.gz" -C dist Brevduva.app
+      - name: package (linux)
+        if: runner.os == 'Linux'
         run: |
           mkdir stage
           cp "target/${{ matrix.target }}/release/brv" LICENSE stage/

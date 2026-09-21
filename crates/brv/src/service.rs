@@ -493,8 +493,16 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
             config: config.map(str::to_owned),
         },
     ) {
-        restore_legacy_registration(legacy);
-        return Err(e);
+        if legacy.is_some() {
+            restore_legacy_registration(legacy);
+            return Err(e);
+        }
+        // 되살릴 옛 등록도 없다 — 서비스가 아예 없는 머신으로 두지 않는다 (P1: 리시버는 OS 서비스로 상주).
+        // 옛 방식으로라도 등록하고, 표시가 개발자 이름으로 나온다는 것과 이유를 알린다
+        eprintln!(
+            "warning: {e:#} — registering the receiver the older way instead (System Settings will list it under the developer's name)"
+        );
+        return install_legacy(config);
     }
     if already_running {
         kickstart()?;
