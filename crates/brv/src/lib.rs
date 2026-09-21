@@ -20,6 +20,7 @@ pub mod enroll;
 mod file_lock;
 pub mod hook;
 pub mod local_plane;
+pub mod macos_bundle;
 pub mod manage;
 pub mod mcp;
 pub mod runners;

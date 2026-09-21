@@ -328,6 +328,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // macOS 앱 묶음 설치 (2026-09-22): launchd가 SMAppService 등록으로 띄운 데몬은 봉인된 plist에서
+    // PATH·프로필·로그 경로를 받지 못한다 — 표지 파일의 값을 입고 같은 pid로 다시 실행된다.
+    // 런타임·스레드가 생기기 전에 한다 (위 윈도우 서비스 모드와 같은 이유). 해당 없으면 그냥 지나간다
+    if matches!(&cli.cmd, Cmd::Daemon { action: None, .. }) {
+        brv::macos_bundle::adopt_service_env();
+    }
+
     // stdout은 MCP 프로토콜 전용일 수 있다 — 로그는 항상 stderr로
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

@@ -8,7 +8,10 @@
 //! 선택은 `--config`로.
 //!
 //! - Linux: systemd 사용자 유닛 + `loginctl enable-linger`(부팅 시 로그인 없이 기동)
-//! - macOS: LaunchAgent (로그인 시 기동 + KeepAlive)
+//! - macOS: LaunchAgent (로그인 시 기동 + KeepAlive). 등록 길은 둘 (2026-09-22): brv가 앱 묶음
+//!   `Brevduva.app` 안에서 실행되면 **SMAppService**(묶음 안 plist — 시스템 설정에 "Brevduva"로
+//!   표시된다), 단독 실행 파일이거나 macOS 13 미만이면 옛 방식(`~/Library/LaunchAgents`의 plist —
+//!   서명 개발자 이름으로 표시된다). 근거와 실측은 macos_bundle.rs
 //! - Windows: SCM 진짜 서비스, **LocalSystem** (2026-09-03 사용자 확정 "리시버는 전달자일 뿐" —
 //!   종전의 사용자 계정 서비스는 암호 입력이 필수라 무암호 상주가 불가능했다). 듣기는 시스템
 //!   계정이, 깨우기는 로그온한 사용자의 토큰을 빌려 그 사용자 명의로 (winspawn.rs — 백신·
@@ -217,11 +220,22 @@ fn registration() -> Option<Option<String>> {
 
 #[cfg(target_os = "macos")]
 fn registration() -> Option<Option<String>> {
-    let plist = dirs::home_dir()?
-        .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
-    let text = std::fs::read_to_string(plist).ok()?;
-    Some(config_from_plist(&text))
+    // 옛 방식 plist가 있으면 그것이 진실, 없으면 SMAppService 등록의 표지 파일 (macos_bundle.rs).
+    // 이 함수는 모든 CLI 명령의 설정 경로 해석에 쓰인다 — 프로세스를 띄우지 않고 파일만 본다
+    if let Ok(text) = std::fs::read_to_string(legacy_plist()?) {
+        return Some(config_from_plist(&text));
+    }
+    crate::macos_bundle::read_marker().map(|env| env.config)
+}
+
+/// 옛 방식 등록 파일 — `~/Library/LaunchAgents/dev.brevduva.brv-daemon.plist`.
+#[cfg(target_os = "macos")]
+fn legacy_plist() -> Option<std::path::PathBuf> {
+    Some(
+        dirs::home_dir()?
+            .join("Library/LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist")),
+    )
 }
 
 #[cfg(windows)]
@@ -254,12 +268,12 @@ fn registration_exe() -> Option<std::path::PathBuf> {
     exe_from_unit(&std::fs::read_to_string(unit).ok()?).map(std::path::PathBuf::from)
 }
 
+/// 옛 방식 plist의 실행 파일만 돌려준다. SMAppService 등록(앱 묶음)은 None — [`align_binary`]가
+/// **서명으로 봉인된 묶음 안에 파일을 복사해 넣으면 서명이 깨져** macOS가 실행을 막는다. 묶음의
+/// 갱신은 설치기가 묶음째 교체하는 것이 유일한 길이다.
 #[cfg(target_os = "macos")]
 fn registration_exe() -> Option<std::path::PathBuf> {
-    let plist = dirs::home_dir()?
-        .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
-    exe_from_plist(&std::fs::read_to_string(plist).ok()?).map(std::path::PathBuf::from)
+    exe_from_plist(&std::fs::read_to_string(legacy_plist()?).ok()?).map(std::path::PathBuf::from)
 }
 
 #[cfg(windows)]
@@ -457,12 +471,88 @@ pub fn restart() -> anyhow::Result<bool> {
 // ---------------------------------------------------------------- macOS: LaunchAgent
 
 #[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "dev.brevduva.brv-daemon";
+use crate::macos_bundle::LAUNCHD_LABEL;
 
 #[cfg(target_os = "macos")]
 pub fn install(config: Option<&str>) -> anyhow::Result<()> {
-    use anyhow::Context as _;
     let config = require_absolute(config)?;
+    let Some(helper) = crate::macos_bundle::bundled_helper() else {
+        return install_legacy(config);
+    };
+    // 앱 묶음 설치: SMAppService로 등록한다. 같은 이름의 옛 방식 등록이 남아 있으면 먼저 내린다 —
+    // 둘이 동시에 있으면 launchd가 어느 쪽을 띄울지 알 수 없고 시스템 설정에는 개발자 이름이 남는다
+    let legacy = remove_legacy_registration();
+    if let Err(e) = crate::macos_bundle::register(
+        &helper,
+        &crate::macos_bundle::ServiceEnv {
+            path: std::env::var("PATH").ok(),
+            config: config.map(str::to_owned),
+        },
+    ) {
+        restore_legacy_registration(legacy);
+        return Err(e);
+    }
+    println!(
+        "registered: Brevduva background service {LAUNCHD_LABEL} (starts at login, logs: ~/Library/Logs/brv-daemon.log)"
+    );
+    Ok(())
+}
+
+/// 옛 방식 등록을 내리고 plist를 지운다 (없으면 아무 일도 없다). 지운 plist의 내용을 돌려준다 —
+/// 새 방식 등록이 실패하면 [`restore_legacy_registration`]이 되살린다.
+#[cfg(target_os = "macos")]
+fn remove_legacy_registration() -> Option<String> {
+    let plist = legacy_plist().filter(|p| p.exists())?;
+    let text = std::fs::read_to_string(&plist).ok();
+    if let Ok(uid) = launchd_uid() {
+        let _ = run_cmd(
+            "launchctl",
+            &["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
+        );
+    }
+    if let Err(e) = std::fs::remove_file(&plist) {
+        eprintln!("warning: could not remove the old registration {plist:?}: {e}");
+    }
+    text
+}
+
+/// 새 방식 등록이 실패했을 때 옛 방식 등록을 되살린다 — 이전 도중의 실패가 "서비스가 아예 없는 머신"을
+/// 남기면 안 된다 (메시지를 받을 곳이 사라진다). 되살리기까지 실패하면 사용자가 알아야 한다.
+#[cfg(target_os = "macos")]
+fn restore_legacy_registration(text: Option<String>) {
+    let (Some(text), Some(plist)) = (text, legacy_plist()) else {
+        return;
+    };
+    let restored = std::fs::write(&plist, text)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| launchd_uid())
+        .and_then(|uid| {
+            run_cmd(
+                "launchctl",
+                &["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()],
+            )
+        });
+    match restored {
+        Ok(()) => eprintln!("kept the previous background service registration"),
+        Err(e) => eprintln!(
+            "warning: the previous registration could not be restored ({e:#}) — run `brv daemon install`"
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_uid() -> anyhow::Result<String> {
+    Ok(
+        String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// 옛 방식: `~/Library/LaunchAgents`에 plist를 쓴다 — 단독 실행 파일 설치와 macOS 13 미만.
+#[cfg(target_os = "macos")]
+fn install_legacy(config: Option<&str>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     let exe = std::env::current_exe()?;
     let home = dirs::home_dir().context("cannot resolve home dir")?;
     let log = home.join("Library/Logs/brv-daemon.log");
@@ -505,9 +595,7 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let plist_path = dir.join(format!("{LAUNCHD_LABEL}.plist"));
     std::fs::write(&plist_path, plist)?;
-    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
-        .trim()
-        .to_owned();
+    let uid = launchd_uid()?;
     // 이미 로드돼 있으면 bootstrap이 거부한다 — 먼저 내리고(실패 무시) 다시 올린다
     let _ = run_cmd(
         "launchctl",
@@ -530,44 +618,67 @@ pub fn install(config: Option<&str>) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn uninstall() -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
-        .trim()
-        .to_owned();
-    let _ = run_cmd(
-        "launchctl",
-        &["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
-    );
-    let plist = dirs::home_dir()
-        .context("cannot resolve home dir")?
-        .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
-    if plist.exists() {
-        std::fs::remove_file(&plist)?;
+    // 두 등록 길을 다 내린다 — 어느 쪽으로 등록됐든 남는 것이 없어야 한다
+    if let Some(helper) = crate::macos_bundle::bundled_helper() {
+        crate::macos_bundle::unregister(&helper);
     }
+    let _ = remove_legacy_registration();
     println!("unregistered: {LAUNCHD_LABEL}");
     Ok(())
 }
 
 /// 등록된 LaunchAgent 재기동 — `kickstart -k`는 돌고 있으면 죽이고 다시 띄운다 (linux restart 참조).
+///
+/// 설치기는 갱신 뒤 이 명령 하나만 부른다. 그래서 **단독 실행 파일 → 앱 묶음 갱신의 등록 이전도
+/// 여기서 끝낸다** (2026-09-22, 수칙 8·9): 묶음 안에서 실행됐는데 옛 방식 plist가 남아 있으면 그
+/// plist의 PATH·프로필을 이어받아 SMAppService로 다시 등록하고 plist를 지운다.
 #[cfg(target_os = "macos")]
 pub fn restart() -> anyhow::Result<bool> {
-    use anyhow::Context as _;
-    let plist = dirs::home_dir()
-        .context("cannot resolve home dir")?
-        .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
-    if !plist.exists() {
+    use crate::macos_bundle::{self as bundle, HelperStatus};
+    let legacy = legacy_plist().filter(|p| p.exists());
+    let Some(helper) = bundle::bundled_helper() else {
+        // 단독 실행 파일 (또는 macOS 13 미만): 옛 방식 그대로
+        if legacy.is_none() {
+            return Ok(false);
+        }
+        kickstart()?;
+        return Ok(true);
+    };
+    if let Some(plist) = legacy {
+        let text = std::fs::read_to_string(&plist).unwrap_or_default();
+        let env = bundle::ServiceEnv {
+            path: bundle::env_from_plist(&text, "PATH"),
+            config: config_from_plist(&text),
+        };
+        let removed = remove_legacy_registration();
+        // 등록하면 launchd가 바로 띄운다 — kickstart는 필요 없다
+        if let Err(e) = bundle::register(&helper, &env) {
+            restore_legacy_registration(removed);
+            return Err(e);
+        }
+        println!("moved the background service registration into Brevduva.app");
+        return Ok(true);
+    }
+    if bundle::read_marker().is_none() {
         return Ok(false);
     }
-    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
-        .trim()
-        .to_owned();
+    // 묶음이 통째로 교체된 뒤 macOS가 등록을 놓았을 수 있다 — 상태를 보고 필요하면 다시 등록한다
+    if bundle::status(&helper) != HelperStatus::Enabled {
+        let env = bundle::read_marker().unwrap_or_default();
+        bundle::register(&helper, &env)?;
+        return Ok(true);
+    }
+    kickstart()?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn kickstart() -> anyhow::Result<()> {
+    let uid = launchd_uid()?;
     run_cmd(
         "launchctl",
         &["kickstart", "-k", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
-    )?;
-    Ok(true)
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

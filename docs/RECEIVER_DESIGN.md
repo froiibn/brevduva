@@ -313,6 +313,20 @@ Copyright 2026 SEIZIA (Jaeyoung Ko). SPDX-License-Identifier: Apache-2.0
   새 바이너리로 맞춘다(2026-09-04 결정 유지). 세션 어댑터는 얇아서 갱신 대상이 아니거나, 서비스와
   버전 악수를 해서 옛 어댑터가 서버와 대화하는 일이 없다.
 - 갱신 잔재(`.old` 등)는 서비스가 기동 시 스스로 치운다. 설치 위치는 하나다.
+- **macOS 설치 형태 (2026-09-22)**: brv는 앱 묶음 `Brevduva.app` 안에 들어가고(`Contents/MacOS/brv`),
+  서비스는 묶음 안 `Contents/Library/LaunchAgents`의 정의를 **SMAppService**로 등록한다 — 여전히
+  launchd LaunchAgent다(P1·P9 그대로). 터미널의 `brv`는 묶음 안 실행 파일을 가리키는 심볼릭 링크.
+  근거(2026-09-21 맥북 실측): 서명한 단독 실행 파일을 `~/Library/LaunchAgents` plist로 등록하면 시스템
+  설정의 백그라운드 항목에 프로그램 이름이 아니라 인증서의 개발자 이름이 나온다 — 묶음 안에 넣어도,
+  `AssociatedBundleIdentifiers`를 넣어도(아이콘만 따라온다), `~/Applications`로 옮겨도 같았고,
+  SMAppService 등록만 "Brevduva"로 유지됐다(Apple이 macOS 13부터 plist 설치의 대체로 제공하는 정식
+  경로). 권한 목록(TCC)·공증 증명 첨부도 묶음이어야 제 이름으로 된다. 함의: ① 묶음 안 정의는 서명으로
+  봉인돼 사용자별 값(설치자 PATH·프로필·로그 경로)을 못 담는다 → 설정 폴더의 표지 파일
+  `launchd-service.toml`에 적고, launchd가 띄운 데몬이 그 값을 입고 같은 pid로 다시 실행된다 ② 갱신은
+  **묶음째 교체**다 — 봉인된 묶음 안에 파일을 복사해 넣지 않는다(`align_binary` 대상 아님) ③ 단독 설치에서
+  갱신하면 `brv daemon restart`가 옛 plist의 PATH·프로필을 이어받아 새 방식으로 옮기고 plist를 지운다,
+  새 등록이 실패하면 옛 등록을 되살린다 ④ 등록 API는 Swift·Objective-C 전용이라 묶음 안의 작은 도구
+  (`brevduva-service`)가 호출한다 ⑤ macOS 13 미만과 단독 실행 파일은 옛 방식 그대로. 코드: macos_bundle.rs.
 - 근거: Windows는 실행 중 exe를 덮어쓸 수 없어 옛 파일을 비켜 두고, macOS·Linux는 덮어써도 뜬
   프로세스가 옛 inode를 계속 쓴다. 세 OS 모두 "이미 뜬 어댑터는 옛 코드"다. 러너가 띄운 어댑터의
   수명은 러너가 쥐고 있어 설치기가 재기동할 수 없다.
