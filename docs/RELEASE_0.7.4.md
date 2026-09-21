@@ -24,6 +24,8 @@ macOS에서 알아 둘 것:
 
 ## 검증
 
-공개 시험·fmt/clippy는 Ubuntu·Windows·macOS CI에서 통과(토큰 파일 정리, 앱 묶음 판별·등록 도구 출력 해석·옛 plist 값 승계·표지 파일 회귀 시험 추가). macOS 실기(arm64, macOS 26.6): Safari로 받은 서명판의 Gatekeeper 통과, 토큰 파일 3개의 키체인 이전, `daemon install`·`restart`·`uninstall`, 옛 plist 등록에서 `brv daemon restart` 한 번으로의 이전, 설치 한 줄 시나리오(지금 상태 위 갱신 / 0.7.3 단독 설치 상태에서 갱신 / 재실행 멱등), 시스템 설정 표시 "Brevduva". 미검증: 재부팅 뒤 등록 유지, 백그라운드 항목 토글 끄기·켜기, Intel 맥.
+공개 시험·fmt/clippy는 Ubuntu·Windows·macOS CI에서 통과(토큰 파일 정리, 앱 묶음 판별·등록 도구 출력 해석·옛 plist 값 승계·표지 파일 회귀 시험 추가). macOS 실기(arm64, macOS 26.6): Safari로 받은 서명판의 Gatekeeper 통과, 토큰 파일 3개의 키체인 이전, `daemon install`·`restart`·`uninstall`, 옛 plist 등록에서 `brv daemon restart` 한 번으로의 이전, 설치 한 줄 시나리오(지금 상태 위 갱신 / 0.7.3 단독 설치 상태에서 갱신 / 재실행 멱등), 시스템 설정 표시 "Brevduva". 미검증: 백그라운드 항목 토글 끄기·켜기, Intel 맥.
+
+릴리스 뒤 확인(2026-09-22): 공식 한 줄로 설치한 0.7.4 맥북을 재부팅한 뒤 로그인하자 리시버가 백그라운드에서 스스로 떠서 정상 동작했다 — 릴리스 시점에 미검증이던 "재부팅 뒤 등록 유지"가 확인됐다(사용자 보고).
 
 설치: https://brevduva.dev/install.sh 또는 https://brevduva.dev/install.ps1
