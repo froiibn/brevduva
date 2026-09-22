@@ -158,7 +158,7 @@ wake_args = ["-p", "{prompt}", "--allowedTools", "mcp__brevduva__*"]  # 이 바�
 - 무인 세션 안에서 `brv wake set`·`binding`·`init`·`daemon`이 "refused … unattended session"으로 거부된다: 의도된 동작 — 원격 메시지가 이 머신의 로컬 정책을 바꾸지 못하게 막는다. 설정은 머신 소유자가 직접 바꾼다
 - 깨우기는 됐는데 세션이 brevduva 도구를 못 쓴다(응답 불능): 러너의 등록이 옛 형식인지 `brv mcp register --dry-run`으로 비교한다 — 갱신 때 등록을 다시 쓰지만(0.7.1), 등록 명령이 없는 러너는 붙여 넣은 조각을 손으로 맞춰야 한다
 - `brv status`에 `SUSPENDED — … token …`: 토큰이 거부된 상태(대시보드에서 연결을 회수했거나 다른 머신에서 같은 에이전트를 연결한 경우). 대시보드에서 연결 코드를 다시 발급해 `brv init --enroll`하면 데몬이 재기동 없이 복구된다
-- `brv status`에 `WAKE UNAVAILABLE — …`: 세션을 못 띄워 채널에 붙지 않는 중(메시지는 서버 큐에 대기) — 러너 로그인 만료(`claude login`), 경로, 권한을 고치면 다음 재점검(최대 15분)에 스스로 접속한다. 바로 확인하려면 `brv wake test` 후 `brv daemon restart`
+- `brv status`에 `WAKE UNAVAILABLE — …`: 세션을 못 띄워 채널에 붙지 않는 중(메시지는 서버 큐에 대기) — 러너 로그인 만료(`claude login`), 경로, 권한을 고치면 다음 재점검(최대 15분)에 스스로 접속한다. 상태 줄에는 러너가 `wake.log`에 남긴 원인 줄이 함께 나온다(`last output in wake.log: …`) — 점검이 시간 초과로 죽은 경우도 같다(러너가 API 오류를 재시도하다 상한에 걸리면 그 오류 줄, 예: `429`). 전체 출력은 설정 디렉터리의 `wake.log`. 바로 확인하려면 `brv wake test` 후 `brv daemon restart`
 - `brv status`의 `runners:`에 쓰려는 러너가 없다: PATH와 알려진 설치 폴더(npm 전역·`~/.local/bin`·Codex 앱 번들 등)에서 못 찾았거나 `--version`이 실패한 것 — `brv wake set --runner codex --command <절대 경로>`로 직접 지정한다
 - `brv status`의 `profile:`에 뜻밖의 경로가 보인다: 등록된 OS 서비스의 프로필을 따른 것이다 — 다른 프로필을 보려면 `BREVDUVA_CONFIG`를 주거나 `--config`를 붙인다
 - CLI로 요청에 회신할 때는 `brv send --to <agent> --reply-to <메시지 id> --payload "…"` — correlation이 실려야 상대의 `wait_for_reply`가 풀린다

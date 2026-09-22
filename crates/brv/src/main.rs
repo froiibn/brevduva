@@ -941,22 +941,10 @@ async fn wake_test(binding_sel: Option<&str>) -> anyhow::Result<()> {
         .parent()
         .expect("config has parent")
         .join("wake.log");
-    let status = match tokio::time::timeout(Duration::from_secs(capped.timeout_s), async {
-        let mut child = child;
-        child.wait().await
-    })
-    .await
-    {
-        Ok(res) => res.context("wake process wait")?,
-        Err(_) => anyhow::bail!(
-            "wake session did not finish within {}s — check {log_hint:?}",
-            capped.timeout_s
-        ),
-    };
-    anyhow::ensure!(
-        status.success(),
-        "wake session exited with {status} — check {log_hint:?}"
-    );
+    // 데몬의 사전 점검과 같은 대기 — 실패 문장에 러너의 원인 줄이 실린다 (2026-09-23)
+    brv::daemon::wait_wake(&capped, child)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#} (full session output: {log_hint:?})"))?;
     println!(
         "WAKE TEST OK ({:.1}s) — session output appended to {log_hint:?}",
         started.elapsed().as_secs_f32()

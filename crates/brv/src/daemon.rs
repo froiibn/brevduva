@@ -240,8 +240,14 @@ impl std::fmt::Display for NoUserSession {
 
 impl std::error::Error for NoUserSession {}
 
-/// 깨운 프로세스 — 스폰 방식에 따라 다른 핸들 (wait·kill만 필요).
-pub enum WakeChild {
+/// 깨운 프로세스 — 스폰 방식에 따라 다른 핸들 (wait·kill만 필요) + 이 깨우기의 출력이 `wake.log`에서
+/// 시작하는 위치. 실패했을 때 그 뒤에 쓰인 출력에서 원인 줄을 발췌해 상태·오류에 싣는다 (2026-09-23).
+pub struct WakeChild {
+    process: WakeProcess,
+    log: WakeLogMark,
+}
+
+enum WakeProcess {
     Direct(Box<tokio::process::Child>), // Box: 변형 크기 차이(clippy) — Child가 272바이트
     #[cfg(windows)]
     UserSession(crate::winspawn::Child),
@@ -249,20 +255,91 @@ pub enum WakeChild {
 
 impl WakeChild {
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        match self {
-            WakeChild::Direct(c) => c.wait().await,
+        match &mut self.process {
+            WakeProcess::Direct(c) => c.wait().await,
             #[cfg(windows)]
-            WakeChild::UserSession(c) => c.wait().await,
+            WakeProcess::UserSession(c) => c.wait().await,
         }
     }
 
     pub async fn kill(&mut self) -> std::io::Result<()> {
-        match self {
-            WakeChild::Direct(c) => c.kill().await,
+        match &mut self.process {
+            WakeProcess::Direct(c) => c.kill().await,
             #[cfg(windows)]
-            WakeChild::UserSession(c) => c.kill(),
+            WakeProcess::UserSession(c) => c.kill(),
         }
     }
+
+    /// 이 깨우기가 `wake.log`에 남긴 출력 중 원인을 말해 주는 한 줄 — [`wake_log_excerpt`].
+    pub fn last_output(&self) -> Option<String> {
+        self.log.excerpt()
+    }
+}
+
+/// `wake.log`는 모든 깨우기가 이어 쓰는 한 파일이라, 스폰 직전의 길이가 곧 이 깨우기 출력의 시작이다.
+/// 여러 바인딩이 동시에 깨어나면 그 뒤의 출력이 섞일 수 있다 — 발췌는 최선 노력이고 원본은 파일에 있다.
+struct WakeLogMark {
+    path: PathBuf,
+    from: u64,
+}
+
+impl WakeLogMark {
+    /// 스폰 뒤 쓰인 부분(끝에서 최대 64KiB)을 읽어 원인 줄을 고른다. 파일을 못 읽으면 `None` — 발췌는
+    /// 부가 정보라 원래 오류를 가리지 않는다.
+    fn excerpt(&self) -> Option<String> {
+        use std::io::{Read as _, Seek as _};
+        const TAIL_MAX: u64 = 64 * 1024;
+        let mut file = std::fs::File::open(&self.path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len <= self.from {
+            return None;
+        }
+        let start = self.from.max(len.saturating_sub(TAIL_MAX));
+        file.seek(std::io::SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        wake_log_excerpt(&String::from_utf8_lossy(&bytes))
+    }
+}
+
+/// 러너 출력에서 실패 원인을 말해 주는 한 줄 (2026-09-22 후속 8의 과제). 시간 초과로 죽은 사전 점검은
+/// "exceeded timeout"만 남겼고 진짜 이유(게이트웨이의 `429 · No access to this model`)는 `wake.log`를 뒤져야
+/// 보였다. 오류로 보이는 마지막 줄을 고르고, 없으면 마지막 줄 — 러너가 재시도로 시간을 끌 때는 오류 줄 뒤에
+/// 경고가 이어지므로 "마지막 줄"만으로는 원인이 가려진다. 긴 줄은 자른다 (한 줄 상태 표시용).
+pub fn wake_log_excerpt(text: &str) -> Option<String> {
+    const MAX_CHARS: usize = 240;
+    const ERROR_MARKS: [&str; 11] = [
+        "error",
+        "fail",
+        "denied",
+        "unauthori",
+        "forbidden",
+        "not logged in",
+        "expired",
+        "panic",
+        "429",
+        "401",
+        "403",
+    ];
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let looks_like_error = |line: &str| {
+        let lower = line.to_ascii_lowercase();
+        ERROR_MARKS.iter().any(|mark| lower.contains(mark))
+    };
+    let picked = lines
+        .iter()
+        .rev()
+        .find(|line| looks_like_error(line))
+        .or_else(|| lines.last())?;
+    let mut excerpt: String = picked.chars().take(MAX_CHARS).collect();
+    if excerpt.len() < picked.len() {
+        excerpt.push('…');
+    }
+    Some(excerpt)
 }
 
 impl Default for DaemonOptions {
@@ -1694,8 +1771,9 @@ async fn report_unanswered(
         );
         return;
     }
+    // 발신자에게는 러너 출력 발췌 없이 (WakeFailed 문서 주석)
     let (reason, detail) = match failure {
-        Some(e) => ("session-failed", e.to_string()),
+        Some(e) => ("session-failed", WakeFailed::peer_facing(e)),
         None => (
             "session-exited",
             "the woken session ended without answering".to_owned(),
@@ -1938,7 +2016,12 @@ pub async fn spawn_wake(
         .append(true)
         .open(&log_path)
         .with_context(|| format!("cannot open wake log {log_path:?}"))?;
-    match spawn {
+    // 이 깨우기의 출력이 시작될 위치 — 실패 시 발췌 범위 (WakeLogMark)
+    let mark = WakeLogMark {
+        from: log.metadata().map(|m| m.len()).unwrap_or(0),
+        path: log_path,
+    };
+    let process = match spawn {
         WakeSpawn::Direct => {
             let child = tokio::process::Command::new(&command)
                 .args(&args)
@@ -1963,7 +2046,7 @@ pub async fn spawn_wake(
                 .stderr(std::process::Stdio::from(log))
                 .spawn()
                 .with_context(|| format!("cannot spawn wake command {command:?}"))?;
-            Ok(WakeChild::Direct(Box::new(child)))
+            WakeProcess::Direct(Box::new(child))
         }
         // 윈도우 시스템 서비스 (2026-09-03): 로그온한 사용자 세션에 그 사용자 명의로 —
         // 환경·로그인·프로젝트 접근이 전부 사용자의 것. 같은 두 변수는 여기서도 덧씌운다
@@ -1987,7 +2070,7 @@ pub async fn spawn_wake(
                 .with_context(|| {
                     format!("cannot spawn wake command {command:?} in the user session")
                 })?;
-                Ok(WakeChild::UserSession(child))
+                WakeProcess::UserSession(child)
             }
             #[cfg(not(windows))]
             {
@@ -1995,7 +2078,8 @@ pub async fn spawn_wake(
                 anyhow::bail!("user-session wake is Windows-only (service mode)")
             }
         }
-    }
+    };
+    Ok(WakeChild { process, log: mark })
 }
 
 /// 프롬프트를 표준 입력으로 넘기는 설정인가 — 인자에 `{prompt}` 자리표시자가 없을 때 (U7).
@@ -2052,22 +2136,42 @@ fn file_tag(binding_label: &str) -> String {
 
 /// 깨우기 실패의 형태 — `could_not_start`(몇 초 안의 실패 종료 = 인증·경로·환경)는 데몬이
 /// 접속 관문으로 되돌아가는 신호다 (2026-09-03). 스폰 실패(실행 파일 없음)는 별도 anyhow 오류.
+/// `last_output`은 러너가 `wake.log`에 남긴 원인 줄(2026-09-23) — 이 머신의 `brv status`·데몬 로그에는
+/// 싣고, 발신자에게 가는 실패 보고에는 싣지 않는다([`WakeFailed::peer_facing`]): 러너 출력은 이 머신의
+/// 경로·환경을 담을 수 있고, 발신자에게 필요한 것은 "세션이 실패했다"뿐이다.
 #[derive(Debug)]
 pub struct WakeFailed {
     pub could_not_start: bool,
     pub message: String,
+    pub last_output: Option<String>,
+}
+
+impl WakeFailed {
+    /// 발신자에게 보내도 되는 설명 — 러너 출력 발췌를 뺀 문장. `WakeFailed`가 아닌 오류는 그대로.
+    pub fn peer_facing(error: &anyhow::Error) -> String {
+        match error.downcast_ref::<WakeFailed>() {
+            Some(failed) => failed.message.clone(),
+            None => error.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for WakeFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        match &self.last_output {
+            Some(line) => write!(f, " — last output in wake.log: {line}"),
+            None => f.write_str(" — see wake.log"),
+        }
     }
 }
 
 impl std::error::Error for WakeFailed {}
 
 /// 깨우기 완주 대기 — 타임아웃 시 강제 종료 (스폰과 분리: 확정 시점은 깨운 세션의 수신 증거, 2026-09-11).
-/// pub인 이유는 spawn_wake와 동일 (`brv wake test`).
+/// pub인 이유는 spawn_wake와 동일 (`brv wake test`). 실패마다 러너의 원인 줄을 함께 돌려준다 —
+/// 시간 초과도 예외가 아니다: 러너가 API 오류를 재시도하며 시간을 끌면 강제 종료 직전까지의 출력이
+/// 유일한 단서다(출력은 핸들 상속으로 `wake.log`에 바로 쓰이므로 강제 종료로 사라지지 않는다).
 pub async fn wait_wake(wake: &WakeConfig, mut child: WakeChild) -> anyhow::Result<()> {
     let started = Instant::now();
     match tokio::time::timeout(Duration::from_secs(wake.timeout_s), child.wait()).await {
@@ -2079,29 +2183,37 @@ pub async fn wait_wake(wake: &WakeConfig, mut child: WakeChild) -> anyhow::Resul
         // 실패는 "일을 시작도 못 함"(인증·경로·환경)으로 분류해 원인 방향을 로그에 남긴다
         Ok(Ok(status)) => {
             let secs = started.elapsed().as_secs();
+            let last_output = child.last_output();
             if secs < QUICK_FAIL_SECS {
                 return Err(WakeFailed {
                     could_not_start: true,
                     message: format!(
                         "wake session exited with {status} after {secs}s — it most likely could not start at all \
-                         (CLI login expired? runner path? permissions?) — see wake.log"
+                         (CLI login expired? runner path? permissions?)"
                     ),
+                    last_output,
                 }
                 .into());
             }
             Err(WakeFailed {
                 could_not_start: false,
-                message: format!("wake session exited with {status} after {secs}s — see wake.log"),
+                message: format!("wake session exited with {status} after {secs}s"),
+                last_output,
             }
             .into())
         }
         Ok(Err(e)) => Err(e).context("wake process wait"),
         Err(_) => {
             let _ = child.kill().await;
-            anyhow::bail!(
-                "wake session exceeded timeout_s={} — killed",
-                wake.timeout_s
-            )
+            Err(WakeFailed {
+                could_not_start: false,
+                message: format!(
+                    "wake session exceeded timeout_s={} — killed while still running (a runner stuck retrying an API error looks like this)",
+                    wake.timeout_s
+                ),
+                last_output: child.last_output(),
+            }
+            .into())
         }
     }
 }
@@ -2418,6 +2530,115 @@ mod tests {
         .await
         .expect("wake command spawns");
         wait_wake(&wake, child).await.expect("wake command runs");
+    }
+
+    /// 2026-09-23 (2026-09-22 후속 8의 과제): 러너 출력에서 원인 줄을 고른다 — 오류로 보이는 마지막 줄, 없으면
+    /// 마지막 줄. 실제 사고의 형태: 게이트웨이 429 뒤에 경고가 이어져 마지막 줄만 보면 원인이 가려졌다.
+    #[test]
+    fn wake_log_excerpt_prefers_the_last_error_looking_line() {
+        let incident = "\
+⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set
+API Error: Request rejected (429) · No access to this model at this time.
+⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set
+";
+        assert_eq!(
+            wake_log_excerpt(incident).as_deref(),
+            Some("API Error: Request rejected (429) · No access to this model at this time.")
+        );
+        // 오류로 보이는 줄이 없으면 마지막 비어 있지 않은 줄 (CRLF·공백은 걷어낸다)
+        assert_eq!(
+            wake_log_excerpt("starting\r\n  waiting for the model  \r\n\r\n").as_deref(),
+            Some("waiting for the model")
+        );
+        assert_eq!(wake_log_excerpt("\n  \n"), None);
+        assert_eq!(wake_log_excerpt(""), None);
+        // 한 줄 상태 표시용이라 긴 줄은 자른다
+        let long = format!("error: {}", "x".repeat(500));
+        let cut = wake_log_excerpt(&long).unwrap();
+        assert!(cut.ends_with('…') && cut.chars().count() == 241, "{cut}");
+    }
+
+    /// 2026-09-23: 실패 종료·시간 초과 모두 이 깨우기가 `wake.log`에 남긴 원인 줄을 오류에 싣는다 — 사전 점검이
+    /// 죽었을 때 `brv status`가 "exceeded timeout"만 말하고 진짜 이유는 로그를 뒤져야 보이던 것을 없앤다. 발신자에게
+    /// 가는 문장(`peer_facing`)에는 발췌가 없다.
+    #[tokio::test]
+    async fn wake_failures_carry_the_runners_last_output() {
+        let marker = format!(
+            "API Error: Request rejected (429) - probe {}",
+            ClientKey::generate()
+        );
+        let shell = |script: String| WakeConfig {
+            command: if cfg!(windows) {
+                "cmd".into()
+            } else {
+                "sh".into()
+            },
+            args: if cfg!(windows) {
+                vec!["/C".into(), format!("{script} & rem {{prompt}}")]
+            } else {
+                vec!["-c".into(), script, "{prompt}".into()]
+            },
+            timeout_s: 30,
+        };
+        // 실패 종료: 표준 오류에 원인 줄을 쓰고 exit 3
+        let exit = shell(if cfg!(windows) {
+            format!("echo {marker} 1>&2 & exit 3")
+        } else {
+            format!("echo '{marker}' >&2; exit 3")
+        });
+        let child = spawn_wake(
+            &exit,
+            ".",
+            "excerpt-exit@myapp",
+            "t",
+            &WakeSpawn::Direct,
+            None,
+        )
+        .await
+        .expect("spawns");
+        let err = wait_wake(&exit, child).await.expect_err("exit 3 fails");
+        let failed = err.downcast_ref::<WakeFailed>().expect("WakeFailed");
+        assert!(failed.could_not_start);
+        assert_eq!(failed.last_output.as_deref(), Some(marker.as_str()));
+        let shown = err.to_string();
+        assert!(
+            shown.contains("last output in wake.log:") && shown.contains(&marker),
+            "{shown}"
+        );
+        assert!(!WakeFailed::peer_facing(&err).contains(&marker));
+
+        // 시간 초과: 원인 줄을 쓴 뒤 상한보다 오래 머문다 → 강제 종료돼도 그 줄이 실린다
+        let marker = format!(
+            "API Error: Request rejected (429) - probe {}",
+            ClientKey::generate()
+        );
+        let stuck = WakeConfig {
+            timeout_s: 1,
+            ..shell(if cfg!(windows) {
+                format!("echo {marker} 1>&2 & ping -n 6 127.0.0.1 >nul")
+            } else {
+                format!("echo '{marker}' >&2; sleep 5")
+            })
+        };
+        let child = spawn_wake(
+            &stuck,
+            ".",
+            "excerpt-stuck@myapp",
+            "t",
+            &WakeSpawn::Direct,
+            None,
+        )
+        .await
+        .expect("spawns");
+        let err = wait_wake(&stuck, child).await.expect_err("times out");
+        let failed = err.downcast_ref::<WakeFailed>().expect("WakeFailed");
+        assert!(!failed.could_not_start);
+        assert!(
+            failed.message.contains("exceeded timeout_s=1"),
+            "{}",
+            failed.message
+        );
+        assert_eq!(failed.last_output.as_deref(), Some(marker.as_str()));
     }
 
     /// 2026-09-13 (U7): 자리표시자 없는 인자는 프롬프트를 표준 입력으로 넘기고, 자식은 그것을 끝까지 읽는다.
