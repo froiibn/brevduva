@@ -9,8 +9,12 @@
 #   ARTIFACT_SIGNING_ENDPOINT   예: https://krc.codesigning.azure.net/  (계정을 만든 리전의 것)
 #   ARTIFACT_SIGNING_ACCOUNT · ARTIFACT_SIGNING_PROFILE
 #
-# 신원 검증이 끝나 위 값이 채워지기 전에는 이 워크플로를 돌려도 첫 단계에서 멈춘다. 서명이 실기에서
-# 확인되면 같은 단계를 release.yml로 옮긴다 (macos-sign-check.yml과 같은 순서).
+# 서명 작업은 GitHub 환경 `signing` 안에서 돈다 (2026-09-30). 연합 자격 증명은 실행 조건을 고정 문자열로
+# 등록해야 하는데, 릴리스는 태그마다 ref가 달라 ref로는 등록할 수 없다 — 환경으로 묶으면 조건이
+# `repo:froiibn/brevduva:environment:signing` 하나로 고정된다. 그 환경은 main 브랜치와 `v*` 태그에서만
+# 쓸 수 있게 막혀 있어, 다른 브랜치의 워크플로는 서명 권한을 얻지 못한다.
+#
+# 서명이 실기에서 확인되면 같은 단계를 release.yml로 옮긴다 (macos-sign-check.yml과 같은 순서).
 name: windows-sign-check
 
 on:
@@ -23,6 +27,7 @@ permissions:
 jobs:
   sign:
     runs-on: windows-latest
+    environment: signing
     env:
       TARGET: x86_64-pc-windows-msvc
     steps:
