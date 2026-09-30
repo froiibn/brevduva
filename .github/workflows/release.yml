@@ -7,6 +7,9 @@
 # macOS x86_64만 arm 러너에서 크로스 (Intel 러너 은퇴 대비 — SDK가 양쪽 아치를 지원).
 # macOS 자산의 내용물은 앱 묶음 Brevduva.app이다 (2026-09-22) — 단독 실행 파일은 서명해도 시스템 설정에
 # 개발자 이름으로 나온다. 자산 이름은 그대로라 install.sh의 고정 URL과 검증 목록이 바뀌지 않는다.
+# 윈도우 brv.exe는 Azure Artifact Signing으로 Authenticode 서명한다 (2026-09-30) — 게시자 "Seizia".
+# windows-sign-check.yml에서 실측한 단계 그대로다. 서명 자격은 OIDC로만 얻고, 연합 자격 증명은 GitHub 환경
+# `signing`(main·v* 태그만 허용)에 묶여 있어 build 잡이 그 환경에서 돈다.
 name: release
 
 on:
@@ -36,6 +39,11 @@ jobs:
     needs: verify
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # 윈도우 서명의 OIDC subject가 이 환경 이름을 담는다 (윈도우 외 칸은 토큰을 쓰지 않는다)
+    environment: signing
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +61,7 @@ jobs:
     env:
       # secrets 컨텍스트는 step의 if에서 못 쓴다 — env로 옮겨 조건에 쓴다
       MACOS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+      WINDOWS_SIGNING: ${{ vars.AZURE_CLIENT_ID != '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -110,6 +119,43 @@ jobs:
         run: |
           $info = (Get-Item "target/${{ matrix.target }}/release/brv.exe").VersionInfo
           if ($info.ProductName -ne 'Brevduva') { throw "windows resources missing from brv.exe" }
+
+      # 윈도우: Authenticode 서명. 설정이 없는 포크는 건너뛰고, 본 리포에서 빠지면 실패시킨다 — 서명 릴리스
+      # 뒤에 미서명 릴리스가 나가면 사용자 PC의 승격 창이 다시 "알 수 없는 게시자"로 돌아간다 (macOS와 같은 규칙).
+      - name: 서명 설정 확인 (windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING != 'true' && github.repository == 'froiibn/brevduva'
+        run: |
+          echo "::error::windows signing variables are missing"
+          exit 1
+      - name: azure login (windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # 인증서의 유효 기간이 3일이라 타임스탬프가 필수다 — 그래야 서명이 그 뒤에도 유효하다
+      - name: sign (windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\target\${{ matrix.target }}\release\brv.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: 서명 확인 (windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "target/${{ matrix.target }}/release/brv.exe"
+          $sig | Format-List Status, StatusMessage, SignatureType
+          "signer   : $($sig.SignerCertificate.Subject)"
+          "timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "brv.exe signature is not valid: $($sig.Status)" }
+          if (-not $sig.TimeStamperCertificate) { throw "brv.exe signature has no timestamp" }
 
       - name: package (windows)
         if: runner.os == 'Windows'
